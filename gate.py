@@ -29,13 +29,17 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import evdev
 from evdev import UInput, ecodes
 
-# Which mouse to gate. Chosen by setup.sh and written to this file; a path given on
-# the command line overrides it. Resolved lazily in main() so the module stays
-# importable (test_translator.py execs this file) on a machine with no config yet.
-CONFIG_PATH = os.path.join(
+# Settings live in a "key = value" file written by setup.sh. Everything here is
+# resolved lazily in main() so the module stays importable (test_translator.py execs
+# this file) on a machine with no config yet.
+_CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-    "onshape-trackball", "device",
+    "onshape-trackball",
 )
+CONFIG_PATH = os.path.join(_CONFIG_DIR, "config")
+
+# Superseded by CONFIG_PATH; still read so an older install keeps working.
+LEGACY_DEVICE_PATH = os.path.join(_CONFIG_DIR, "device")
 
 VIRTUAL_NAME = "Onshape-gated Mouse"
 PORT = 47653
@@ -46,7 +50,17 @@ PAN_BUTTON = ecodes.BTN_MIDDLE
 
 # A pan stroke ends after this long without motion, so the synthetic button is never
 # left down. Panning then feels like trackpad strokes: push, pause, push again.
-PAN_IDLE_RELEASE = 0.2
+# Overridden by pan_idle_release_ms in the config file; this is the fallback.
+DEFAULT_PAN_IDLE_RELEASE_MS = 100
+PAN_IDLE_RELEASE = DEFAULT_PAN_IDLE_RELEASE_MS / 1000.0
+
+# Outside this range the feature stops behaving like a pan stroke at all: too low
+# and a stroke ends between mouse reports, too high and the button hangs around
+# long after you stop.
+PAN_IDLE_MIN_MS = 20
+PAN_IDLE_MAX_MS = 2000
+
+# How often the idle check runs, so a release lands within PAN_TICK of the deadline.
 PAN_TICK = 0.05
 
 # The extension pushes on every real transition and heartbeats every 30s via
@@ -216,6 +230,7 @@ class Gate:
             }
             translator = self.translator
         state["device"] = DEVICE_PATH
+        state["pan_idle_release_ms"] = round(PAN_IDLE_RELEASE * 1000)
         state["device_attached"] = translator is not None
         if translator is not None:
             state.update(translator.snapshot())
@@ -329,22 +344,69 @@ def watch_focus():
 DEVICE_PATH = None
 
 
-def resolve_device():
-    """Command line wins, then the config file written by setup.sh."""
-    if len(sys.argv) > 1:
-        return sys.argv[1]
+def read_config():
+    """Parse the "key = value" config file. Missing file is not an error."""
+    values = {}
     try:
         with open(CONFIG_PATH) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return values
+
+
+def read_legacy_device():
+    """The pre-config-file layout: a file containing just the device path."""
+    try:
+        with open(LEGACY_DEVICE_PATH) as fh:
             for line in fh:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     return line
     except FileNotFoundError:
         pass
+    return None
+
+
+def resolve_device(config):
+    """Command line wins, then the config file, then the legacy device file."""
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+
+    device = config.get("device") or read_legacy_device()
+    if device:
+        return device
+
     raise SystemExit(
         f"No mouse configured. Run setup.sh to choose one, or pass a device path.\n"
-        f"Expected a /dev/input/by-id/... path in {CONFIG_PATH}"
+        f"Expected 'device = /dev/input/by-id/...' in {CONFIG_PATH}"
     )
+
+
+def resolve_pan_idle(config):
+    """Seconds to hold the pan button after motion stops. A bad value is a typo in a
+    hand-edited file, so warn and fall back rather than refusing to start."""
+    raw = config.get("pan_idle_release_ms")
+    if raw is None:
+        return DEFAULT_PAN_IDLE_RELEASE_MS / 1000.0
+
+    try:
+        ms = float(raw)
+    except ValueError:
+        log(f"pan_idle_release_ms: '{raw}' is not a number; "
+            f"using {DEFAULT_PAN_IDLE_RELEASE_MS}ms")
+        return DEFAULT_PAN_IDLE_RELEASE_MS / 1000.0
+
+    clamped = max(PAN_IDLE_MIN_MS, min(PAN_IDLE_MAX_MS, ms))
+    if clamped != ms:
+        log(f"pan_idle_release_ms: {ms:g}ms is outside "
+            f"{PAN_IDLE_MIN_MS}-{PAN_IDLE_MAX_MS}ms; using {clamped:g}ms")
+    return clamped / 1000.0
 
 
 def wait_for_device(path):
@@ -358,13 +420,16 @@ def wait_for_device(path):
 
 
 def main():
-    global DEVICE_PATH
-    DEVICE_PATH = resolve_device()
+    global DEVICE_PATH, PAN_IDLE_RELEASE
+    config = read_config()
+    DEVICE_PATH = resolve_device(config)
+    PAN_IDLE_RELEASE = resolve_pan_idle(config)
 
     threading.Thread(target=serve, daemon=True).start()
     threading.Thread(target=watch_focus, daemon=True).start()
     threading.Thread(target=pan_timer, daemon=True).start()
-    log(f"listening on 127.0.0.1:{PORT}, gating {DEVICE_PATH}")
+    log(f"listening on 127.0.0.1:{PORT}, gating {DEVICE_PATH} "
+        f"(pan idle release {PAN_IDLE_RELEASE * 1000:.0f}ms)")
 
     while True:
         dev = wait_for_device(DEVICE_PATH)

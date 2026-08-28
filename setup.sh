@@ -18,7 +18,9 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/onshape-trackball"
-CONFIG_FILE="$CONFIG_DIR/device"
+CONFIG_FILE="$CONFIG_DIR/config"
+LEGACY_DEVICE_FILE="$CONFIG_DIR/device"
+DEFAULT_PAN_IDLE_MS=100
 UDEV_RULE="/etc/udev/rules.d/99-onshape-mouse.rules"
 UNIT_NAME="onshape-mouse-gate.service"
 UNIT_PATH="$HOME/.config/systemd/user/$UNIT_NAME"
@@ -69,6 +71,12 @@ ${BOLD}EXAMPLES${OFF}
   $0 --status         Check health at a glance.
   $0 --reconfigure    Switch to the other mouse.
   $0 --uninstall
+
+${BOLD}CONFIGURATION${OFF}
+  \$XDG_CONFIG_HOME/onshape-trackball/config, created on first run.
+  Holds the chosen mouse and pan_idle_release_ms (default ${DEFAULT_PAN_IDLE_MS}ms) —
+  how long a pan stroke stays live after you stop moving. Edit it, then:
+    systemctl --user restart $UNIT_NAME
 
 ${BOLD}ONCE INSTALLED${OFF}
   curl -s localhost:$PORT/status
@@ -130,8 +138,74 @@ unit_enabled()    { systemctl --user is-enabled --quiet "$UNIT_NAME" 2>/dev/null
 unit_active()     { systemctl --user is-active  --quiet "$UNIT_NAME" 2>/dev/null; }
 daemon_up()       { curl -fsS --max-time 2 "http://127.0.0.1:$PORT/status" >/dev/null 2>&1; }
 
-configured_device() { [[ -s $CONFIG_FILE ]] && grep -vE '^\s*(#|$)' "$CONFIG_FILE" | head -1; }
+config_get() {  # key -> value, or nothing
+  [[ -f $CONFIG_FILE ]] || return 1
+  sed -n "s|^[[:space:]]*$1[[:space:]]*=[[:space:]]*||p" "$CONFIG_FILE" \
+    | sed 's|[[:space:]]*$||' | grep -v '^$' | head -1
+}
+
+config_set() {  # key value
+  ensure_config
+  if grep -qE "^[[:space:]]*$1[[:space:]]*=" "$CONFIG_FILE"; then
+    sed -i "s|^[[:space:]]*$1[[:space:]]*=.*|$1 = $2|" "$CONFIG_FILE"
+  else
+    printf '%s = %s\n' "$1" "$2" >> "$CONFIG_FILE"
+  fi
+}
+
+# Creates the config on first run, carrying over a device chosen under the older
+# single-purpose "device" file so an existing install is not disturbed.
+ensure_config() {
+  [[ -f $CONFIG_FILE ]] && return 0
+
+  mkdir -p "$CONFIG_DIR"
+  local legacy=""
+  if [[ -s $LEGACY_DEVICE_FILE ]]; then
+    legacy="$(grep -vE '^[[:space:]]*(#|$)' "$LEGACY_DEVICE_FILE" | head -1 || true)"
+  fi
+
+  cat > "$CONFIG_FILE" <<EOF
+# Onshape trackball gate — configuration.
+#
+# Apply changes with:
+#   systemctl --user restart $UNIT_NAME
+
+# Which mouse is gated. Set by setup.sh; change it with:  setup.sh --reconfigure
+device = $legacy
+
+# How long a pan stroke stays live after you stop moving, in milliseconds.
+#
+# Panning is synthesised by holding the middle button down. A mouse never says
+# "I stopped", so this timeout is what ends a stroke: the button is released
+# this long after the last motion. Without it the button would stay down for
+# ever. It is also what makes panning feel like trackpad strokes — push, pause,
+# push again — which is how you carry on panning past a screen edge.
+#
+#   lower   strokes end sooner; brief pauses split one pan into several
+#   higher  the button stays held longer after you stop moving
+#
+# Accepted range is 20-2000; anything outside is clamped.
+pan_idle_release_ms = $DEFAULT_PAN_IDLE_MS
+EOF
+
+  ok "created $CONFIG_FILE"
+  if [[ -n $legacy ]]; then
+    rm -f "$LEGACY_DEVICE_FILE"
+    note "migrated your mouse choice from the old 'device' file"
+  fi
+}
+
+configured_device() {
+  local dev
+  dev="$(config_get device || true)"
+  if [[ -z $dev && -s $LEGACY_DEVICE_FILE ]]; then
+    dev="$(grep -vE '^[[:space:]]*(#|$)' "$LEGACY_DEVICE_FILE" | head -1 || true)"
+  fi
+  [[ -n $dev ]] && printf '%s\n' "$dev"
+}
 device_configured() { [[ -n "$(configured_device || true)" ]]; }
+
+configured_pan_ms() { config_get pan_idle_release_ms || printf '%s' "$DEFAULT_PAN_IDLE_MS"; }
 
 mouse_name() {
   "$REPO_DIR/pick-mouse.py" --list 2>/dev/null \
@@ -151,6 +225,12 @@ running_exec_ok() {
   pid="$(systemctl --user show -p MainPID --value "$UNIT_NAME" 2>/dev/null || true)"
   [[ -n $pid && $pid != 0 ]] || return 1
   tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$REPO_DIR/gate.py"
+}
+
+daemon_settings_current() {
+  daemon_up || return 1
+  [[ "$(status_field device 2>/dev/null || true)" == "$(configured_device)" ]] || return 1
+  [[ "$(status_field pan_idle_release_ms 2>/dev/null || true)" == "$(configured_pan_ms)" ]] || return 1
 }
 
 status_field() {
@@ -227,6 +307,13 @@ show_status() {
     todo "left mouse not chosen yet"
   fi
 
+  if [[ -f $CONFIG_FILE ]]; then
+    ok "config file present (pan idle release: $(configured_pan_ms) ms)"
+    note "$CONFIG_FILE"
+  else
+    todo "config file not created yet"
+  fi
+
   unit_installed && ok "systemd unit installed"          || todo "systemd unit not installed"
   unit_enabled   && ok "service enabled at login"        || todo "service not enabled"
   unit_active    && ok "service running"                 || todo "service not running"
@@ -239,6 +326,8 @@ show_status() {
   if daemon_up; then
     ok "daemon responding on port $PORT"
     device_attached && ok "mouse grabbed by daemon"      || todo "mouse NOT grabbed (permissions or unplugged)"
+    daemon_settings_current && ok "daemon settings match the config" \
+                            || bad "daemon is running stale settings — needs a restart"
     extension_seen  && ok "Chrome extension reporting"   || todo "Chrome extension not reporting"
   else
     todo "daemon not responding on port $PORT"
@@ -248,10 +337,10 @@ show_status() {
 
 all_done() {
   have_udev_rule && uinput_perms_ok && in_group_file && group_active \
-    && device_configured \
+    && [[ -f $CONFIG_FILE ]] && device_configured \
     && unit_installed && unit_enabled && unit_active \
     && service_exec_ok && running_exec_ok \
-    && daemon_up && device_attached && extension_seen
+    && daemon_up && device_attached && daemon_settings_current && extension_seen
 }
 
 # ---------------------------------------------------------------- steps
@@ -310,8 +399,7 @@ EOF
 }
 
 save_device() {
-  mkdir -p "$CONFIG_DIR"
-  printf '%s\n' "$1" > "$CONFIG_FILE"
+  config_set device "$1"
   ok "left mouse set to: $(mouse_name "$1")"
   note "$1"
 }
@@ -451,12 +539,10 @@ EOF
     todo "replacing a service running from a different path"
     need_restart=1
   fi
-  if daemon_up; then
-    if [[ "$(status_field device 2>/dev/null || true)" != "$(configured_device)" ]]; then
-      todo "chosen mouse changed since the daemon started"
-      need_restart=1
-    fi
-  else
+  if ! daemon_up; then
+    need_restart=1
+  elif ! daemon_settings_current; then
+    todo "config changed since the daemon started"
     need_restart=1
   fi
 
@@ -659,6 +745,14 @@ printf '%sOnshape trackball gate — setup%s\n' "$BOLD" "$OFF"
 printf '%s%s%s\n' "$DIM" "$REPO_DIR" "$OFF"
 
 preflight
+
+# Before the status board, so a first run reports the config it just created.
+if (( ! STATUS_ONLY )); then
+  head_ "Configuration"
+  ensure_config
+  [[ -f $CONFIG_FILE ]] && ok "using $CONFIG_FILE"
+fi
+
 show_status
 
 if (( STATUS_ONLY )); then
@@ -693,6 +787,9 @@ cat <<EOF
     right button + move      rotate
     wheel                    zoom
     left button              select
+
+  Settings live in $CONFIG_FILE
+  (pan idle release is currently $(configured_pan_ms) ms).
 
   Useful commands:
     $0 --status
