@@ -8,12 +8,23 @@ ns = {}
 exec(compile(src, 'gate.py', 'exec'), ns)
 Translator = ns['Translator']
 
-NAMES = {ecodes.BTN_LEFT:'LEFT', ecodes.BTN_RIGHT:'RIGHT', ecodes.BTN_MIDDLE:'MIDDLE'}
+NAMES = {ecodes.BTN_LEFT:'LEFT', ecodes.BTN_RIGHT:'RIGHT', ecodes.BTN_MIDDLE:'MIDDLE',
+         ecodes.KEY_LEFTCTRL:'CTRL'}
+
+# The cases below were written against the middle-drag gesture; pin it so they
+# keep testing that path. The Ctrl+right gesture gets its own section at the end.
+ns['PAN_GESTURE'] = 'middle'
 
 class StubUI:
     def __init__(self): self.log = []
     def write(self, t, c, v):
-        self.log.append(('KEY', NAMES.get(c, c), v) if t == ecodes.EV_KEY else (t, c, v))
+        if t == ecodes.EV_KEY:
+            self.log.append(('KEY', NAMES.get(c, c), v))
+        elif t == ecodes.EV_REL:
+            axis = {ecodes.REL_X: 'X', ecodes.REL_Y: 'Y'}.get(c, 'WHEEL')
+            self.log.append(('REL', axis, v))
+        else:
+            self.log.append((t, c, v))
     def write_event(self, e):
         if e.type == ecodes.EV_KEY: self.log.append(('KEY', NAMES.get(e.code, e.code), e.value))
         elif e.type == ecodes.EV_REL: self.log.append(('REL', 'X' if e.code==ecodes.REL_X else ('Y' if e.code==ecodes.REL_Y else 'WHEEL'), e.value))
@@ -49,13 +60,13 @@ def idle_then_tick(tr):
     tr.tick()
 results.append(run("idle releases the pan button",
     motion(5),
-    [('KEY','MIDDLE',1), ('REL','X',5), ('SYN',), ('KEY','MIDDLE',0), ('SYN',)],
+    [('KEY','MIDDLE',1), ('REL','X',5), ('SYN',), ('REL','X',ns['MIN_DRAG_PX']), ('SYN',), ('KEY','MIDDLE',0), ('SYN',)],
     post=idle_then_tick))
 
 # 3. Right button interrupts the pan and hands off to native rotate.
 results.append(run("right button ends pan, then rotates",
     motion(5) + button(ecodes.BTN_RIGHT, 1) + motion(9),
-    [('KEY','MIDDLE',1), ('REL','X',5), ('SYN',),
+    [('KEY','MIDDLE',1), ('REL','X',5), ('SYN',), ('REL','X',ns['MIN_DRAG_PX']), ('SYN',), 
      ('KEY','MIDDLE',0), ('KEY','RIGHT',1), ('SYN',),
      ('REL','X',9), ('SYN',)]))
 
@@ -69,7 +80,7 @@ results.append(run("pan resumes after right button release",
 # 5. Gate closing mid-stroke must not strand the synthetic button down.
 results.append(run("gate close releases synthetic button",
     motion(5),
-    [('KEY','MIDDLE',1), ('REL','X',5), ('SYN',), ('KEY','MIDDLE',0), ('SYN',)],
+    [('KEY','MIDDLE',1), ('REL','X',5), ('SYN',), ('REL','X',ns['MIN_DRAG_PX']), ('SYN',), ('KEY','MIDDLE',0), ('SYN',)],
     post=lambda tr: tr.release_all()))
 
 # 6. Gate close mid real click releases that too.
@@ -86,8 +97,462 @@ results.append(run("wheel passes through without panning",
 # 8. Left click ends the pan stroke first so the click isn't a middle-drag.
 results.append(run("left click ends pan stroke first",
     motion(5) + button(ecodes.BTN_LEFT, 1),
-    [('KEY','MIDDLE',1), ('REL','X',5), ('SYN',),
+    [('KEY','MIDDLE',1), ('REL','X',5), ('SYN',), ('REL','X',ns['MIN_DRAG_PX']), ('SYN',), 
      ('KEY','MIDDLE',0), ('KEY','LEFT',1), ('SYN',)]))
+
+# --- recentring ----------------------------------------------------------------
+# The ordering here is the whole point: a warp landing while the pan button is
+# still down would be read by Onshape as one enormous pan.
+
+class StubPointer:
+    def __init__(self, pos): self.ok = True; self._pos = pos; self.warps = []
+    def position(self): return self._pos
+    def warp(self, x, y): self.warps.append((x, y)); self._pos = (x, y)
+
+class StubGate:
+    def __init__(self, geom): self._geom = geom
+    def geometry(self): return self._geom
+
+WINDOW = (0, 0, 1920, 1080)          # x, y, w, h
+CENTRE = (960, 540)
+
+def run_recentre(name, pointer_at, expect_warps, expect_log):
+    ui = StubUI(); tr = Translator(ui)
+    ns['GATE'] = StubGate(WINDOW)
+    # Start centred, so opening the pan stroke does not itself trigger a warp;
+    # handle() calls _recenter_if_near_edge on every motion event.
+    pointer = StubPointer(CENTRE)
+    ns['POINTER'] = pointer
+    for e in motion(5):
+        tr.handle(e)
+    ui.log.clear()
+    pointer._pos = pointer_at          # now place it where the case wants it
+    pointer.warps.clear()
+    tr._last_edge_check = 0.0          # defeat the sampling throttle
+    tr._last_press_time = time.monotonic() - (ns['PRESS_MIN_INTERVAL'] + 0.01)
+    tr._recenter_if_near_edge()
+    ok = ui.log == expect_log and pointer.warps == expect_warps
+    print(f"{'PASS' if ok else 'FAIL'}  {name}")
+    if not ok:
+        print(f"      expected warps {expect_warps}, events {expect_log}")
+        print(f"      got      warps {pointer.warps}, events {ui.log}")
+    results.append(ok)
+
+run_recentre("well inside the window: no warp, no events",
+             (960, 540), [], [])
+
+run_recentre("inside but past the margin: no warp",
+             (200, 540), [], [])
+
+run_recentre("near the left edge: button lifted, warp, button restored",
+             (40, 540), [CENTRE],
+             [('KEY','MIDDLE',0), ('SYN',), ('KEY','MIDDLE',1), ('SYN',)])
+
+run_recentre("near the bottom edge: same handling",
+             (960, 1040), [CENTRE],
+             [('KEY','MIDDLE',0), ('SYN',), ('KEY','MIDDLE',1), ('SYN',)])
+
+# Not panning => nothing to protect, so no warp.
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW)
+pointer = StubPointer((5, 5)); ns['POINTER'] = pointer
+tr._last_edge_check = 0.0
+tr._recenter_if_near_edge()
+check_ok = pointer.warps == [] and ui.log == []
+print(f"{'PASS' if check_ok else 'FAIL'}  no warp when not panning")
+results.append(check_ok)
+
+# A recentre stalls the read loop, so it must refresh the idle deadline or the
+# timer tears down the stroke it just restored.
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW)
+pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
+for e in motion(5):
+    tr.handle(e)
+tr._last_motion = time.monotonic() - 1.0     # deadline already blown
+pointer._pos = (40, 540)
+tr._last_edge_check = 0.0
+tr._last_press_time = time.monotonic() - (ns['PRESS_MIN_INTERVAL'] + 0.01)
+tr._recenter_if_near_edge()
+ui.log.clear()
+tr.tick()                                     # must NOT end the stroke
+survived = tr._panning and ui.log == []
+print(f"{'PASS' if survived else 'FAIL'}  recentre refreshes the idle deadline")
+if not survived:
+    print(f"      panning={tr._panning}, events after tick={ui.log}")
+results.append(survived)
+
+# Another mouse stirring must drop the stroke, so its wheel reaches the page as a
+# clean scroll rather than wheel-with-middle-held.
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW)
+ns['POINTER'] = StubPointer(CENTRE)
+for e in motion(5):
+    tr.handle(e)
+ui.log.clear()
+tr.yield_stroke()
+yielded = (not tr._panning
+           and ui.log == [('REL','X',ns['MIN_DRAG_PX']), ('SYN',), ('KEY','MIDDLE',0), ('SYN',)]
+           and tr.yields == 1)
+print(f"{'PASS' if yielded else 'FAIL'}  other mouse activity releases the pan button")
+if not yielded:
+    print(f"      panning={tr._panning}, yields={tr.yields}, events={ui.log}")
+results.append(yielded)
+
+# Yielding when nothing is happening must not emit a spurious release.
+ui = StubUI(); tr = Translator(ui)
+tr.yield_stroke()
+quiet = ui.log == [] and tr.yields == 0
+print(f"{'PASS' if quiet else 'FAIL'}  yielding while idle emits nothing")
+results.append(quiet)
+
+# Straight after a yield the cooldown holds panning off, so a wheel-zoom burst on
+# the other mouse is not fought over press-by-press.
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW)
+ns['POINTER'] = StubPointer(CENTRE)
+for e in motion(5):
+    tr.handle(e)
+tr.yield_stroke()
+ui.log.clear()
+for e in motion(4):
+    tr.handle(e)
+held_off = (not tr._panning) and ('KEY','MIDDLE',1) not in ui.log
+print(f"{'PASS' if held_off else 'FAIL'}  cooldown holds panning off right after a yield")
+if not held_off:
+    print(f"      panning={tr._panning}, events={ui.log}")
+results.append(held_off)
+
+# Once both the cooldown and the minimum press interval lapse, the next movement
+# starts a fresh stroke.
+tr._yield_until = time.monotonic() - 0.001
+tr._last_press_time = time.monotonic() - (ns['PRESS_MIN_INTERVAL'] + 0.01)
+ui.log.clear()
+for e in motion(4):
+    tr.handle(e)
+resumed = tr._panning and ('KEY','MIDDLE',1) in ui.log
+print(f"{'PASS' if resumed else 'FAIL'}  panning resumes once the cooldown lapses")
+if not resumed:
+    print(f"      panning={tr._panning}, events={ui.log}")
+results.append(resumed)
+
+# --- minimum press interval ----------------------------------------------------
+# Two presses inside the double-click window pair into Zoom to Fit, so a stroke
+# restart waits the remainder out rather than pressing early.
+
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW); ns['POINTER'] = StubPointer(CENTRE)
+for e in motion(5):
+    tr.handle(e)                      # first press: nothing to pair with
+first_ok = tr._panning and ('KEY','MIDDLE',1) in ui.log
+print(f"{'PASS' if first_ok else 'FAIL'}  the first press is immediate")
+results.append(first_ok)
+
+tr._end_pan(syn=True)                 # stroke ends; press was moments ago
+ui.log.clear()
+for e in motion(4):
+    tr.handle(e)
+deferred = (not tr._panning and tr._pending_press
+            and ('KEY','MIDDLE',1) not in ui.log
+            and tr.press_delays == 1)
+print(f"{'PASS' if deferred else 'FAIL'}  a too-soon restart is deferred, not pressed")
+if not deferred:
+    print(f"      panning={tr._panning}, pending={tr._pending_press}, events={ui.log}")
+results.append(deferred)
+
+# Motion still flows while deferred, so the cursor keeps tracking the hand.
+flows = ('REL','X',4) in ui.log
+print(f"{'PASS' if flows else 'FAIL'}  motion still passes through while deferred")
+results.append(flows)
+
+# The timer presses once the interval clears.
+tr._last_press_time = time.monotonic() - (ns['PRESS_MIN_INTERVAL'] + 0.01)
+tr._last_motion = time.monotonic()
+ui.log.clear()
+tr.tick()
+pressed = tr._panning and ('KEY','MIDDLE',1) in ui.log and not tr._pending_press
+print(f"{'PASS' if pressed else 'FAIL'}  the deferred press lands once the interval clears")
+if not pressed:
+    print(f"      panning={tr._panning}, pending={tr._pending_press}, events={ui.log}")
+results.append(pressed)
+
+# If the hand stops during the wait, the deferred press is abandoned.
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW); ns['POINTER'] = StubPointer(CENTRE)
+for e in motion(5):
+    tr.handle(e)
+tr._end_pan(syn=True)
+for e in motion(4):
+    tr.handle(e)
+tr._last_motion = time.monotonic() - (ns['PAN_IDLE_RELEASE'] + 0.01)
+ui.log.clear()
+tr.tick()
+abandoned = not tr._pending_press and not tr._panning and ('KEY','MIDDLE',1) not in ui.log
+print(f"{'PASS' if abandoned else 'FAIL'}  a deferred press is dropped if you stop moving")
+if not abandoned:
+    print(f"      panning={tr._panning}, pending={tr._pending_press}, events={ui.log}")
+results.append(abandoned)
+
+# --- a press must never land outside the window --------------------------------
+# Pressing outside the browser clicks another window, which takes focus away and
+# closes the gate. Motion flows while a press is deferred, so the cursor really can
+# be outside by press time.
+
+OUTSIDE = (WINDOW[0] + WINDOW[2] + 200, WINDOW[1] + 100)   # right of the window
+
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW)
+pointer = StubPointer(OUTSIDE); ns['POINTER'] = pointer
+tr._press_pan()
+x, y = pointer._pos
+pulled_in = (WINDOW[0] <= x <= WINDOW[0] + WINDOW[2]
+             and WINDOW[1] <= y <= WINDOW[1] + WINDOW[3]
+             and tr.presses_recentred == 1)
+print(f"{'PASS' if pulled_in else 'FAIL'}  a press outside the window is pulled back inside")
+if not pulled_in:
+    print(f"      pressed at {pointer._pos} for window {WINDOW}")
+results.append(pulled_in)
+
+# A press already inside must not be disturbed.
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW)
+pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
+tr._press_pan()
+undisturbed = pointer._pos == CENTRE and tr.presses_recentred == 0 and pointer.warps == []
+print(f"{'PASS' if undisturbed else 'FAIL'}  a press already inside is left where it is")
+if not undisturbed:
+    print(f"      pos={pointer._pos}, warps={pointer.warps}")
+results.append(undisturbed)
+
+# The realistic path: deferred press, cursor wanders out, timer fires it.
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW)
+pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
+for e in motion(5):
+    tr.handle(e)
+tr._end_pan(syn=True)
+for e in motion(4):
+    tr.handle(e)                       # deferred: _panning is False
+pointer._pos = OUTSIDE                 # cursor drifts out during the wait
+tr._last_press_time = time.monotonic() - (ns['PRESS_MIN_INTERVAL'] + 0.01)
+tr._last_motion = time.monotonic()
+tr.tick()
+x, y = pointer._pos
+safe = (tr._panning
+        and WINDOW[0] <= x <= WINDOW[0] + WINDOW[2]
+        and WINDOW[1] <= y <= WINDOW[1] + WINDOW[3])
+print(f"{'PASS' if safe else 'FAIL'}  a deferred press fired outside is pulled back inside")
+if not safe:
+    print(f"      panning={tr._panning}, pressed at {pointer._pos}")
+results.append(safe)
+
+# A recentre is a full release+press, so it must obey the same minimum interval as
+# a stroke restart — otherwise it is a back door to a double middle-click.
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW)
+pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
+for e in motion(5):
+    tr.handle(e)
+pointer._pos = (40, 540)
+tr._last_edge_check = 0.0
+tr._last_press_time = time.monotonic()      # pressed just now
+ui.log.clear(); pointer.warps.clear()
+tr._recenter_if_near_edge()
+throttled = (pointer.warps == [] and ui.log == []
+             and tr.recenters_deferred == 1 and tr._panning)
+print(f"{'PASS' if throttled else 'FAIL'}  a too-soon recentre is deferred, not pressed")
+if not throttled:
+    print(f"      warps={pointer.warps}, events={ui.log}, deferred={tr.recenters_deferred}")
+results.append(throttled)
+
+# Once the interval clears, the recentre goes ahead.
+tr._last_press_time = time.monotonic() - (ns['PRESS_MIN_INTERVAL'] + 0.01)
+tr._last_edge_check = 0.0
+pointer._pos = (40, 540)
+tr._recenter_if_near_edge()
+allowed = pointer.warps and tr.recenters == 1
+print(f"{'PASS' if allowed else 'FAIL'}  the recentre proceeds once the interval clears")
+if not allowed:
+    print(f"      warps={pointer.warps}, recenters={tr.recenters}")
+results.append(allowed)
+
+# --- Ctrl + right-drag gesture -------------------------------------------------
+# Nothing here may ever touch the middle button: that is the entire point of the
+# gesture, since Onshape maps double middle-click to Zoom to Fit.
+
+ns['PAN_GESTURE'] = 'ctrl_right'
+
+class SharedUI(StubUI):
+    """Logs into a shared list so ordering across the two virtual devices is visible."""
+    def __init__(self, log): self.log = log
+
+def ctrl_setup(pos=CENTRE):
+    log = []
+    ui, mod = SharedUI(log), SharedUI(log)
+    tr = Translator(ui, mod)
+    ns['GATE'] = StubGate(WINDOW)
+    ns['POINTER'] = StubPointer(pos)
+    return tr, log
+
+def expect(name, got, want):
+    ok = got == want
+    print(f"{'PASS' if ok else 'FAIL'}  {name}")
+    if not ok:
+        print(f"      expected {want}")
+        print(f"      got      {got}")
+    results.append(ok)
+
+# Ctrl must land before the button; the other order is a momentary plain right-drag,
+# which Onshape rotates on.
+tr, log = ctrl_setup()
+for e in motion(5):
+    tr.handle(e)
+expect("ctrl_right: Ctrl is pressed before the right button",
+       [x for x in log if x[0] == 'KEY'],
+       [('KEY','CTRL',1), ('KEY','RIGHT',1)])
+
+no_middle = not any(x[0] == 'KEY' and x[1] == 'MIDDLE' for x in log)
+print(f"{'PASS' if no_middle else 'FAIL'}  ctrl_right: the middle button is never touched")
+results.append(no_middle)
+
+# And on release the button must lift before Ctrl, for the same reason.
+log.clear()
+tr._end_pan(syn=True)
+expect("ctrl_right: the right button lifts before Ctrl",
+       [x for x in log if x[0] == 'KEY'],
+       [('KEY','RIGHT',0), ('KEY','CTRL',0)])
+
+# Writing them in the right order is not enough: the button release must be FLUSHED
+# before Ctrl goes, or X sees Ctrl lift first and the still-held button becomes a
+# plain right-drag, which Onshape rotates on.
+right_up = log.index(('KEY','RIGHT',0))
+ctrl_up = log.index(('KEY','CTRL',0))
+flushed = any(log[i] == ('SYN',) for i in range(right_up + 1, ctrl_up))
+print(f"{'PASS' if flushed else 'FAIL'}  ctrl_right: the button release is flushed before Ctrl")
+if not flushed:
+    print(f"      log={log}")
+results.append(flushed)
+
+# Same on the way down: Ctrl must be flushed before the button press.
+tr2, log2 = ctrl_setup()
+for e in motion(5):
+    tr2.handle(e)
+ctrl_down = log2.index(('KEY','CTRL',1))
+right_down = log2.index(('KEY','RIGHT',1))
+down_ok = ctrl_down < right_down
+print(f"{'PASS' if down_ok else 'FAIL'}  ctrl_right: Ctrl lands before the button press")
+if not down_ok:
+    print(f"      log={log2}")
+results.append(down_ok)
+
+# Pressing the physical right button mid-pan hands the same drag to rotate.
+tr, log = ctrl_setup()
+for e in motion(5):
+    tr.handle(e)
+log.clear()
+tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1))
+handover = ([x for x in log if x[0] == 'KEY'] == [('KEY','CTRL',0)]
+            and not tr._panning and tr._right_emitted)
+print(f"{'PASS' if handover else 'FAIL'}  ctrl_right: physical right drops Ctrl without re-pressing")
+if not handover:
+    print(f"      panning={tr._panning}, right_emitted={tr._right_emitted}, log={log}")
+results.append(handover)
+
+# Releasing it ends the gesture exactly once.
+log.clear()
+tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0))
+released = ([x for x in log if x[0] == 'KEY'] == [('KEY','RIGHT',0)]
+            and not tr._right_emitted)
+print(f"{'PASS' if released else 'FAIL'}  ctrl_right: releasing right ends the gesture once")
+if not released:
+    print(f"      right_emitted={tr._right_emitted}, log={log}")
+results.append(released)
+
+# Ctrl + wheel is browser page zoom, so the modifier must be gone first.
+tr, log = ctrl_setup()
+for e in motion(5):
+    tr.handle(e)
+log.clear()
+tr.handle(ev(ecodes.EV_REL, ecodes.REL_WHEEL, 1))
+keys = [x for x in log if x[0] == 'KEY']
+wheel_at = log.index(('REL','WHEEL',1)) if ('REL','WHEEL',1) in log else -1
+ctrl_up_at = log.index(('KEY','CTRL',0)) if ('KEY','CTRL',0) in log else -1
+wheel_safe = (not tr._ctrl_down and ctrl_up_at >= 0 and wheel_at > ctrl_up_at)
+print(f"{'PASS' if wheel_safe else 'FAIL'}  ctrl_right: Ctrl is released before a wheel event")
+if not wheel_safe:
+    print(f"      ctrl_held={tr._ctrl_down}, log={log}")
+results.append(wheel_safe)
+
+# Gate closing mid-pan must strand neither the button nor the modifier.
+tr, log = ctrl_setup()
+for e in motion(5):
+    tr.handle(e)
+log.clear()
+tr.release_all()
+clean = not tr._ctrl_down and not tr._right_emitted and not tr._panning
+print(f"{'PASS' if clean else 'FAIL'}  ctrl_right: gate close releases both button and Ctrl")
+if not clean:
+    print(f"      ctrl_held={tr._ctrl_down}, right_emitted={tr._right_emitted}, log={log}")
+results.append(clean)
+
+# --- every release must be a drag, never a bare click ---------------------------
+# Ctrl + right-click with no movement opens Chrome's context menu mid-pan.
+
+ns['PAN_GESTURE'] = 'ctrl_right'
+
+# Press then release with the pointer never moving: a nudge must be emitted first.
+tr, log = ctrl_setup()
+tr._press_pan()
+log.clear()
+tr._release_right_button()
+nudged = ([x[0] for x in log] == ['REL', 'SYN', 'KEY', 'SYN']
+          and log[0][1] == 'X' and abs(log[0][2]) == ns['MIN_DRAG_PX']
+          and log[2] == ('KEY','RIGHT',0)
+          and tr.drag_nudges == 1)
+print(f"{'PASS' if nudged else 'FAIL'}  a motionless release is nudged into a drag first")
+if not nudged:
+    print(f"      log={log}, nudges={tr.drag_nudges}")
+results.append(nudged)
+
+# Already dragged far enough: no extra nudge, so no stray pan.
+tr, log = ctrl_setup()
+tr._press_pan()
+ns['POINTER']._pos = (CENTRE[0] + 200, CENTRE[1])
+log.clear()
+tr._release_right_button()
+clean = (log == [('KEY','RIGHT',0), ('SYN',)] and tr.drag_nudges == 0)
+print(f"{'PASS' if clean else 'FAIL'}  a real drag is released without an extra nudge")
+if not clean:
+    print(f"      log={log}, nudges={tr.drag_nudges}")
+results.append(clean)
+
+# The nudge steers away from the window edge rather than off it.
+tr, log = ctrl_setup()
+tr._press_pan()
+ns['POINTER']._pos = (WINDOW[0] + WINDOW[2] - 2, CENTRE[1])
+tr._last_press_pos = ns['POINTER']._pos
+log.clear()
+tr._release_right_button()
+inward = any(x[0] == 'REL' and x[2] < 0 for x in log)
+print(f"{'PASS' if inward else 'FAIL'}  the nudge steers inward at the window edge")
+if not inward:
+    print(f"      log={log}")
+results.append(inward)
+
+# Ending a pan normally goes through the same path.
+tr, log = ctrl_setup()
+for e in motion(1):
+    tr.handle(e)
+log.clear()
+tr._end_pan(syn=True)
+ordered = [x for x in log if x[0] in ('REL','KEY')]
+via_nudge = (ordered and ordered[0][0] == 'REL'
+             and ('KEY','RIGHT',0) in ordered and ('KEY','CTRL',0) in ordered
+             and ordered.index(('KEY','RIGHT',0)) < ordered.index(('KEY','CTRL',0)))
+print(f"{'PASS' if via_nudge else 'FAIL'}  ending a pan nudges, releases right, then Ctrl")
+if not via_nudge:
+    print(f"      log={log}")
+results.append(via_nudge)
 
 print()
 print(f"{sum(results)}/{len(results)} passed")

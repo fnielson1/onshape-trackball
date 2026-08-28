@@ -20,7 +20,9 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/onshape-trackball"
 CONFIG_FILE="$CONFIG_DIR/config"
 LEGACY_DEVICE_FILE="$CONFIG_DIR/device"
-DEFAULT_PAN_IDLE_MS=100
+DEFAULT_PAN_IDLE_MS=150
+DEFAULT_RECENTER_MARGIN=80
+DEFAULT_PRESS_INTERVAL_MS=501
 UDEV_RULE="/etc/udev/rules.d/99-onshape-mouse.rules"
 UNIT_NAME="onshape-mouse-gate.service"
 UNIT_PATH="$HOME/.config/systemd/user/$UNIT_NAME"
@@ -155,6 +157,110 @@ config_set() {  # key value
 
 # Creates the config on first run, carrying over a device chosen under the older
 # single-purpose "device" file so an existing install is not disturbed.
+# Every setting is documented in exactly one place: this function. ensure_config
+# builds a fresh file from it, and ensure_config_keys appends whatever an older
+# config is missing. Keeping one source avoids the two copies drifting apart.
+config_block() {
+  case "$1" in
+    device)
+      cat <<EOF
+# Which mouse is gated. Set by setup.sh; change it with:  setup.sh --reconfigure
+device = ${2:-}
+EOF
+      ;;
+    pan_gesture)
+      cat <<EOF
+
+# Which Onshape gesture is synthesised for panning. Onshape's stock mapping accepts
+# both middle-drag and Ctrl + right-drag; plain right-drag rotates either way.
+#
+#   ctrl_right  Ctrl is held on a separate virtual keyboard device and the right
+#               button on the mouse one. Nothing ever presses the middle button, so
+#               Onshape's double-middle-click Zoom to Fit cannot fire by accident.
+#               Pressing the physical right button mid-pan drops Ctrl, handing the
+#               same drag over to rotate.
+#   middle      the original synthetic middle-drag.
+#
+# Known cost of ctrl_right: Ctrl + wheel is browser page zoom. The daemon drops Ctrl
+# before any wheel event from the gated mouse, and pan_yield_to_other_mice drops it
+# when another mouse stirs — but the very first notch of a scroll on the other mouse
+# can still race it. If the page itself ever zooms, Ctrl+0 resets it.
+pan_gesture = ctrl_right
+EOF
+      ;;
+    pan_idle_release_ms)
+      cat <<EOF
+
+# How long a pan stroke stays live after you stop moving, in milliseconds.
+#
+# Panning is synthesised by holding the middle button down. A mouse never says
+# "I stopped", so this timeout is what ends a stroke: the button is released this
+# long after the last motion. Without it the button would stay down for ever.
+#
+#   lower   strokes end sooner; brief pauses split one pan into several
+#   higher  the button stays held longer after you stop moving
+#
+# Accepted range is 20-2000; anything outside is clamped.
+pan_idle_release_ms = $DEFAULT_PAN_IDLE_MS
+EOF
+      ;;
+    pan_recenter)
+      cat <<EOF
+
+# Panning drags the real cursor, so a long sweep runs out of screen and the pan
+# dies. With recentring on, the cursor is warped back to the middle of the Chrome
+# window whenever it comes within pan_recenter_margin_px of an edge, making a pan
+# effectively unlimited. The pan button is briefly lifted around the warp so the
+# jump is not read as one huge pan.
+#
+# Set pan_recenter to false to get the old behaviour: pan until you hit the edge,
+# then lift and reposition.
+pan_recenter = true
+pan_recenter_margin_px = $DEFAULT_RECENTER_MARGIN
+EOF
+      ;;
+    pan_yield_to_other_mice)
+      cat <<EOF
+
+# Both mice drive one shared X11 pointer, so while a pan stroke is live the held
+# pan button applies to whatever your other mouse does too: its motion pans, and
+# its wheel arrives as wheel-with-middle-held instead of a clean scroll.
+#
+# With this on, the other mice are watched read-only (never grabbed, so they keep
+# working normally) and any activity on one drops the pan stroke immediately.
+# Panning resumes shortly after they go quiet.
+#
+# Turn it off if resting your hand on the other mouse interrupts panning too eagerly.
+pan_yield_to_other_mice = true
+EOF
+      ;;
+    pan_min_press_interval_ms)
+      cat <<EOF
+
+# Two middle presses inside the double-click interval pair into a double
+# middle-click, which Onshape reads as Zoom to Fit — the view jumps out. Successive
+# presses are held at least this far apart, so the pairing cannot happen at all.
+#
+# A stroke restart waits out the remainder before panning resumes; only short nudges
+# ever wait, since a longer stroke has already used the interval up. The cursor keeps
+# tracking your hand while it waits, it just is not panning yet.
+#
+# This only ever guarded the middle button, so with pan_gesture = ctrl_right it is
+# not needed and defaults to 0 — nothing presses the middle button to pair. Under
+# pan_gesture = middle, 501 sits just past the usual 500ms double-click window.
+#
+# Accepted range 0-2000; 0 disables the wait entirely.
+pan_min_press_interval_ms = 0
+EOF
+      ;;
+  esac
+}
+
+CONFIG_KEYS=(device pan_gesture pan_idle_release_ms pan_recenter
+             pan_yield_to_other_mice pan_min_press_interval_ms)
+
+# Creates the config on first run, carrying over a device chosen under the older
+# single-purpose "device" file so an existing install is not disturbed.
 ensure_config() {
   [[ -f $CONFIG_FILE ]] && return 0
 
@@ -164,35 +270,35 @@ ensure_config() {
     legacy="$(grep -vE '^[[:space:]]*(#|$)' "$LEGACY_DEVICE_FILE" | head -1 || true)"
   fi
 
-  cat > "$CONFIG_FILE" <<EOF
-# Onshape trackball gate — configuration.
-#
-# Apply changes with:
-#   systemctl --user restart $UNIT_NAME
-
-# Which mouse is gated. Set by setup.sh; change it with:  setup.sh --reconfigure
-device = $legacy
-
-# How long a pan stroke stays live after you stop moving, in milliseconds.
-#
-# Panning is synthesised by holding the middle button down. A mouse never says
-# "I stopped", so this timeout is what ends a stroke: the button is released
-# this long after the last motion. Without it the button would stay down for
-# ever. It is also what makes panning feel like trackpad strokes — push, pause,
-# push again — which is how you carry on panning past a screen edge.
-#
-#   lower   strokes end sooner; brief pauses split one pan into several
-#   higher  the button stays held longer after you stop moving
-#
-# Accepted range is 20-2000; anything outside is clamped.
-pan_idle_release_ms = $DEFAULT_PAN_IDLE_MS
-EOF
+  {
+    echo "# Onshape trackball gate — configuration."
+    echo "#"
+    echo "# Apply changes with:"
+    echo "#   systemctl --user restart $UNIT_NAME"
+    echo
+    local key
+    for key in "${CONFIG_KEYS[@]}"; do
+      config_block "$key" "$legacy"
+    done
+  } > "$CONFIG_FILE"
 
   ok "created $CONFIG_FILE"
   if [[ -n $legacy ]]; then
     rm -f "$LEGACY_DEVICE_FILE"
     note "migrated your mouse choice from the old 'device' file"
   fi
+}
+
+# An existing config predates later settings; append what is missing so the file
+# always documents every knob the daemon actually reads.
+ensure_config_keys() {
+  [[ -f $CONFIG_FILE ]] || return 0
+  local key
+  for key in "${CONFIG_KEYS[@]}"; do
+    grep -qE "^[[:space:]]*$key[[:space:]]*=" "$CONFIG_FILE" && continue
+    config_block "$key" >> "$CONFIG_FILE"
+    ok "added $key to $CONFIG_FILE"
+  done
 }
 
 configured_device() {
@@ -206,6 +312,8 @@ configured_device() {
 device_configured() { [[ -n "$(configured_device || true)" ]]; }
 
 configured_pan_ms() { config_get pan_idle_release_ms || printf '%s' "$DEFAULT_PAN_IDLE_MS"; }
+configured_recenter_margin() { config_get pan_recenter_margin_px || printf '%s' "$DEFAULT_RECENTER_MARGIN"; }
+configured_press_interval() { config_get pan_min_press_interval_ms || printf '%s' "$DEFAULT_PRESS_INTERVAL_MS"; }
 
 mouse_name() {
   "$REPO_DIR/pick-mouse.py" --list 2>/dev/null \
@@ -227,10 +335,26 @@ running_exec_ok() {
   tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$REPO_DIR/gate.py"
 }
 
+# Catches an edited gate.py that the running daemon predates. Path and config
+# comparisons both miss this: a python process keeps running its old in-memory code
+# no matter what the file on disk now says.
+running_build_fresh() {
+  local pid started src
+  pid="$(systemctl --user show -p MainPID --value "$UNIT_NAME" 2>/dev/null || true)"
+  [[ -n $pid && $pid != 0 ]] || return 1
+  started="$(date -d "$(ps -o lstart= -p "$pid" 2>/dev/null)" +%s 2>/dev/null)" || return 1
+  [[ -n $started ]] || return 1
+  src="$(stat -c %Y "$REPO_DIR/gate.py" 2>/dev/null)" || return 1
+  (( started >= src ))
+}
+
 daemon_settings_current() {
   daemon_up || return 1
   [[ "$(status_field device 2>/dev/null || true)" == "$(configured_device)" ]] || return 1
   [[ "$(status_field pan_idle_release_ms 2>/dev/null || true)" == "$(configured_pan_ms)" ]] || return 1
+  [[ "$(status_field pan_recenter_margin_px 2>/dev/null || true)" == "$(configured_recenter_margin)" ]] || return 1
+  [[ "$(status_field pan_min_press_interval_ms 2>/dev/null || true)" == "$(configured_press_interval)" ]] || return 1
+  [[ "$(status_field pan_gesture 2>/dev/null || true)" == "$(config_get pan_gesture || printf 'ctrl_right')" ]] || return 1
 }
 
 status_field() {
@@ -308,7 +432,7 @@ show_status() {
   fi
 
   if [[ -f $CONFIG_FILE ]]; then
-    ok "config file present (pan idle release: $(configured_pan_ms) ms)"
+    ok "config file present (pan idle $(configured_pan_ms) ms, recentre margin $(configured_recenter_margin) px)"
     note "$CONFIG_FILE"
   else
     todo "config file not created yet"
@@ -328,6 +452,8 @@ show_status() {
     device_attached && ok "mouse grabbed by daemon"      || todo "mouse NOT grabbed (permissions or unplugged)"
     daemon_settings_current && ok "daemon settings match the config" \
                             || bad "daemon is running stale settings — needs a restart"
+    running_build_fresh && ok "daemon is running the current gate.py" \
+                       || bad "daemon predates the current gate.py — needs a restart"
     extension_seen  && ok "Chrome extension reporting"   || todo "Chrome extension not reporting"
   else
     todo "daemon not responding on port $PORT"
@@ -340,7 +466,8 @@ all_done() {
     && [[ -f $CONFIG_FILE ]] && device_configured \
     && unit_installed && unit_enabled && unit_active \
     && service_exec_ok && running_exec_ok \
-    && daemon_up && device_attached && daemon_settings_current && extension_seen
+    && daemon_up && device_attached && daemon_settings_current \
+    && running_build_fresh && extension_seen
 }
 
 # ---------------------------------------------------------------- steps
@@ -543,6 +670,9 @@ EOF
     need_restart=1
   elif ! daemon_settings_current; then
     todo "config changed since the daemon started"
+    need_restart=1
+  elif ! running_build_fresh; then
+    todo "gate.py changed since the daemon started"
     need_restart=1
   fi
 
@@ -750,6 +880,7 @@ preflight
 if (( ! STATUS_ONLY )); then
   head_ "Configuration"
   ensure_config
+  ensure_config_keys
   [[ -f $CONFIG_FILE ]] && ok "using $CONFIG_FILE"
 fi
 

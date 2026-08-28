@@ -19,7 +19,9 @@ is open. The gate needs **two** signals to agree:
 
 - **X11** says the focused window belongs to Chrome, tracked event-driven via
   `xprop -root -spy _NET_ACTIVE_WINDOW`.
-- **A Chrome extension** says that window's active tab is on `onshape.com`.
+- **A Chrome extension** says the frontmost Chrome window's active tab is on
+  `onshape.com`. It reports only on the *tab*, never on focus — the daemon owns that,
+  so refocusing Chrome reopens the gate instantly instead of waiting for a push.
 
 Neither is sufficient alone: X11 cannot see a tab's URL, and the extension's MV3
 service worker gets suspended while Chrome sits in the background. Window titles
@@ -69,14 +71,17 @@ extensions on startup. That is unavoidable for unpacked extensions.
 `~/.config/onshape-trackball/config`, created on first run:
 
 ```ini
-device = /dev/input/by-id/usb-PixArt_USB_Optical_Mouse-event-mouse
-pan_idle_release_ms = 100
+device      = /dev/input/by-id/usb-PixArt_USB_Optical_Mouse-event-mouse
+pan_gesture = ctrl_right
 ```
 
-`pan_idle_release_ms` is how long a pan stroke stays live after you stop moving.
-Lower splits one pan into more strokes; higher leaves the button held longer after
-you stop. Out-of-range values are clamped to 20–2000; junk falls back to 100 with a
-warning rather than failing to start.
+Every setting is documented inline in the file itself, which `setup.sh` generates and
+keeps up to date — that file is the reference, not this list.
+
+The two that matter most: `pan_gesture` picks which Onshape gesture is synthesised
+(`ctrl_right`, or `middle` for the original middle-drag), and `pan_idle_release_ms` is
+how long a pan stroke stays live after you stop moving. Bad values warn and fall back
+rather than stopping the daemon.
 
 After editing, run `./setup.sh` (it notices the drift and restarts) or:
 
