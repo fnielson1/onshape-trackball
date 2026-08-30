@@ -22,6 +22,7 @@ CONFIG_FILE="$CONFIG_DIR/config"
 LEGACY_DEVICE_FILE="$CONFIG_DIR/device"
 DEFAULT_PAN_IDLE_MS=150
 DEFAULT_RECENTER_MARGIN=20
+DEFAULT_DEADZONE_PX=20
 UDEV_RULE="/etc/udev/rules.d/99-onshape-mouse.rules"
 UNIT_NAME="onshape-mouse-gate.service"
 UNIT_PATH="$HOME/.config/systemd/user/$UNIT_NAME"
@@ -199,6 +200,23 @@ EOF
 pan_idle_release_ms = $DEFAULT_PAN_IDLE_MS
 EOF
       ;;
+    pan_deadzone_px)
+      cat <<EOF
+
+# How far the gated mouse must travel before a pan actually starts.
+#
+# Measured as net displacement, not distance travelled, so jitter that wanders out
+# and back never trips it — only a deliberate push does. Each stroke earns its own
+# dead zone, and a nudge that goes nowhere expires rather than banking toward the
+# next one.
+#
+# Panning only. Rotating, zooming and the left button are unaffected, and the cursor
+# keeps tracking your hand throughout — it just is not panning yet.
+#
+# Accepted range 0-500; 0 starts panning on the first movement.
+pan_deadzone_px = $DEFAULT_DEADZONE_PX
+EOF
+      ;;
     pan_recenter)
       cat <<EOF
 
@@ -240,8 +258,8 @@ EOF
   esac
 }
 
-CONFIG_KEYS=(device left_click_key pan_idle_release_ms pan_recenter
-             pan_yield_to_other_mice)
+CONFIG_KEYS=(device left_click_key pan_deadzone_px pan_idle_release_ms
+             pan_recenter pan_yield_to_other_mice)
 
 # Creates the config on first run, carrying over a device chosen under the older
 # single-purpose "device" file so an existing install is not disturbed.
@@ -337,6 +355,7 @@ daemon_settings_current() {
   [[ "$(status_field pan_idle_release_ms 2>/dev/null || true)" == "$(configured_pan_ms)" ]] || return 1
   [[ "$(status_field pan_recenter_margin_px 2>/dev/null || true)" == "$(configured_recenter_margin)" ]] || return 1
   [[ "$(status_field left_click_key 2>/dev/null || true)" == "$(config_get left_click_key || printf 'space')" ]] || return 1
+  [[ "$(status_field pan_deadzone_px 2>/dev/null || true)" == "$(config_get pan_deadzone_px || printf '%s' "$DEFAULT_DEADZONE_PX")" ]] || return 1
 }
 
 status_field() {

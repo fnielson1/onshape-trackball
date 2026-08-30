@@ -11,6 +11,10 @@ Translator = ns['Translator']
 NAMES = {ecodes.BTN_LEFT:'LEFT', ecodes.BTN_RIGHT:'RIGHT', ecodes.BTN_MIDDLE:'MIDDLE',
          ecodes.KEY_LEFTCTRL:'CTRL', ecodes.KEY_SPACE:'SPACE'}
 
+# The cases below are about gesture mechanics and use small synthetic motions, so
+# the dead zone is off for them. It has its own section at the end.
+ns['PAN_DEADZONE'] = 0
+
 class StubUI:
     def __init__(self, log=None): self.log = [] if log is None else log
     def write(self, t, c, v):
@@ -702,6 +706,99 @@ print(f"{'PASS' if quiet else 'FAIL'}  yielding with nothing held emits nothing"
 if not quiet:
     print(f"      log={log}")
 results.append(quiet)
+
+# --- pan dead zone ---------------------------------------------------------------
+# A pan should need a deliberate push, not a nudge. Measured as net displacement, so
+# jitter that wanders out and back never trips it.
+
+ns['PAN_DEADZONE'] = 10
+
+def dz_setup():
+    log = []
+    ui, mod = StubUI(log), StubUI(log)
+    tr = Translator(ui, mod)
+    ns['GATE'] = StubGate(WINDOW)
+    ns['POINTER'] = StubPointer(CENTRE)
+    return tr, log
+
+def pressed(log):
+    return ('KEY','RIGHT',1) in [x for x in log if x[0] == 'KEY']
+
+# Under the threshold: motion flows, but no pan.
+tr, log = dz_setup()
+for e in motion(4) + motion(4):          # 8px total, still inside
+    tr.handle(e)
+inside = not tr._panning and not pressed(log) and ('REL','X',4) in log
+print(f"{'PASS' if inside else 'FAIL'}  under the dead zone: motion passes, no pan starts")
+if not inside:
+    print(f"      panning={tr._panning}, log={log}")
+results.append(inside)
+
+# Crossing it starts the pan.
+for e in motion(4):                      # 12px total
+    tr.handle(e)
+crossed = tr._panning and pressed(log)
+print(f"{'PASS' if crossed else 'FAIL'}  crossing the dead zone starts the pan")
+if not crossed:
+    print(f"      panning={tr._panning}, log={log}")
+results.append(crossed)
+
+# Jitter out and back nets zero, so it must never trip.
+tr, log = dz_setup()
+for _ in range(6):
+    for e in motion(8) + motion(-8):
+        tr.handle(e)
+jitter = not tr._panning and not pressed(log)
+print(f"{'PASS' if jitter else 'FAIL'}  jitter that returns to origin never starts a pan")
+if not jitter:
+    print(f"      panning={tr._panning}, travel=({tr._travel_x},{tr._travel_y})")
+results.append(jitter)
+
+# Diagonal counts as distance, not per-axis.
+tr, log = dz_setup()
+for e in ([ev(ecodes.EV_REL, ecodes.REL_X, 8), ev(ecodes.EV_REL, ecodes.REL_Y, 8),
+           ev(ecodes.EV_SYN, 0, 0)]):
+    tr.handle(e)
+diagonal = tr._panning and pressed(log)
+print(f"{'PASS' if diagonal else 'FAIL'}  a diagonal push crosses on distance, not per axis")
+if not diagonal:
+    print(f"      panning={tr._panning}, travel=({tr._travel_x},{tr._travel_y})")
+results.append(diagonal)
+
+# Each stroke earns its own dead zone.
+tr, log = dz_setup()
+for e in motion(12):
+    tr.handle(e)
+tr._end_pan(syn=True)
+log.clear()
+for e in motion(4):
+    tr.handle(e)
+re_armed = not tr._panning and not pressed(log)
+print(f"{'PASS' if re_armed else 'FAIL'}  the dead zone re-arms after a stroke ends")
+if not re_armed:
+    print(f"      panning={tr._panning}, log={log}")
+results.append(re_armed)
+
+# A stale nudge expires rather than combining with a later one.
+tr, log = dz_setup()
+for e in motion(8):
+    tr.handle(e)
+tr._last_motion = time.monotonic() - (ns['PAN_IDLE_RELEASE'] + 0.01)
+tr.tick()
+expired = tr._travel_x == 0 and tr._travel_y == 0
+print(f"{'PASS' if expired else 'FAIL'}  a stale nudge expires instead of accumulating")
+if not expired:
+    print(f"      travel=({tr._travel_x},{tr._travel_y})")
+results.append(expired)
+
+# Zero disables it entirely.
+ns['PAN_DEADZONE'] = 0
+tr, log = dz_setup()
+for e in motion(1):
+    tr.handle(e)
+disabled = tr._panning and pressed(log)
+print(f"{'PASS' if disabled else 'FAIL'}  pan_deadzone_px = 0 starts panning immediately")
+results.append(disabled)
 
 print()
 print(f"{sum(results)}/{len(results)} passed")

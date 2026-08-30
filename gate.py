@@ -142,6 +142,14 @@ RECENTER_CHECK_INTERVAL = 0.03
 # dropping the gesture the moment one of them stirs keeps them independent.
 PAN_YIELD = True
 
+# How far the mouse must travel before a pan actually starts. Measured as net
+# displacement, not distance travelled, so jitter that wanders out and back never
+# trips it — only a deliberate push in some direction does.
+#
+# Applies to panning alone. Rotating, zooming and the left button are unaffected: the
+# cursor keeps tracking your hand throughout, it simply is not panning yet.
+PAN_DEADZONE = 10
+
 # A press and release with nothing in between is a click, and Ctrl + right-click
 # opens Chrome's context menu. Every release we emit is preceded by at least this
 # much displacement, so the gesture always reads as a drag.
@@ -263,6 +271,8 @@ class Translator:
         self.yields = 0
         self._last_press_pos = None
         self._last_press_time = 0.0
+        self._travel_x = 0.0
+        self._travel_y = 0.0
         self.drag_nudges = 0
         self._yield_until = 0.0
         self.presses_recentred = 0
@@ -302,6 +312,14 @@ class Translator:
         self._last_press_pos = position
         self._last_press_time = now
 
+    def _within_deadzone(self):
+        return (self._travel_x * self._travel_x + self._travel_y * self._travel_y
+                < PAN_DEADZONE * PAN_DEADZONE)
+
+    def _reset_deadzone(self):
+        self._travel_x = 0.0
+        self._travel_y = 0.0
+
     def _start_pan(self):
         if self._panning:
             return
@@ -310,8 +328,12 @@ class Translator:
         if now < self._yield_until:
             return          # another mouse is mid-gesture; stay out of its way
 
+        if PAN_DEADZONE > 0 and self._within_deadzone():
+            return          # not a deliberate push yet
+
         self._press_pan()
         self._panning = True
+        self._reset_deadzone()
 
     def _handle_right_button(self, event):
         """The pan already holds the right button, so a physical press must not press
@@ -435,6 +457,7 @@ class Translator:
             return
         self._emit_pan_up()
         self._panning = False
+        self._reset_deadzone()      # the next stroke earns its own dead zone
         if syn:
             self._ui.syn()
 
@@ -478,6 +501,10 @@ class Translator:
 
             if etype == ecodes.EV_REL and code in MOTION_AXES:
                 if not self._right_down:
+                    if code == ecodes.REL_X:
+                        self._travel_x += value
+                    else:
+                        self._travel_y += value
                     self._start_pan()
                     self._last_motion = time.monotonic()
                     self._ui.write_event(event)
@@ -575,6 +602,7 @@ class Translator:
                 self._ctrl(0)
             self._ui.syn()
 
+            self._reset_deadzone()
             self.yields += 1
             self._yield_until = time.monotonic() + YIELD_COOLDOWN
 
@@ -591,6 +619,10 @@ class Translator:
 
             if self._panning and now - self._last_motion > PAN_IDLE_RELEASE:
                 self._end_pan(syn=True)
+            elif not self._panning and now - self._last_motion > PAN_IDLE_RELEASE:
+                # Let a stale nudge expire, so movement from a while ago cannot
+                # combine with a fresh one to cross the dead zone.
+                self._reset_deadzone()
 
     def release_all(self):
         """Gate closed. Lift anything we left down, real or synthetic."""
@@ -610,6 +642,7 @@ class Translator:
                 self._ui.write(ecodes.EV_KEY, code, 0)
             self._held.clear()
             self._right_down = False
+            self._reset_deadzone()
             self._ui.syn()
             log("gate closed mid-gesture; released held buttons")
 
@@ -745,6 +778,7 @@ class Gate:
         state["pan_recenter"] = RECENTER and POINTER.ok
         state["pan_recenter_margin_px"] = RECENTER_MARGIN
         state["pan_yield_to_other_mice"] = PAN_YIELD
+        state["pan_deadzone_px"] = PAN_DEADZONE
         state["left_click_key"] = LEFT_CLICK_KEY
         state["device_attached"] = translator is not None
         if translator is not None:
@@ -991,6 +1025,21 @@ def resolve_left_click(config):
     return raw, LEFT_CLICK_CODES[raw]
 
 
+def resolve_deadzone(config):
+    raw = config.get("pan_deadzone_px")
+    if raw is None:
+        return PAN_DEADZONE
+    try:
+        value = int(float(raw))
+    except ValueError:
+        log(f"pan_deadzone_px: '{raw}' is not a number; using {PAN_DEADZONE}")
+        return PAN_DEADZONE
+    clamped = max(0, min(500, value))
+    if clamped != value:
+        log(f"pan_deadzone_px: {value} is outside 0-500; using {clamped}")
+    return clamped
+
+
 def resolve_yield(config):
     raw = config.get("pan_yield_to_other_mice")
     if raw is None:
@@ -1110,12 +1159,14 @@ def wait_for_device(path):
 
 def main():
     global DEVICE_PATH, PAN_IDLE_RELEASE, RECENTER, RECENTER_MARGIN, PAN_YIELD
+    global PAN_DEADZONE
     global LEFT_CLICK_KEY, LEFT_CLICK_CODE
     config = read_config()
     DEVICE_PATH = resolve_device(config)
     PAN_IDLE_RELEASE = resolve_pan_idle(config)
     RECENTER, RECENTER_MARGIN = resolve_recenter(config)
     PAN_YIELD = resolve_yield(config)
+    PAN_DEADZONE = resolve_deadzone(config)
     LEFT_CLICK_KEY, LEFT_CLICK_CODE = resolve_left_click(config)
 
     threading.Thread(target=serve, daemon=True).start()
@@ -1126,7 +1177,8 @@ def main():
     recentring = (f"recentre at {RECENTER_MARGIN}px"
                   if RECENTER and POINTER.ok else "recentring off")
     log(f"listening on 127.0.0.1:{PORT}, gating {DEVICE_PATH} "
-        f"(pan by Ctrl+right-drag, idle release {PAN_IDLE_RELEASE * 1000:.0f}ms, "
+        f"(pan by Ctrl+right-drag, dead zone {PAN_DEADZONE}px, "
+        f"idle release {PAN_IDLE_RELEASE * 1000:.0f}ms, "
         f"{recentring})")
 
     while True:

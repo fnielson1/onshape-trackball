@@ -72,6 +72,22 @@ check("an oversized margin is clamped",
 check("a negative margin is clamped to zero",
       ns["resolve_recenter"](with_config("pan_recenter_margin_px = -40\n")), (True, 0))
 
+# --- pan dead zone --------------------------------------------------------------
+check("dead zone defaults to 20px",
+      ns["resolve_deadzone"](with_config(None)), 20)
+
+check("a custom dead zone is honoured",
+      ns["resolve_deadzone"](with_config("pan_deadzone_px = 25\n")), 25)
+
+check("zero disables the dead zone",
+      ns["resolve_deadzone"](with_config("pan_deadzone_px = 0\n")), 0)
+
+check("a junk dead zone falls back",
+      ns["resolve_deadzone"](with_config("pan_deadzone_px = far\n")), 20)
+
+check("an oversized dead zone is clamped",
+      ns["resolve_deadzone"](with_config("pan_deadzone_px = 9000\n")), 500)
+
 # --- device -------------------------------------------------------------------
 check("device is read from the config",
       ns["resolve_device"](with_config("device = /dev/input/by-id/usb-A-event-mouse\n")),
