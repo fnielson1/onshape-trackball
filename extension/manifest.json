@@ -3,7 +3,26 @@
   "name": "Onshape Mouse Gate",
   "version": "1.0.0",
   "description": "Tells the local mouse-gating daemon whether the frontmost tab is on onshape.com.",
-  "permissions": ["tabs", "alarms"],
-  "host_permissions": ["http://127.0.0.1:47653/*"],
-  "background": { "service_worker": "background.js" }
+  "permissions": [
+    "tabs",
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:47653/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.onshape.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
 }

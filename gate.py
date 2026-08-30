@@ -67,7 +67,11 @@ PAN_BUTTON = ecodes.BTN_MIDDLE
 
 # Ctrl must land before the button and lift after it. The other order leaves a moment
 # of plain right-drag, which Onshape reads as rotate.
-MODIFIER_SETTLE = 0.002
+# Measured too small at 2ms: the button release and the Ctrl release travel through
+# two independent uinput devices, and X was seen processing them out of order,
+# leaving brief windows of button-without-Ctrl that Onshape rotates on. Only paid
+# once per stroke now that a recentre keeps Ctrl down.
+MODIFIER_SETTLE = 0.008
 
 WHEEL_AXES = tuple(
     code for code in ("REL_WHEEL", "REL_HWHEEL", "REL_WHEEL_HI_RES", "REL_HWHEEL_HI_RES")
@@ -94,7 +98,14 @@ PAN_TICK = 0.05
 # Recentring warps the pointer back to the middle of the window when it nears an edge,
 # which makes panning effectively unlimited.
 RECENTER = True
-RECENTER_MARGIN = 80
+RECENTER_MARGIN = 20
+
+# The usable view rect comes from the extension's content script, which probes the
+# page with elementFromPoint to find the region that genuinely belongs to the 3D view
+# — the canvas minus whatever Onshape stacks on top of it. Goes stale if the script
+# stops reporting (tab closed, extension reloaded), at which point we fall back to the
+# whole Chrome window.
+CANVAS_STALE_AFTER = 5.0
 
 # The warp must not land while the pan button is down: Onshape would read the jump as
 # one enormous pan. So the button is lifted, X is given a moment to settle, then it is
@@ -255,7 +266,7 @@ class Translator:
         deferred press, when _panning is false and edge recentring is therefore not
         running — so by press time the cursor can genuinely be outside the window.
         """
-        geometry = GATE.geometry()
+        geometry = GATE.view_rect()
         if geometry is None or position is None or not POINTER.ok:
             return position
 
@@ -345,8 +356,9 @@ class Translator:
 
     def _emit_pan_down(self):
         if PAN_GESTURE == "ctrl_right":
-            self._ctrl(1)
-            time.sleep(MODIFIER_SETTLE)
+            if not self._ctrl_down:
+                self._ctrl(1)
+                time.sleep(MODIFIER_SETTLE)
             if not self._right_emitted:
                 self._ui.write(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1)
                 self._ui.syn()
@@ -371,7 +383,7 @@ class Translator:
                 return                      # already dragged far enough
 
         direction = 1
-        geometry = GATE.geometry()
+        geometry = GATE.view_rect()
         if position is not None and geometry is not None:
             win_x, _, win_w, _ = geometry
             if position[0] + MIN_DRAG_PX > win_x + win_w - 8:
@@ -397,13 +409,18 @@ class Translator:
         self._ui.syn()
         self._right_emitted = False
 
-    def _emit_pan_up(self):
+    def _emit_pan_up(self, keep_modifier=False):
+        """keep_modifier is for the recentre, which lifts and re-presses the button
+        mid-stroke. Dropping Ctrl there too was pure cost: it doubled the number of
+        modifier transitions and opened a window where X could see the button still
+        down with Ctrl already gone, which is a plain right-drag and rotates.
+        """
         if PAN_GESTURE == "ctrl_right":
             # Button first: dropping Ctrl while the button is still down would leave
             # a plain right-drag, which Onshape rotates on.
             if not self._right_down:
                 self._release_right_button()
-            if self._ctrl_down:
+            if self._ctrl_down and not keep_modifier:
                 time.sleep(MODIFIER_SETTLE)
                 self._ctrl(0)
         else:
@@ -470,7 +487,7 @@ class Translator:
         The pan button is lifted around the warp: a jump with it held would be read
         as one enormous pan. Caller holds self._lock.
         """
-        if not RECENTER or not POINTER.ok or not self._panning:
+        if not RECENTER or not POINTER.ok:
             return
 
         now = time.monotonic()
@@ -478,7 +495,7 @@ class Translator:
             return
         self._last_edge_check = now
 
-        geometry = GATE.geometry()
+        geometry = GATE.view_rect()
         if geometry is None:
             return
         win_x, win_y, win_w, win_h = geometry
@@ -498,20 +515,32 @@ class Translator:
         if inside:
             return
 
+        centre_x = win_x + win_w // 2
+        centre_y = win_y + win_h // 2
+
+        if not self._panning:
+            # No button is held, so there is nothing to protect and no press cycle to
+            # pay for — just put the cursor back. This case matters more than it
+            # sounds: motion keeps flowing between strokes and through the yield
+            # cooldown, and without recentring here the cursor wanders clean out of
+            # the view and over the feature tree.
+            POINTER.warp(centre_x, centre_y)
+            self.recenters += 1
+            self._last_motion = time.monotonic()
+            return
+
         # A recentre is a full release + press, so it is another way to produce a
-        # middle-click pair. It used to be exempt from PRESS_MIN_INTERVAL to avoid
-        # stalling mid-sweep, which left it as the last route to an accidental double
-        # middle-click. Wait instead: the pan keeps running on X's implicit grab
+        # click pair. Wait instead: the pan keeps running on X's implicit grab
         # meanwhile, it just cannot be re-anchored yet.
         if now < self._last_press_time + PRESS_MIN_INTERVAL:
             self.recenters_deferred += 1
             return
 
-        self._emit_pan_up()
+        self._emit_pan_up(keep_modifier=True)
         self._ui.syn()
         time.sleep(RECENTER_SETTLE)
 
-        POINTER.warp(win_x + win_w // 2, win_y + win_h // 2)
+        POINTER.warp(centre_x, centre_y)
         time.sleep(RECENTER_SETTLE)
 
         self._press_pan()
@@ -602,6 +631,10 @@ class Gate:
         self._open = False
         self._geometry = None
         self._window_id = None
+        self._canvas = None
+        self._canvas_at = 0.0
+        self._canvas_diag = None
+        self._canvas_diag_at = 0.0
         self.translator = None
 
     def _compute_locked(self):
@@ -650,6 +683,29 @@ class Gate:
         with self._lock:
             return self._geometry
 
+    def set_canvas(self, canvas, diag=None):
+        with self._lock:
+            self._canvas = canvas
+            self._canvas_at = time.monotonic() if canvas else 0.0
+            if diag is not None:
+                self._canvas_diag = diag
+                self._canvas_diag_at = time.monotonic()
+
+    def view_rect(self):
+        """The area the cursor should stay inside: the usable 3D view when the
+        extension is reporting it, otherwise the whole Chrome window.
+
+        It is deliberately not the canvas's own rect. Onshape lays controls over the
+        canvas and, with the feature list collapsed, the canvas runs underneath the
+        slide-out entirely. Those are ordinary DOM elements, so a right-button release
+        over one opens a context menu.
+        """
+        with self._lock:
+            if (self._canvas is not None
+                    and time.monotonic() - self._canvas_at <= CANVAS_STALE_AFTER):
+                return self._canvas
+            return self._geometry
+
     def set_onshape(self, onshape):
         with self._lock:
             self._onshape = onshape
@@ -671,6 +727,12 @@ class Gate:
                 ),
                 "gate_open": self._compute_locked(),
                 "window_geometry": self._geometry,
+                "canvas_rect": self._canvas,
+                "canvas_age": (None if self._canvas_at == 0.0
+                               else round(time.monotonic() - self._canvas_at, 1)),
+                "canvas_diag": self._canvas_diag,
+                "canvas_diag_age": (None if self._canvas_diag_at == 0.0
+                                    else round(time.monotonic() - self._canvas_diag_at, 1)),
             }
             translator = self.translator
         state["device"] = DEVICE_PATH
@@ -707,6 +769,7 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
             GATE.set_onshape(bool(body.get("onshape")))
+            GATE.set_canvas(parse_rect(body.get("canvas")), body.get("diag"))
         except Exception as exc:
             self.send_error(400, str(exc))
             return
@@ -729,6 +792,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+def parse_rect(raw):
+    """-> (x, y, w, h) or None. Comes off the network, so validate rather than trust."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        rect = tuple(int(raw[key]) for key in ("x", "y", "w", "h"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if rect[2] <= 0 or rect[3] <= 0:
+        return None
+    return rect
 
 
 def serve():

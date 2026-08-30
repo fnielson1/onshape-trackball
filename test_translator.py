@@ -110,8 +110,14 @@ class StubPointer:
     def warp(self, x, y): self.warps.append((x, y)); self._pos = (x, y)
 
 class StubGate:
-    def __init__(self, geom): self._geom = geom
+    """geometry() is the Chrome window; view_rect() is what the cursor must stay
+    inside — the canvas when one is known. They differ so a test can tell which one
+    the code actually consulted."""
+    def __init__(self, geom, canvas=None):
+        self._geom = geom
+        self._canvas = canvas
     def geometry(self): return self._geom
+    def view_rect(self): return self._canvas if self._canvas is not None else self._geom
 
 WINDOW = (0, 0, 1920, 1080)          # x, y, w, h
 CENTRE = (960, 540)
@@ -145,22 +151,36 @@ run_recentre("inside but past the margin: no warp",
              (200, 540), [], [])
 
 run_recentre("near the left edge: button lifted, warp, button restored",
-             (40, 540), [CENTRE],
+             (8, 540), [CENTRE],
              [('KEY','MIDDLE',0), ('SYN',), ('KEY','MIDDLE',1), ('SYN',)])
 
 run_recentre("near the bottom edge: same handling",
-             (960, 1040), [CENTRE],
+             (960, 1072), [CENTRE],
              [('KEY','MIDDLE',0), ('SYN',), ('KEY','MIDDLE',1), ('SYN',)])
 
-# Not panning => nothing to protect, so no warp.
+# Not panning still recentres — just without a button cycle, since nothing is held.
+# Motion keeps flowing between strokes and through the yield cooldown, and without
+# this the cursor wanders out of the view and over the feature tree.
 ui = StubUI(); tr = Translator(ui)
 ns['GATE'] = StubGate(WINDOW)
 pointer = StubPointer((5, 5)); ns['POINTER'] = pointer
 tr._last_edge_check = 0.0
 tr._recenter_if_near_edge()
-check_ok = pointer.warps == [] and ui.log == []
-print(f"{'PASS' if check_ok else 'FAIL'}  no warp when not panning")
-results.append(check_ok)
+warped_bare = (pointer.warps == [CENTRE] and ui.log == [] and not tr._panning)
+print(f"{'PASS' if warped_bare else 'FAIL'}  strays are recentred even with no stroke running")
+if not warped_bare:
+    print(f"      warps={pointer.warps}, events={ui.log}")
+results.append(warped_bare)
+
+# Inside the view with no stroke running: leave it alone.
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW)
+pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
+tr._last_edge_check = 0.0
+tr._recenter_if_near_edge()
+left_alone = pointer.warps == [] and ui.log == []
+print(f"{'PASS' if left_alone else 'FAIL'}  no stroke and inside the view: left alone")
+results.append(left_alone)
 
 # A recentre stalls the read loop, so it must refresh the idle deadline or the
 # timer tears down the stroke it just restored.
@@ -170,7 +190,7 @@ pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
 for e in motion(5):
     tr.handle(e)
 tr._last_motion = time.monotonic() - 1.0     # deadline already blown
-pointer._pos = (40, 540)
+pointer._pos = (8, 540)
 tr._last_edge_check = 0.0
 tr._last_press_time = time.monotonic() - (ns['PRESS_MIN_INTERVAL'] + 0.01)
 tr._recenter_if_near_edge()
@@ -353,7 +373,7 @@ ns['GATE'] = StubGate(WINDOW)
 pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
 for e in motion(5):
     tr.handle(e)
-pointer._pos = (40, 540)
+pointer._pos = (8, 540)
 tr._last_edge_check = 0.0
 tr._last_press_time = time.monotonic()      # pressed just now
 ui.log.clear(); pointer.warps.clear()
@@ -368,9 +388,9 @@ results.append(throttled)
 # Once the interval clears, the recentre goes ahead.
 tr._last_press_time = time.monotonic() - (ns['PRESS_MIN_INTERVAL'] + 0.01)
 tr._last_edge_check = 0.0
-pointer._pos = (40, 540)
+pointer._pos = (8, 540)
 tr._recenter_if_near_edge()
-allowed = pointer.warps and tr.recenters == 1
+allowed = bool(pointer.warps) and tr.recenters == 1
 print(f"{'PASS' if allowed else 'FAIL'}  the recentre proceeds once the interval clears")
 if not allowed:
     print(f"      warps={pointer.warps}, recenters={tr.recenters}")
@@ -553,6 +573,94 @@ print(f"{'PASS' if via_nudge else 'FAIL'}  ending a pan nudges, releases right, 
 if not via_nudge:
     print(f"      log={log}")
 results.append(via_nudge)
+
+# --- canvas rect ----------------------------------------------------------------
+# The cursor should be penned inside the 3D canvas, not merely inside the window:
+# Onshape's toolbars and feature tree are inside the window but outside the canvas,
+# and a right-button release over one of them opens a context menu.
+
+parse_rect = ns['parse_rect']
+for label, raw, want in [
+    ("a well-formed rect", {"x": 10, "y": 20, "w": 300, "h": 400}, (10, 20, 300, 400)),
+    ("null", None, None),
+    ("a missing field", {"x": 1, "y": 2, "w": 3}, None),
+    ("a non-numeric field", {"x": "a", "y": 2, "w": 3, "h": 4}, None),
+    ("a zero-area rect", {"x": 1, "y": 2, "w": 0, "h": 4}, None),
+    ("a negative size", {"x": 1, "y": 2, "w": -5, "h": 4}, None),
+]:
+    got = parse_rect(raw)
+    ok = got == want
+    print(f"{'PASS' if ok else 'FAIL'}  parse_rect rejects/accepts {label}")
+    if not ok:
+        print(f"      expected {want}, got {got}")
+    results.append(ok)
+
+WINDOW_RECT = (0, 0, 1920, 1080)
+CANVAS_RECT = (400, 200, 900, 700)
+
+gate = ns['Gate']()
+gate.set_chrome_focused(True, WINDOW_RECT, "0x1")
+falls_back = gate.view_rect() == WINDOW_RECT
+print(f"{'PASS' if falls_back else 'FAIL'}  view_rect uses the window when no canvas is known")
+results.append(falls_back)
+
+gate.set_canvas(CANVAS_RECT)
+prefers = gate.view_rect() == CANVAS_RECT
+print(f"{'PASS' if prefers else 'FAIL'}  view_rect prefers the canvas when it is fresh")
+results.append(prefers)
+
+gate._canvas_at -= (ns['CANVAS_STALE_AFTER'] + 1)
+stale = gate.view_rect() == WINDOW_RECT
+print(f"{'PASS' if stale else 'FAIL'}  view_rect falls back once the canvas goes stale")
+results.append(stale)
+
+# The point of all this: a cursor comfortably inside the window but at the canvas
+# edge must still be recentred, into the canvas rather than the window.
+ns['PAN_GESTURE'] = 'middle'
+ui = StubUI(); tr = Translator(ui)
+ns['GATE'] = StubGate(WINDOW_RECT, CANVAS_RECT)
+pointer = StubPointer((CANVAS_RECT[0] + CANVAS_RECT[2] // 2, CANVAS_RECT[1] + CANVAS_RECT[3] // 2))
+ns['POINTER'] = pointer
+for e in motion(5):
+    tr.handle(e)
+pointer._pos = (CANVAS_RECT[0] + 5, CANVAS_RECT[1] + 300)   # just inside the canvas edge
+pointer.warps.clear()
+tr._last_edge_check = 0.0
+tr._last_press_time = time.monotonic() - (ns['PRESS_MIN_INTERVAL'] + 0.01)
+tr._recenter_if_near_edge()
+canvas_centre = (CANVAS_RECT[0] + CANVAS_RECT[2] // 2, CANVAS_RECT[1] + CANVAS_RECT[3] // 2)
+to_canvas = pointer.warps == [canvas_centre]
+print(f"{'PASS' if to_canvas else 'FAIL'}  recentres to the canvas centre, not the window centre")
+if not to_canvas:
+    print(f"      warps={pointer.warps}, expected [{canvas_centre}]")
+results.append(to_canvas)
+
+# A recentre must not drop Ctrl. Releasing and re-pressing it mid-stroke opened a
+# window where X saw the button still down with Ctrl gone — a plain right-drag,
+# which Onshape rotates on. Measured 26 such episodes in 25s of panning.
+ns['PAN_GESTURE'] = 'ctrl_right'
+tr, log = ctrl_setup()
+for e in motion(5):
+    tr.handle(e)
+ns['POINTER']._pos = (8, 540)
+tr._last_edge_check = 0.0
+tr._last_press_time = time.monotonic() - (ns['PRESS_MIN_INTERVAL'] + 0.01)
+log.clear()
+tr._recenter_if_near_edge()
+ctrl_events = [x for x in log if x[0] == 'KEY' and x[1] == 'CTRL']
+held = tr._ctrl_down and ctrl_events == []
+print(f"{'PASS' if held else 'FAIL'}  ctrl_right: a recentre keeps Ctrl held throughout")
+if not held:
+    print(f"      ctrl_down={tr._ctrl_down}, ctrl events={ctrl_events}")
+results.append(held)
+
+# The button, on the other hand, must still be lifted and re-pressed around the warp.
+btn = [x for x in log if x[0] == 'KEY' and x[1] == 'RIGHT']
+cycled = btn == [('KEY','RIGHT',0), ('KEY','RIGHT',1)]
+print(f"{'PASS' if cycled else 'FAIL'}  ctrl_right: a recentre still cycles the button")
+if not cycled:
+    print(f"      button events={btn}")
+results.append(cycled)
 
 print()
 print(f"{sum(results)}/{len(results)} passed")

@@ -33,13 +33,44 @@ async function activeTabIsOnshape(windowId) {
   }
 }
 
+// Latest canvas rect from the content script, in screen coordinates. Relayed through
+// here because a content script's fetch is subject to the page's CSP, which would
+// block a call to localhost; the service worker is not.
+let canvasRect = null;
+let canvasDiag = null;
+
+// MV3 suspends the service worker freely and its module state does not survive, so
+// the rect has to be parked somewhere durable or it is lost on every restart —
+// leaving the daemon on the whole-window fallback until the content script next
+// reports, which can be a while when Chrome throttles timers in a background tab.
+chrome.storage.session.get(["canvasRect", "canvasDiag"]).then(stored => {
+  if (canvasRect === null && stored.canvasRect) canvasRect = stored.canvasRect;
+  if (canvasDiag === null && stored.canvasDiag) canvasDiag = stored.canvasDiag;
+}).catch(() => {});
+
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (!message || !("canvas" in message)) return;
+  canvasRect = message.canvas;
+  if (message.diag) canvasDiag = message.diag;
+  chrome.storage.session.set({ canvasRect, canvasDiag }).catch(() => {});
+  push(sender.tab && sender.tab.windowId);
+});
+
 async function push(windowId) {
   const onshape = await activeTabIsOnshape(windowId);
   try {
     await fetch(ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ onshape })
+      body: JSON.stringify({
+        onshape,
+        // Sent regardless of `onshape`. Blanking it whenever the frontmost tab is
+        // not Onshape threw away a perfectly good rect every time you alt-tabbed,
+        // and the content script only refreshes it once a second — and not at all
+        // while Chrome throttles timers in a background tab.
+        canvas: canvasRect,
+        diag: canvasDiag
+      })
     });
   } catch {
     // Daemon not running. Nothing to do; it fails closed on its own.

@@ -21,7 +21,7 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/onshape-trackball"
 CONFIG_FILE="$CONFIG_DIR/config"
 LEGACY_DEVICE_FILE="$CONFIG_DIR/device"
 DEFAULT_PAN_IDLE_MS=150
-DEFAULT_RECENTER_MARGIN=80
+DEFAULT_RECENTER_MARGIN=20
 DEFAULT_PRESS_INTERVAL_MS=501
 UDEV_RULE="/etc/udev/rules.d/99-onshape-mouse.rules"
 UNIT_NAME="onshape-mouse-gate.service"
@@ -208,10 +208,18 @@ EOF
       cat <<EOF
 
 # Panning drags the real cursor, so a long sweep runs out of screen and the pan
-# dies. With recentring on, the cursor is warped back to the middle of the Chrome
-# window whenever it comes within pan_recenter_margin_px of an edge, making a pan
+# dies. With recentring on, the cursor is warped back to the middle of the view
+# whenever it comes within pan_recenter_margin_px of an edge, making a pan
 # effectively unlimited. The pan button is briefly lifted around the warp so the
 # jump is not read as one huge pan.
+#
+# The edge is the usable 3D view's edge, not the Chrome window's. The extension
+# probes the page to find the region that genuinely belongs to the view — the canvas
+# minus the controls Onshape stacks on top of it — and the daemon pens the cursor
+# inside that. This is what keeps the cursor off the feature tree and the tool
+# strips, which are ordinary DOM elements and so do not suppress Chrome's context
+# menu the way the canvas does. If the extension stops reporting, it falls back to
+# the whole window after a few seconds.
 #
 # Set pan_recenter to false to get the old behaviour: pan until you hit the edge,
 # then lift and reposition.
