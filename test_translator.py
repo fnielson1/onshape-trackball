@@ -9,7 +9,7 @@ exec(compile(src, 'gate.py', 'exec'), ns)
 Translator = ns['Translator']
 
 NAMES = {ecodes.BTN_LEFT:'LEFT', ecodes.BTN_RIGHT:'RIGHT', ecodes.BTN_MIDDLE:'MIDDLE',
-         ecodes.KEY_LEFTCTRL:'CTRL'}
+         ecodes.KEY_LEFTCTRL:'CTRL', ecodes.KEY_SPACE:'SPACE'}
 
 # The cases below were written against the middle-drag gesture; pin it so they
 # keep testing that path. The Ctrl+right gesture gets its own section at the end.
@@ -94,11 +94,23 @@ results.append(run("wheel passes through without panning",
     [ev(ecodes.EV_REL, ecodes.REL_WHEEL, 1), ev(ecodes.EV_SYN, 0, 0)],
     [('REL','WHEEL',1), ('SYN',)]))
 
-# 8. Left click ends the pan stroke first so the click isn't a middle-drag.
-results.append(run("left click ends pan stroke first",
+# 8. The left button ends the pan stroke and is then swallowed: it taps space to
+# clear the selection instead of clicking. (The tap itself needs the modifier device,
+# which this fixture has none of, so only the swallowing is visible here — the tap is
+# covered in the left-click section further down.)
+results.append(run("left button ends the pan stroke and is swallowed",
     motion(5) + button(ecodes.BTN_LEFT, 1),
-    [('KEY','MIDDLE',1), ('REL','X',5), ('SYN',), ('REL','X',ns['MIN_DRAG_PX']), ('SYN',), 
+    [('KEY','MIDDLE',1), ('REL','X',5), ('SYN',), ('REL','X',ns['MIN_DRAG_PX']), ('SYN',),
+     ('KEY','MIDDLE',0), ('SYN',), ('SYN',)]))
+
+# Passing the click through instead is one config value away.
+saved_code = ns['LEFT_CLICK_CODE']
+ns['LEFT_CLICK_CODE'] = None
+results.append(run("with left_click_key = none, the click passes through as before",
+    motion(5) + button(ecodes.BTN_LEFT, 1),
+    [('KEY','MIDDLE',1), ('REL','X',5), ('SYN',), ('REL','X',ns['MIN_DRAG_PX']), ('SYN',),
      ('KEY','MIDDLE',0), ('KEY','LEFT',1), ('SYN',)]))
+ns['LEFT_CLICK_CODE'] = saved_code
 
 # --- recentring ----------------------------------------------------------------
 # The ordering here is the whole point: a warp landing while the pan button is
@@ -212,7 +224,8 @@ for e in motion(5):
 ui.log.clear()
 tr.yield_stroke()
 yielded = (not tr._panning
-           and ui.log == [('REL','X',ns['MIN_DRAG_PX']), ('SYN',), ('KEY','MIDDLE',0), ('SYN',)]
+           and ui.log == [('REL','X',ns['MIN_DRAG_PX']), ('SYN',), ('KEY','MIDDLE',0),
+                          ('SYN',), ('SYN',)]
            and tr.yields == 1)
 print(f"{'PASS' if yielded else 'FAIL'}  other mouse activity releases the pan button")
 if not yielded:
@@ -661,6 +674,141 @@ print(f"{'PASS' if cycled else 'FAIL'}  ctrl_right: a recentre still cycles the 
 if not cycled:
     print(f"      button events={btn}")
 results.append(cycled)
+
+# --- left click clears the selection ---------------------------------------------
+# The cursor is penned in the middle of the view, so a real left click would just
+# select whatever geometry is under it. Onshape clears the whole selection on space.
+
+ns['PAN_GESTURE'] = 'ctrl_right'
+tr, log = ctrl_setup()
+for e in motion(5):
+    tr.handle(e)
+log.clear()
+tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+keys = [x for x in log if x[0] == 'KEY']
+tapped = ('KEY','SPACE',1) in keys and ('KEY','SPACE',0) in keys and tr.left_taps == 1
+print(f"{'PASS' if tapped else 'FAIL'}  a left click taps space")
+if not tapped:
+    print(f"      log={log}")
+results.append(tapped)
+
+swallowed = not any(x[0] == 'KEY' and x[1] == 'LEFT' for x in log)
+print(f"{'PASS' if swallowed else 'FAIL'}  the left click itself is swallowed")
+if not swallowed:
+    print(f"      log={log}")
+results.append(swallowed)
+
+# Ctrl must be gone before the tap, or it is Ctrl+space rather than space.
+ctrl_up = next((i for i, x in enumerate(log) if x == ('KEY','CTRL',0)), None)
+space_down = next((i for i, x in enumerate(log) if x == ('KEY','SPACE',1)), None)
+ordered = ctrl_up is not None and space_down is not None and ctrl_up < space_down
+print(f"{'PASS' if ordered else 'FAIL'}  the pan is released before the tap")
+if not ordered:
+    print(f"      log={log}")
+results.append(ordered)
+
+# The release is swallowed too, so it cannot tap twice.
+log.clear()
+tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+once = log == [] and tr.left_taps == 1
+print(f"{'PASS' if once else 'FAIL'}  the button release taps nothing further")
+if not once:
+    print(f"      log={log}, taps={tr.left_taps}")
+results.append(once)
+
+# left_click_key = none restores an ordinary click.
+saved = ns['LEFT_CLICK_CODE']
+ns['LEFT_CLICK_CODE'] = None
+tr2, log2 = ctrl_setup()
+tr2.handle(ev(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+passthrough = ('KEY','LEFT',1) in log2 and tr2.left_taps == 0
+print(f"{'PASS' if passthrough else 'FAIL'}  with the key disabled, the click passes through")
+if not passthrough:
+    print(f"      log={log2}")
+results.append(passthrough)
+ns['LEFT_CLICK_CODE'] = saved
+
+# --- the stale _right_down hole --------------------------------------------------
+# If that flag went stale, ending a pan skipped the button release but still dropped
+# Ctrl: button held, no Ctrl, which is a plain right-drag and rotates until something
+# else clears it.
+
+ns['PAN_GESTURE'] = 'ctrl_right'
+tr, log = ctrl_setup()
+for e in motion(5):
+    tr.handle(e)
+tr._right_down = True              # pretend it went stale
+log.clear()
+tr._end_pan(syn=True)
+keys = [x for x in log if x[0] == 'KEY']
+released = ('KEY','RIGHT',0) in keys and not tr._right_emitted
+print(f"{'PASS' if released else 'FAIL'}  a stale right_down cannot strand the button held")
+if not released:
+    print(f"      right_emitted={tr._right_emitted}, keys={keys}")
+results.append(released)
+
+if ('KEY','CTRL',0) in keys and ('KEY','RIGHT',0) in keys:
+    order_ok = keys.index(('KEY','RIGHT',0)) < keys.index(('KEY','CTRL',0))
+else:
+    order_ok = False
+print(f"{'PASS' if order_ok else 'FAIL'}  and the button still goes before Ctrl")
+results.append(order_ok)
+
+# Closing the gate must clear the flag even on the idle path, which used to return
+# early and leave it set.
+tr2, log2 = ctrl_setup()
+tr2._right_down = True             # idle: nothing panning, nothing held
+tr2.release_all()
+cleared = tr2._right_down is False
+print(f"{'PASS' if cleared else 'FAIL'}  closing the gate clears right_down even when idle")
+results.append(cleared)
+
+# --- the right mouse must cancel a rotate, not just a pan ------------------------
+# After the hand-off, _panning is False while the right button stays held. Keying the
+# yield off _panning meant a rotate ran on until the physical button came back up.
+
+ns['PAN_GESTURE'] = 'ctrl_right'
+tr, log = ctrl_setup()
+for e in motion(5):
+    tr.handle(e)
+tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1))    # hand off to rotate
+handed_off = (not tr._panning) and tr._right_emitted and not tr._ctrl_down
+print(f"{'PASS' if handed_off else 'FAIL'}  setup: the hand-off holds the button with _panning False")
+results.append(handed_off)
+
+log.clear()
+tr.yield_stroke()
+cancelled = (not tr._right_emitted
+             and ('KEY','RIGHT',0) in [x for x in log if x[0] == 'KEY']
+             and tr.yields == 1)
+print(f"{'PASS' if cancelled else 'FAIL'}  the right mouse cancels a rotate")
+if not cancelled:
+    print(f"      right_emitted={tr._right_emitted}, yields={tr.yields}, log={log}")
+results.append(cancelled)
+
+# Cancelling a plain pan still works, and still lifts the button before Ctrl.
+tr, log = ctrl_setup()
+for e in motion(5):
+    tr.handle(e)
+log.clear()
+tr.yield_stroke()
+keys = [x for x in log if x[0] == 'KEY']
+pan_cancelled = (not tr._panning and not tr._right_emitted and not tr._ctrl_down
+                 and ('KEY','RIGHT',0) in keys and ('KEY','CTRL',0) in keys
+                 and keys.index(('KEY','RIGHT',0)) < keys.index(('KEY','CTRL',0)))
+print(f"{'PASS' if pan_cancelled else 'FAIL'}  the right mouse still cancels a pan, button before Ctrl")
+if not pan_cancelled:
+    print(f"      keys={keys}")
+results.append(pan_cancelled)
+
+# Nothing held: stay silent rather than emitting stray releases.
+tr, log = ctrl_setup()
+tr.yield_stroke()
+quiet = log == [] and tr.yields == 0
+print(f"{'PASS' if quiet else 'FAIL'}  yielding with nothing held emits nothing")
+if not quiet:
+    print(f"      log={log}")
+results.append(quiet)
 
 print()
 print(f"{sum(results)}/{len(results)} passed")

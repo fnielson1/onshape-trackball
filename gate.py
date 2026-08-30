@@ -67,17 +67,40 @@ PAN_BUTTON = ecodes.BTN_MIDDLE
 
 # Ctrl must land before the button and lift after it. The other order leaves a moment
 # of plain right-drag, which Onshape reads as rotate.
-# Measured too small at 2ms: the button release and the Ctrl release travel through
-# two independent uinput devices, and X was seen processing them out of order,
-# leaving brief windows of button-without-Ctrl that Onshape rotates on. Only paid
-# once per stroke now that a recentre keeps Ctrl down.
-MODIFIER_SETTLE = 0.008
+# The button release and the Ctrl release travel through two independent uinput
+# devices, so nothing but this gap enforces their order — and out of order means a
+# moment of plain right-drag, which Onshape rotates on.
+#
+# Sized by measurement, not guesswork. At 2ms: 26 rotate episodes in 25s of panning.
+# At 8ms: still 18, clustered at 16-20ms, i.e. one per stroke teardown with the gap
+# consistently too short. Set well past that spread.
+#
+# Costs nothing noticeable: it delays only the Ctrl release at the end of a stroke,
+# never the button press or any motion, and a recentre no longer pays it at all.
+MODIFIER_SETTLE = 0.030
+
+# What the gated mouse's left button does. Onshape clears the whole selection on
+# space, which is more useful from a navigation mouse than a left click would be: the
+# cursor is penned in the middle of the view, so a real click would just select
+# whatever geometry happens to be under it.
+#
+# The click is swallowed, not passed through, for that same reason. "none" restores
+# an ordinary left click.
+LEFT_CLICK_KEY = "space"
+LEFT_CLICK_CODES = {
+    "space": ecodes.KEY_SPACE,
+    "esc": ecodes.KEY_ESC,
+    "escape": ecodes.KEY_ESC,
+    "none": None,
+}
 
 WHEEL_AXES = tuple(
     code for code in ("REL_WHEEL", "REL_HWHEEL", "REL_WHEEL_HI_RES", "REL_HWHEEL_HI_RES")
     if hasattr(ecodes, code)
 )
 WHEEL_CODES = tuple(getattr(ecodes, code) for code in WHEEL_AXES)
+
+LEFT_CLICK_CODE = LEFT_CLICK_CODES[LEFT_CLICK_KEY]
 
 # A pan stroke ends after this long without motion, so the synthetic button is never
 # left down. Panning then feels like trackpad strokes: push, pause, push again.
@@ -254,6 +277,7 @@ class Translator:
         self._pending_press = False
         self.press_delays = 0
         self.presses_recentred = 0
+        self.left_taps = 0
         self.recenters_deferred = 0
 
     # --- callers must hold self._lock -------------------------------------------
@@ -347,6 +371,16 @@ class Translator:
             self._release_right_button()
             self._ui.syn()
 
+    def _tap_key(self, code):
+        """Tap a key on the modifier device. Caller holds self._lock."""
+        if self._modifier is None:
+            return
+        self._modifier.write(ecodes.EV_KEY, code, 1)
+        self._modifier.syn()
+        self._modifier.write(ecodes.EV_KEY, code, 0)
+        self._modifier.syn()
+        self.left_taps += 1
+
     def _ctrl(self, value):
         if self._modifier is None:
             return
@@ -418,8 +452,15 @@ class Translator:
         if PAN_GESTURE == "ctrl_right":
             # Button first: dropping Ctrl while the button is still down would leave
             # a plain right-drag, which Onshape rotates on.
-            if not self._right_down:
-                self._release_right_button()
+            #
+            # Released unconditionally. This runs only while a pan owns the button
+            # (_end_pan and the recentre both require _panning), and the hand-off to
+            # rotate never comes through here — _handle_right_button drops Ctrl and
+            # clears _panning itself. Skipping the release when _right_down looked
+            # true therefore protected nothing, and if that flag ever went stale it
+            # left the button held with Ctrl gone: a rotate lasting until something
+            # else happened to clear it.
+            self._release_right_button()
             if self._ctrl_down and not keep_modifier:
                 time.sleep(MODIFIER_SETTLE)
                 self._ctrl(0)
@@ -452,6 +493,13 @@ class Translator:
             if etype == ecodes.EV_KEY:
                 if code == ecodes.BTN_RIGHT:
                     return self._handle_right_button(event)
+                if code == ecodes.BTN_LEFT and LEFT_CLICK_CODE is not None:
+                    if value:
+                        # End the pan first: the tap must not land while Ctrl is still
+                        # held, or it is Ctrl+space rather than space.
+                        self._end_pan(syn=True)
+                        self._tap_key(LEFT_CLICK_CODE)
+                    return                  # swallow press and release alike
                 if value:
                     # Any other button starts a real click; don't leave a pan running
                     # underneath it.
@@ -554,12 +602,26 @@ class Translator:
         self._last_motion = time.monotonic()
 
     def yield_stroke(self):
-        """Another pointing device stirred. Drop the pan so the shared X11 pointer is
-        not carrying a held button into someone else's gesture."""
+        """Another pointing device stirred. Drop everything the gated mouse is
+        holding, so the shared X11 pointer is not carrying it into someone else's
+        gesture.
+
+        Deliberately not conditioned on _panning. After the hand-off to rotate that
+        flag is already False while the right button stays held, so keying off it
+        meant the right mouse could cancel a pan but never a rotate — the button then
+        stayed down until the physical button happened to come back up.
+        """
         with self._lock:
-            if not self._panning:
+            if not (self._panning or self._right_emitted or self._ctrl_down):
                 return
-            self._end_pan(syn=True)
+
+            self._end_pan(syn=True)          # no-op when not panning
+            self._release_right_button()     # this is what catches the rotate
+            if self._ctrl_down:
+                time.sleep(MODIFIER_SETTLE)  # button before Ctrl, as everywhere else
+                self._ctrl(0)
+            self._ui.syn()
+
             self._pending_press = False
             self.yields += 1
             self._yield_until = time.monotonic() + YIELD_COOLDOWN
@@ -592,6 +654,10 @@ class Translator:
         """Gate closed. Lift anything we left down, real or synthetic."""
         with self._lock:
             self._pending_press = False
+            # Cleared before the early return, not after it. Leaving it set here is
+            # how it went stale: close the gate while the physical right button is
+            # down and the flag survived for the rest of the session.
+            self._right_down = False
             if not self._panning and not self._held and not self._right_emitted \
                     and not self._ctrl_down:
                 return
@@ -616,6 +682,7 @@ class Translator:
                 "pan_yields": self.yields,
                 "press_delays": self.press_delays,
                 "presses_recentred": self.presses_recentred,
+                "left_taps": self.left_taps,
                 "recenters_deferred": self.recenters_deferred,
                 "ctrl_held": self._ctrl_down,
                 "drag_nudges": self.drag_nudges,
@@ -742,6 +809,7 @@ class Gate:
         state["pan_yield_to_other_mice"] = PAN_YIELD
         state["pan_min_press_interval_ms"] = round(PRESS_MIN_INTERVAL * 1000)
         state["pan_gesture"] = PAN_GESTURE
+        state["left_click_key"] = LEFT_CLICK_KEY
         state["device_attached"] = translator is not None
         if translator is not None:
             state.update(translator.snapshot())
@@ -976,6 +1044,17 @@ def resolve_recenter(config):
     return enabled, margin
 
 
+def resolve_left_click(config):
+    """-> (key_name, key_code_or_None)."""
+    raw = (config.get("left_click_key") or "").strip().lower()
+    if not raw:
+        raw = LEFT_CLICK_KEY
+    if raw not in LEFT_CLICK_CODES:
+        log(f"left_click_key: '{raw}' is not recognised; using {LEFT_CLICK_KEY}")
+        raw = LEFT_CLICK_KEY
+    return raw, LEFT_CLICK_CODES[raw]
+
+
 def resolve_pan_gesture(config):
     raw = (config.get("pan_gesture") or "").strip().lower()
     if raw in ("ctrl_right", "middle"):
@@ -1123,13 +1202,14 @@ def wait_for_device(path):
 
 def main():
     global DEVICE_PATH, PAN_IDLE_RELEASE, RECENTER, RECENTER_MARGIN, PAN_YIELD
-    global PRESS_MIN_INTERVAL, PAN_GESTURE
+    global PRESS_MIN_INTERVAL, PAN_GESTURE, LEFT_CLICK_KEY, LEFT_CLICK_CODE
     config = read_config()
     DEVICE_PATH = resolve_device(config)
     PAN_IDLE_RELEASE = resolve_pan_idle(config)
     RECENTER, RECENTER_MARGIN = resolve_recenter(config)
     PAN_YIELD = resolve_yield(config)
     PAN_GESTURE = resolve_pan_gesture(config)
+    LEFT_CLICK_KEY, LEFT_CLICK_CODE = resolve_left_click(config)
     PRESS_MIN_INTERVAL = resolve_press_interval(config, PAN_GESTURE)
 
     threading.Thread(target=serve, daemon=True).start()
@@ -1154,9 +1234,9 @@ def main():
                                     product=VIRTUAL_PRODUCT_MOUSE,
                                     phys="onshape-gate/mouse")
 
-            if PAN_GESTURE == "ctrl_right":
+            if PAN_GESTURE == "ctrl_right" or LEFT_CLICK_CODE is not None:
                 modifier = make_modifier_device()
-                if modifier is None:
+                if modifier is None and PAN_GESTURE == "ctrl_right":
                     PAN_GESTURE = "middle"
             translator = Translator(ui, modifier)
             GATE.translator = translator

@@ -105,6 +105,19 @@ check("middle can be selected",
 check("an unknown gesture falls back to the default",
       ns["resolve_pan_gesture"](with_config("pan_gesture = elbow\n")), "ctrl_right")
 
+# --- left click -----------------------------------------------------------------
+check("left click defaults to space",
+      ns["resolve_left_click"](with_config(None))[0], "space")
+
+check("esc can be selected",
+      ns["resolve_left_click"](with_config("left_click_key = esc\n"))[0], "esc")
+
+check("none disables the remap",
+      ns["resolve_left_click"](with_config("left_click_key = none\n"))[1], None)
+
+check("an unknown key falls back to the default",
+      ns["resolve_left_click"](with_config("left_click_key = banana\n"))[0], "space")
+
 # --- device -------------------------------------------------------------------
 check("device is read from the config",
       ns["resolve_device"](with_config("device = /dev/input/by-id/usb-A-event-mouse\n")),

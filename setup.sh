@@ -188,6 +188,22 @@ EOF
 pan_gesture = ctrl_right
 EOF
       ;;
+    left_click_key)
+      cat <<EOF
+
+# What the gated mouse's left button does.
+#
+# Because the cursor is penned in the middle of the view, a real left click would
+# just select whatever geometry happens to be under it — rarely what you want from a
+# navigation mouse. Onshape clears the whole selection on space, so the button taps
+# that instead, and the click itself is swallowed.
+#
+#   space   clear the selection (Onshape's own shortcut)
+#   esc     send Escape instead
+#   none    pass the click straight through, as an ordinary left click
+left_click_key = space
+EOF
+      ;;
     pan_idle_release_ms)
       cat <<EOF
 
@@ -264,7 +280,7 @@ EOF
   esac
 }
 
-CONFIG_KEYS=(device pan_gesture pan_idle_release_ms pan_recenter
+CONFIG_KEYS=(device pan_gesture left_click_key pan_idle_release_ms pan_recenter
              pan_yield_to_other_mice pan_min_press_interval_ms)
 
 # Creates the config on first run, carrying over a device chosen under the older
@@ -363,6 +379,7 @@ daemon_settings_current() {
   [[ "$(status_field pan_recenter_margin_px 2>/dev/null || true)" == "$(configured_recenter_margin)" ]] || return 1
   [[ "$(status_field pan_min_press_interval_ms 2>/dev/null || true)" == "$(configured_press_interval)" ]] || return 1
   [[ "$(status_field pan_gesture 2>/dev/null || true)" == "$(config_get pan_gesture || printf 'ctrl_right')" ]] || return 1
+  [[ "$(status_field left_click_key 2>/dev/null || true)" == "$(config_get left_click_key || printf 'space')" ]] || return 1
 }
 
 status_field() {
