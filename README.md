@@ -6,10 +6,10 @@ tabs, other windows, the desktop — that mouse does nothing at all.
 
 | Left mouse | Onshape sees | Result |
 | --- | --- | --- |
-| move | synthetic middle-drag | **pan** |
-| right button + move | real right-drag | **rotate** |
+| move | synthetic Ctrl + right-drag | **pan** |
+| right button + move | Ctrl dropped, same drag | **rotate** |
 | wheel | wheel | zoom |
-| left button | left click | select |
+| left button | space | **clear the selection** |
 
 ## How it works
 
@@ -28,9 +28,13 @@ service worker gets suspended while Chrome sits in the background. Window titles
 were ruled out early — Onshape's sign-in page is titled just "Sign in", and
 document tabs are named after the document.
 
-Panning is synthesised by holding the middle button down (Onshape's stock
-`View manipulation` mapping). A mouse never reports "I stopped moving", so a
-timeout ends the stroke — see `pan_idle_release_ms` below.
+Panning is synthesised by holding Ctrl and the right button — one of Onshape's two
+documented pan gestures. The other, middle-drag, is deliberately unused: panning
+presses the same button repeatedly, and two presses inside the double-click window
+are a double middle-click, which Onshape reads as Zoom to Fit.
+
+A mouse never reports "I stopped moving", so a timeout ends the stroke — see
+`pan_idle_release_ms` below.
 
 It **fails closed**: if the daemon or extension stops, the mouse goes dead rather
 than becoming unrestricted.
@@ -71,17 +75,14 @@ extensions on startup. That is unavoidable for unpacked extensions.
 `~/.config/onshape-trackball/config`, created on first run:
 
 ```ini
-device      = /dev/input/by-id/usb-PixArt_USB_Optical_Mouse-event-mouse
-pan_gesture = ctrl_right
+device               = /dev/input/by-id/usb-PixArt_USB_Optical_Mouse-event-mouse
+left_click_key       = space
+pan_idle_release_ms  = 150
 ```
 
 Every setting is documented inline in the file itself, which `setup.sh` generates and
-keeps up to date — that file is the reference, not this list.
-
-The two that matter most: `pan_gesture` picks which Onshape gesture is synthesised
-(`ctrl_right`, or `middle` for the original middle-drag), and `pan_idle_release_ms` is
-how long a pan stroke stays live after you stop moving. Bad values warn and fall back
-rather than stopping the daemon.
+keeps up to date — that file is the reference, not this list. Bad values warn and fall
+back rather than stopping the daemon.
 
 After editing, run `./setup.sh` (it notices the drift and restarts) or:
 
@@ -110,7 +111,7 @@ interprets it for you.
 | Mouse completely dead | `gate_open` — needs `chrome_focused` **and** `onshape_tab` |
 | Gate never opens | `seconds_since_extension_push` is `null` → extension not loaded |
 | Mouse works everywhere | Daemon not running, so nothing is grabbing it |
-| Motion does not pan | `PAN_BUTTON` in `gate.py` must match Onshape's `View manipulation` preference |
+| Motion does not pan | Onshape's `View manipulation` preference must accept Ctrl + right-drag |
 | Changes not taking effect | `daemon settings match the config` in `--status` |
 
 You cannot click *into* Onshape with the gated mouse — it is inert until Onshape is

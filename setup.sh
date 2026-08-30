@@ -22,7 +22,6 @@ CONFIG_FILE="$CONFIG_DIR/config"
 LEGACY_DEVICE_FILE="$CONFIG_DIR/device"
 DEFAULT_PAN_IDLE_MS=150
 DEFAULT_RECENTER_MARGIN=20
-DEFAULT_PRESS_INTERVAL_MS=501
 UDEV_RULE="/etc/udev/rules.d/99-onshape-mouse.rules"
 UNIT_NAME="onshape-mouse-gate.service"
 UNIT_PATH="$HOME/.config/systemd/user/$UNIT_NAME"
@@ -38,9 +37,9 @@ usage() {
   cat <<EOF
 ${BOLD}Onshape trackball gate${OFF}
 
-Restricts one mouse so it only works while onshape.com is frontmost in Chrome,
-and turns its motion into Onshape navigation: move pans, right-button+move
-rotates, wheel zooms.
+Restricts one mouse so it only works while onshape.com is frontmost in Chrome, and
+turns its motion into Onshape navigation: move pans (Ctrl+right-drag), right-button
++ move rotates, wheel zooms, left click clears the selection.
 
 Safe to run repeatedly. Every step is checked before it is attempted, so
 re-running after the required logout/login resumes where it left off.
@@ -168,26 +167,6 @@ config_block() {
 device = ${2:-}
 EOF
       ;;
-    pan_gesture)
-      cat <<EOF
-
-# Which Onshape gesture is synthesised for panning. Onshape's stock mapping accepts
-# both middle-drag and Ctrl + right-drag; plain right-drag rotates either way.
-#
-#   ctrl_right  Ctrl is held on a separate virtual keyboard device and the right
-#               button on the mouse one. Nothing ever presses the middle button, so
-#               Onshape's double-middle-click Zoom to Fit cannot fire by accident.
-#               Pressing the physical right button mid-pan drops Ctrl, handing the
-#               same drag over to rotate.
-#   middle      the original synthetic middle-drag.
-#
-# Known cost of ctrl_right: Ctrl + wheel is browser page zoom. The daemon drops Ctrl
-# before any wheel event from the gated mouse, and pan_yield_to_other_mice drops it
-# when another mouse stirs — but the very first notch of a scroll on the other mouse
-# can still race it. If the page itself ever zooms, Ctrl+0 resets it.
-pan_gesture = ctrl_right
-EOF
-      ;;
     left_click_key)
       cat <<EOF
 
@@ -258,30 +237,11 @@ EOF
 pan_yield_to_other_mice = true
 EOF
       ;;
-    pan_min_press_interval_ms)
-      cat <<EOF
-
-# Two middle presses inside the double-click interval pair into a double
-# middle-click, which Onshape reads as Zoom to Fit — the view jumps out. Successive
-# presses are held at least this far apart, so the pairing cannot happen at all.
-#
-# A stroke restart waits out the remainder before panning resumes; only short nudges
-# ever wait, since a longer stroke has already used the interval up. The cursor keeps
-# tracking your hand while it waits, it just is not panning yet.
-#
-# This only ever guarded the middle button, so with pan_gesture = ctrl_right it is
-# not needed and defaults to 0 — nothing presses the middle button to pair. Under
-# pan_gesture = middle, 501 sits just past the usual 500ms double-click window.
-#
-# Accepted range 0-2000; 0 disables the wait entirely.
-pan_min_press_interval_ms = 0
-EOF
-      ;;
   esac
 }
 
-CONFIG_KEYS=(device pan_gesture left_click_key pan_idle_release_ms pan_recenter
-             pan_yield_to_other_mice pan_min_press_interval_ms)
+CONFIG_KEYS=(device left_click_key pan_idle_release_ms pan_recenter
+             pan_yield_to_other_mice)
 
 # Creates the config on first run, carrying over a device chosen under the older
 # single-purpose "device" file so an existing install is not disturbed.
@@ -337,7 +297,6 @@ device_configured() { [[ -n "$(configured_device || true)" ]]; }
 
 configured_pan_ms() { config_get pan_idle_release_ms || printf '%s' "$DEFAULT_PAN_IDLE_MS"; }
 configured_recenter_margin() { config_get pan_recenter_margin_px || printf '%s' "$DEFAULT_RECENTER_MARGIN"; }
-configured_press_interval() { config_get pan_min_press_interval_ms || printf '%s' "$DEFAULT_PRESS_INTERVAL_MS"; }
 
 mouse_name() {
   "$REPO_DIR/pick-mouse.py" --list 2>/dev/null \
@@ -377,8 +336,6 @@ daemon_settings_current() {
   [[ "$(status_field device 2>/dev/null || true)" == "$(configured_device)" ]] || return 1
   [[ "$(status_field pan_idle_release_ms 2>/dev/null || true)" == "$(configured_pan_ms)" ]] || return 1
   [[ "$(status_field pan_recenter_margin_px 2>/dev/null || true)" == "$(configured_recenter_margin)" ]] || return 1
-  [[ "$(status_field pan_min_press_interval_ms 2>/dev/null || true)" == "$(configured_press_interval)" ]] || return 1
-  [[ "$(status_field pan_gesture 2>/dev/null || true)" == "$(config_get pan_gesture || printf 'ctrl_right')" ]] || return 1
   [[ "$(status_field left_click_key 2>/dev/null || true)" == "$(config_get left_click_key || printf 'space')" ]] || return 1
 }
 

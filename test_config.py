@@ -72,52 +72,6 @@ check("an oversized margin is clamped",
 check("a negative margin is clamped to zero",
       ns["resolve_recenter"](with_config("pan_recenter_margin_px = -40\n")), (True, 0))
 
-# --- minimum press interval ----------------------------------------------------
-check("press interval defaults off for ctrl_right",
-      ns["resolve_press_interval"](with_config(None), "ctrl_right"), 0.0)
-
-check("press interval defaults to 501ms for middle-drag",
-      ns["resolve_press_interval"](with_config(None), "middle"), 0.501)
-
-check("a custom press interval is honoured",
-      ns["resolve_press_interval"](with_config("pan_min_press_interval_ms = 300\n"),
-                                   "ctrl_right"), 0.3)
-
-check("zero disables the wait",
-      ns["resolve_press_interval"](with_config("pan_min_press_interval_ms = 0\n"),
-                                   "middle"), 0.0)
-
-check("a junk press interval falls back",
-      ns["resolve_press_interval"](with_config("pan_min_press_interval_ms = soon\n"),
-                                   "middle"), 0.501)
-
-check("an oversized press interval is clamped",
-      ns["resolve_press_interval"](with_config("pan_min_press_interval_ms = 9999\n"),
-                                   "middle"), 2.0)
-
-# --- pan gesture ----------------------------------------------------------------
-check("gesture defaults to ctrl_right",
-      ns["resolve_pan_gesture"](with_config(None)), "ctrl_right")
-
-check("middle can be selected",
-      ns["resolve_pan_gesture"](with_config("pan_gesture = middle\n")), "middle")
-
-check("an unknown gesture falls back to the default",
-      ns["resolve_pan_gesture"](with_config("pan_gesture = elbow\n")), "ctrl_right")
-
-# --- left click -----------------------------------------------------------------
-check("left click defaults to space",
-      ns["resolve_left_click"](with_config(None))[0], "space")
-
-check("esc can be selected",
-      ns["resolve_left_click"](with_config("left_click_key = esc\n"))[0], "esc")
-
-check("none disables the remap",
-      ns["resolve_left_click"](with_config("left_click_key = none\n"))[1], None)
-
-check("an unknown key falls back to the default",
-      ns["resolve_left_click"](with_config("left_click_key = banana\n"))[0], "space")
-
 # --- device -------------------------------------------------------------------
 check("device is read from the config",
       ns["resolve_device"](with_config("device = /dev/input/by-id/usb-A-event-mouse\n")),

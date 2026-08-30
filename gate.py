@@ -5,9 +5,10 @@ The physical device is grabbed exclusively (EVIOCGRAB) so X11 never sees it, and
 events are translated onto a virtual uinput clone only while onshape.com is frontmost.
 
 Translation, while the gate is open:
-    motion                  -> pan   (synthesised as a held middle-button drag)
-    right button + motion   -> rotate (passed straight through; Onshape does this natively)
-    wheel, left button      -> passed through unchanged (zoom, select)
+    motion                  -> pan    (synthesised as a held Ctrl + right-drag)
+    right button + motion   -> rotate (Ctrl is dropped; the same drag carries on)
+    wheel                   -> zoom   (passed through unchanged)
+    left button             -> clear the selection (taps space; the click is swallowed)
 
 The gate opens when both of these agree:
   * X11 says the focused window belongs to Google Chrome  (tracked via `xprop -root -spy`)
@@ -55,15 +56,11 @@ VIRTUAL_PRODUCT_MOUSE = 0x0001
 VIRTUAL_PRODUCT_MODIFIER = 0x0002
 PORT = 47653
 
-# Onshape's stock "View manipulation" preference offers two pan gestures: middle-drag,
-# and Ctrl + right-drag. Plain right-drag rotates.
+# Panning is Ctrl + right-drag; plain right-drag rotates. Ctrl is held on a second
+# virtual device and the right button on the mouse one.
 #
-#   "ctrl_right"  Ctrl is held on a second virtual device and the right button on the
-#                 mouse one. Nothing ever presses the middle button, so Onshape's
-#                 double-middle-click Zoom to Fit cannot fire by accident.
-#   "middle"      the original synthetic middle-drag.
-PAN_GESTURE = "ctrl_right"
-PAN_BUTTON = ecodes.BTN_MIDDLE
+# Onshape's other pan gesture, middle-drag, is deliberately not an option: repeated
+# presses pair into a double middle-click, which Onshape reads as Zoom to Fit.
 
 # Ctrl must land before the button and lift after it. The other order leaves a moment
 # of plain right-drag, which Onshape reads as rotate.
@@ -139,17 +136,11 @@ RECENTER_SETTLE = 0.012
 # real, so the edge check is throttled.
 RECENTER_CHECK_INTERVAL = 0.03
 
-# Both mice drive one shared X11 pointer, so a held pan button applies to whatever the
-# *other* mouse does: its motion pans, and its wheel reaches the page as
-# wheel-with-middle-held rather than a clean scroll. Watching the other mice read-only
-# and dropping the stroke the moment one of them stirs keeps them independent.
+# Both mice drive one shared X11 pointer, so a held pan gesture applies to whatever the
+# *other* mouse does: its motion pans, and its wheel reaches the page with the button
+# still down rather than as a clean scroll. Watching the other mice read-only and
+# dropping the gesture the moment one of them stirs keeps them independent.
 PAN_YIELD = True
-
-# Two middle presses inside the double-click interval pair into a dblclick, which
-# Onshape reads as Zoom to Fit. Holding successive presses this far apart makes the
-# pairing impossible. Only relevant to PAN_GESTURE = "middle"; ctrl_right never
-# presses the middle button and defaults this to 0.
-PRESS_MIN_INTERVAL = 0.501
 
 # A press and release with nothing in between is a click, and Ctrl + right-click
 # opens Chrome's context menu. Every release we emit is preceded by at least this
@@ -264,7 +255,7 @@ class Translator:
         self._right_emitted = False
         self._lock = threading.Lock()
         self._held = set()          # real buttons we have forwarded as pressed
-        self._panning = False       # is PAN_BUTTON currently synthesised down?
+        self._panning = False       # is the pan gesture currently held?
         self._last_motion = 0.0
         self._right_down = False
         self._last_edge_check = 0.0
@@ -274,11 +265,8 @@ class Translator:
         self._last_press_time = 0.0
         self.drag_nudges = 0
         self._yield_until = 0.0
-        self._pending_press = False
-        self.press_delays = 0
         self.presses_recentred = 0
         self.left_taps = 0
-        self.recenters_deferred = 0
 
     # --- callers must hold self._lock -------------------------------------------
 
@@ -322,32 +310,14 @@ class Translator:
         if now < self._yield_until:
             return          # another mouse is mid-gesture; stay out of its way
 
-        if now < self._last_press_time + PRESS_MIN_INTERVAL:
-            # Too soon to press without risking a double middle-click. Defer it; the
-            # timer presses as soon as the interval clears, provided you are still
-            # moving. Motion keeps flowing meanwhile, so the cursor tracks your hand,
-            # it just is not panning yet.
-            if not self._pending_press:
-                self._pending_press = True
-                self.press_delays += 1
-            return
-
         self._press_pan()
         self._panning = True
 
     def _handle_right_button(self, event):
-        """Under ctrl_right the pan already holds the right button, so a physical
-        press must not press it twice. Dropping Ctrl instead turns the very same drag
+        """The pan already holds the right button, so a physical press must not press
+        it twice. Dropping Ctrl instead turns the very same drag
         into Onshape's native rotate. Caller holds self._lock."""
         pressed = event.value != 0
-
-        if PAN_GESTURE != "ctrl_right":
-            self._right_down = pressed
-            if pressed:
-                self._end_pan(syn=False)
-            self._track(event.code, event.value)
-            self._ui.write_event(event)
-            return
 
         if pressed:
             self._right_down = True
@@ -356,9 +326,7 @@ class Translator:
                     time.sleep(MODIFIER_SETTLE)
                     self._ctrl(0)
                 self._panning = False
-                self._pending_press = False
                 return              # button is already down; swallow the duplicate
-            self._pending_press = False
             if not self._right_emitted:
                 self._ui.write(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1)
                 self._right_emitted = True
@@ -389,16 +357,13 @@ class Translator:
         self._ctrl_down = bool(value)
 
     def _emit_pan_down(self):
-        if PAN_GESTURE == "ctrl_right":
-            if not self._ctrl_down:
-                self._ctrl(1)
-                time.sleep(MODIFIER_SETTLE)
-            if not self._right_emitted:
-                self._ui.write(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1)
-                self._ui.syn()
-                self._right_emitted = True
-        else:
-            self._ui.write(ecodes.EV_KEY, PAN_BUTTON, 1)
+        if not self._ctrl_down:
+            self._ctrl(1)
+            time.sleep(MODIFIER_SETTLE)
+        if not self._right_emitted:
+            self._ui.write(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1)
+            self._ui.syn()
+            self._right_emitted = True
 
     def _nudge_for_drag(self):
         """Guarantee a little displacement before releasing a button.
@@ -449,24 +414,19 @@ class Translator:
         modifier transitions and opened a window where X could see the button still
         down with Ctrl already gone, which is a plain right-drag and rotates.
         """
-        if PAN_GESTURE == "ctrl_right":
-            # Button first: dropping Ctrl while the button is still down would leave
-            # a plain right-drag, which Onshape rotates on.
-            #
-            # Released unconditionally. This runs only while a pan owns the button
-            # (_end_pan and the recentre both require _panning), and the hand-off to
-            # rotate never comes through here — _handle_right_button drops Ctrl and
-            # clears _panning itself. Skipping the release when _right_down looked
-            # true therefore protected nothing, and if that flag ever went stale it
-            # left the button held with Ctrl gone: a rotate lasting until something
-            # else happened to clear it.
-            self._release_right_button()
-            if self._ctrl_down and not keep_modifier:
-                time.sleep(MODIFIER_SETTLE)
-                self._ctrl(0)
-        else:
-            self._nudge_for_drag()
-            self._ui.write(ecodes.EV_KEY, PAN_BUTTON, 0)
+        # Button first: dropping Ctrl while the button is still down would leave a
+        # plain right-drag, which Onshape rotates on.
+        #
+        # Released unconditionally. This runs only while a pan owns the button
+        # (_end_pan and the recentre both require _panning), and the hand-off to
+        # rotate never comes through here — _handle_right_button drops Ctrl and clears
+        # _panning itself. Skipping the release when _right_down looked true therefore
+        # protected nothing, and if that flag ever went stale it left the button held
+        # with Ctrl gone: a rotate lasting until something else happened to clear it.
+        self._release_right_button()
+        if self._ctrl_down and not keep_modifier:
+            time.sleep(MODIFIER_SETTLE)
+            self._ctrl(0)
 
     def _end_pan(self, syn):
         """Release the pan gesture. syn=False when the source's own SYN_REPORT is
@@ -511,7 +471,7 @@ class Translator:
             if etype == ecodes.EV_REL and code in WHEEL_CODES:
                 # Ctrl + wheel is browser page zoom, so the modifier must be gone
                 # before a wheel event reaches Chrome.
-                if self._panning and PAN_GESTURE == "ctrl_right":
+                if self._panning:
                     self._end_pan(syn=True)
                 self._ui.write_event(event)
                 return
@@ -577,13 +537,6 @@ class Translator:
             self._last_motion = time.monotonic()
             return
 
-        # A recentre is a full release + press, so it is another way to produce a
-        # click pair. Wait instead: the pan keeps running on X's implicit grab
-        # meanwhile, it just cannot be re-anchored yet.
-        if now < self._last_press_time + PRESS_MIN_INTERVAL:
-            self.recenters_deferred += 1
-            return
-
         self._emit_pan_up(keep_modifier=True)
         self._ui.syn()
         time.sleep(RECENTER_SETTLE)
@@ -622,7 +575,6 @@ class Translator:
                 self._ctrl(0)
             self._ui.syn()
 
-            self._pending_press = False
             self.yields += 1
             self._yield_until = time.monotonic() + YIELD_COOLDOWN
 
@@ -637,23 +589,12 @@ class Translator:
         with self._lock:
             now = time.monotonic()
 
-            if self._pending_press:
-                if now - self._last_motion > PAN_IDLE_RELEASE:
-                    self._pending_press = False      # stopped moving; drop it
-                elif (now >= self._last_press_time + PRESS_MIN_INTERVAL
-                      and now >= self._yield_until):
-                    self._pending_press = False
-                    self._press_pan()
-                    self._panning = True
-                    self._ui.syn()
-
             if self._panning and now - self._last_motion > PAN_IDLE_RELEASE:
                 self._end_pan(syn=True)
 
     def release_all(self):
         """Gate closed. Lift anything we left down, real or synthetic."""
         with self._lock:
-            self._pending_press = False
             # Cleared before the early return, not after it. Leaving it set here is
             # how it went stale: close the gate while the physical right button is
             # down and the flag survived for the rest of the session.
@@ -662,7 +603,6 @@ class Translator:
                     and not self._ctrl_down:
                 return
             self._end_pan(syn=False)
-            self._pending_press = False
             self._release_right_button()
             if self._ctrl_down:
                 self._ctrl(0)
@@ -680,10 +620,8 @@ class Translator:
                 "right_button_down": self._right_down,
                 "recenters": self.recenters,
                 "pan_yields": self.yields,
-                "press_delays": self.press_delays,
                 "presses_recentred": self.presses_recentred,
                 "left_taps": self.left_taps,
-                "recenters_deferred": self.recenters_deferred,
                 "ctrl_held": self._ctrl_down,
                 "drag_nudges": self.drag_nudges,
             }
@@ -807,8 +745,6 @@ class Gate:
         state["pan_recenter"] = RECENTER and POINTER.ok
         state["pan_recenter_margin_px"] = RECENTER_MARGIN
         state["pan_yield_to_other_mice"] = PAN_YIELD
-        state["pan_min_press_interval_ms"] = round(PRESS_MIN_INTERVAL * 1000)
-        state["pan_gesture"] = PAN_GESTURE
         state["left_click_key"] = LEFT_CLICK_KEY
         state["device_attached"] = translator is not None
         if translator is not None:
@@ -1055,33 +991,6 @@ def resolve_left_click(config):
     return raw, LEFT_CLICK_CODES[raw]
 
 
-def resolve_pan_gesture(config):
-    raw = (config.get("pan_gesture") or "").strip().lower()
-    if raw in ("ctrl_right", "middle"):
-        return raw
-    if raw:
-        log(f"pan_gesture: '{raw}' is not recognised; using {PAN_GESTURE}")
-    return PAN_GESTURE
-
-
-def resolve_press_interval(config, gesture):
-    raw = config.get("pan_min_press_interval_ms")
-    if raw is None:
-        # Its only job is stopping two middle presses pairing into Zoom to Fit, which
-        # cannot happen when the middle button is never pressed.
-        return 0.0 if gesture == "ctrl_right" else PRESS_MIN_INTERVAL
-    try:
-        ms = float(raw)
-    except ValueError:
-        log(f"pan_min_press_interval_ms: '{raw}' is not a number; "
-            f"using {PRESS_MIN_INTERVAL * 1000:.0f}ms")
-        return PRESS_MIN_INTERVAL
-    clamped = max(0.0, min(2000.0, ms))
-    if clamped != ms:
-        log(f"pan_min_press_interval_ms: {ms:g} is outside 0-2000; using {clamped:g}")
-    return clamped / 1000.0
-
-
 def resolve_yield(config):
     raw = config.get("pan_yield_to_other_mice")
     if raw is None:
@@ -1126,8 +1035,7 @@ def make_modifier_device():
                       vendor=VIRTUAL_VENDOR, product=VIRTUAL_PRODUCT_MODIFIER,
                       phys="onshape-gate/modifier")
     except OSError as exc:
-        log(f"cannot create the Ctrl device ({exc}); "
-            f"falling back to middle-drag panning")
+        log(f"cannot create the Ctrl device ({exc})")
         return None
 
 
@@ -1202,26 +1110,23 @@ def wait_for_device(path):
 
 def main():
     global DEVICE_PATH, PAN_IDLE_RELEASE, RECENTER, RECENTER_MARGIN, PAN_YIELD
-    global PRESS_MIN_INTERVAL, PAN_GESTURE, LEFT_CLICK_KEY, LEFT_CLICK_CODE
+    global LEFT_CLICK_KEY, LEFT_CLICK_CODE
     config = read_config()
     DEVICE_PATH = resolve_device(config)
     PAN_IDLE_RELEASE = resolve_pan_idle(config)
     RECENTER, RECENTER_MARGIN = resolve_recenter(config)
     PAN_YIELD = resolve_yield(config)
-    PAN_GESTURE = resolve_pan_gesture(config)
     LEFT_CLICK_KEY, LEFT_CLICK_CODE = resolve_left_click(config)
-    PRESS_MIN_INTERVAL = resolve_press_interval(config, PAN_GESTURE)
 
     threading.Thread(target=serve, daemon=True).start()
     threading.Thread(target=watch_focus, daemon=True).start()
     threading.Thread(target=pan_timer, daemon=True).start()
     threading.Thread(target=watch_other_pointers, args=(DEVICE_PATH,),
                      daemon=True).start()
-    gesture = ("Ctrl+right-drag" if PAN_GESTURE == "ctrl_right" else "middle-drag")
     recentring = (f"recentre at {RECENTER_MARGIN}px"
                   if RECENTER and POINTER.ok else "recentring off")
     log(f"listening on 127.0.0.1:{PORT}, gating {DEVICE_PATH} "
-        f"(pan by {gesture}, idle release {PAN_IDLE_RELEASE * 1000:.0f}ms, "
+        f"(pan by Ctrl+right-drag, idle release {PAN_IDLE_RELEASE * 1000:.0f}ms, "
         f"{recentring})")
 
     while True:
@@ -1234,10 +1139,12 @@ def main():
                                     product=VIRTUAL_PRODUCT_MOUSE,
                                     phys="onshape-gate/mouse")
 
-            if PAN_GESTURE == "ctrl_right" or LEFT_CLICK_CODE is not None:
-                modifier = make_modifier_device()
-                if modifier is None and PAN_GESTURE == "ctrl_right":
-                    PAN_GESTURE = "middle"
+            # Ctrl lives on this device, so panning cannot work without it.
+            modifier = make_modifier_device()
+            if modifier is None:
+                raise SystemExit(
+                    "cannot create the Ctrl device, so Ctrl+right-drag panning is "
+                    "impossible; see the error above")
             translator = Translator(ui, modifier)
             GATE.translator = translator
             dev.grab()
