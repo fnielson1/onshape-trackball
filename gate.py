@@ -178,6 +178,16 @@ PAN_YIELD = True
 # cursor keeps tracking your hand throughout, it simply is not panning yet.
 PAN_DEADZONE = 20
 
+# How far the *other* mouse must travel, net, before its motion is treated as
+# deliberate and drops the gated mouse's pan or rotate. Below this, resting a hand on
+# it or bumping it in passing does not interrupt the stroke.
+#
+# Motion only — a button press on the other mouse always yields immediately
+# regardless of this value, since pressing a button is unambiguous. Like
+# pan_deadzone_px, an idle other mouse forgets what it has accumulated rather than
+# banking a stale nudge toward a later one.
+PAN_YIELD_DEADZONE = 20
+
 # A press and release with nothing in between is a click, and Ctrl + right-click
 # opens Chrome's context menu. Every release we emit is preceded by at least this
 # much displacement, so the gesture always reads as a drag.
@@ -266,6 +276,9 @@ class Translator:
         self._last_press_time = 0.0
         self._travel_x = 0.0
         self._travel_y = 0.0
+        self._other_travel_x = 0.0
+        self._other_travel_y = 0.0
+        self._other_travel_at = 0.0
         self.drag_nudges = 0
         self._yield_until = 0.0
         self.presses_recentred = 0
@@ -621,7 +634,7 @@ class Translator:
         # gets much more likely as PAN_IDLE_RELEASE approaches the stall duration.
         self._last_motion = time.monotonic()
 
-    def yield_stroke(self):
+    def yield_stroke(self, dx=0.0, dy=0.0, immediate=False):
         """Another pointing device stirred. Drop everything the gated mouse is
         holding, so the shared pointer is not carrying it into someone else's
         gesture.
@@ -630,10 +643,30 @@ class Translator:
         flag is already False while the right button stays held, so keying off it
         meant the right mouse could cancel a pan but never a rotate — the button then
         stayed down until the physical button happened to come back up.
+
+        Plain motion is subject to its own dead zone, pan_yield_deadzone_px, measured
+        the same way as the gated mouse's: net displacement since the stroke started
+        yielding to it. A button press or a wheel turn is `immediate` and skips it —
+        there is no such thing as an accidental click or an accidental scroll.
         """
         with self._lock:
             if not (self._panning or self._right_emitted or self._ctrl_down):
+                self._other_travel_x = 0.0
+                self._other_travel_y = 0.0
                 return
+
+            if not immediate and PAN_YIELD_DEADZONE > 0:
+                now = time.monotonic()
+                if now - self._other_travel_at > PAN_IDLE_RELEASE:
+                    self._other_travel_x = 0.0
+                    self._other_travel_y = 0.0
+                self._other_travel_at = now
+                self._other_travel_x += dx
+                self._other_travel_y += dy
+                if (self._other_travel_x * self._other_travel_x
+                        + self._other_travel_y * self._other_travel_y
+                        < PAN_YIELD_DEADZONE * PAN_YIELD_DEADZONE):
+                    return      # not a deliberate move yet
 
             self._end_pan(syn=True)          # no-op when not panning
             self._release_right_button()     # this is what catches the rotate
@@ -643,6 +676,8 @@ class Translator:
             self._ui.syn()
 
             self._reset_deadzone()
+            self._other_travel_x = 0.0
+            self._other_travel_y = 0.0
             self.yields += 1
             self._yield_until = time.monotonic() + YIELD_COOLDOWN
 
@@ -917,6 +952,7 @@ class Gate:
         state["pan_recenter_margin_px"] = RECENTER_MARGIN
         state["pan_yield_to_other_mice"] = PAN_YIELD
         state["pan_deadzone_px"] = PAN_DEADZONE
+        state["pan_yield_deadzone_px"] = PAN_YIELD_DEADZONE
         state["left_click_key"] = LEFT_CLICK_KEY
         state["device_attached"] = translator is not None
         if translator is not None:
@@ -1063,10 +1099,10 @@ def watch_focus():
 
 
 def watch_other_pointers(gated_identifier):
-    def on_activity():
+    def on_activity(dx=0.0, dy=0.0, immediate=False):
         translator = GATE.translator
         if translator is not None:
-            translator.yield_stroke()
+            translator.yield_stroke(dx, dy, immediate)
 
     backend.watch_other_pointers(gated_identifier, on_activity,
                                  lambda: PAN_YIELD)
@@ -1173,6 +1209,21 @@ def resolve_deadzone(config):
     return clamped
 
 
+def resolve_yield_deadzone(config):
+    raw = config.get("pan_yield_deadzone_px")
+    if raw is None:
+        return PAN_YIELD_DEADZONE
+    try:
+        value = int(float(raw))
+    except ValueError:
+        log(f"pan_yield_deadzone_px: '{raw}' is not a number; using {PAN_YIELD_DEADZONE}")
+        return PAN_YIELD_DEADZONE
+    clamped = max(0, min(500, value))
+    if clamped != value:
+        log(f"pan_yield_deadzone_px: {value} is outside 0-500; using {clamped}")
+    return clamped
+
+
 def resolve_yield(config):
     raw = config.get("pan_yield_to_other_mice")
     if raw is None:
@@ -1203,7 +1254,7 @@ def resolve_pan_idle(config):
 
 def main():
     global DEVICE_PATH, PAN_IDLE_RELEASE, RECENTER, RECENTER_MARGIN, PAN_YIELD
-    global PAN_DEADZONE
+    global PAN_DEADZONE, PAN_YIELD_DEADZONE
     global LEFT_CLICK_KEY, LEFT_CLICK_CODE
     _open_log()
     config = read_config()
@@ -1212,6 +1263,7 @@ def main():
     RECENTER, RECENTER_MARGIN = resolve_recenter(config)
     PAN_YIELD = resolve_yield(config)
     PAN_DEADZONE = resolve_deadzone(config)
+    PAN_YIELD_DEADZONE = resolve_yield_deadzone(config)
     LEFT_CLICK_KEY, LEFT_CLICK_CODE = resolve_left_click(config)
 
     # Must happen before any window rect is read: on Windows an un-declared process
@@ -1229,6 +1281,7 @@ def main():
                   if RECENTER and POINTER.ok else "recentring off")
     log(f"listening on 127.0.0.1:{PORT}, gating {DEVICE_PATH} "
         f"(pan by Ctrl+right-drag, dead zone {PAN_DEADZONE}px, "
+        f"yield dead zone {PAN_YIELD_DEADZONE}px, "
         f"idle release {PAN_IDLE_RELEASE * 1000:.0f}ms, "
         f"{recentring}, backend {backend.name})")
 

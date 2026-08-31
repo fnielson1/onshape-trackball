@@ -396,7 +396,9 @@ def _other_mice(gated_path):
 
 
 def watch_other_pointers(gated_path, on_activity, enabled):
-    """Read-only watch on the other mice; any activity ends the current pan stroke.
+    """Read-only watch on the other mice; motion is reported so the translator can
+    apply its own dead zone, and a button or wheel always reports as immediate since
+    neither happens by accident.
 
     Opened without EVIOCGRAB, so those mice keep working completely normally.
     """
@@ -432,10 +434,20 @@ def watch_other_pointers(gated_path, on_activity, enabled):
         for fd in ready:
             path, dev = fdmap[fd]
             try:
+                dx = dy = 0
+                immediate = False
                 for event in dev.read():
-                    if event.type in (ecodes.EV_REL, ecodes.EV_KEY):
-                        on_activity()
-                        break
+                    if event.type == ecodes.EV_REL:
+                        if event.code == ecodes.REL_X:
+                            dx += event.value
+                        elif event.code == ecodes.REL_Y:
+                            dy += event.value
+                        else:                    # wheel: as deliberate as a click
+                            immediate = True
+                    elif event.type == ecodes.EV_KEY:
+                        immediate = True
+                if dx or dy or immediate:
+                    on_activity(dx, dy, immediate)
             except OSError:
                 # Unplugged: drop it and let the next scan pick it back up.
                 try:

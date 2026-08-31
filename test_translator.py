@@ -28,6 +28,11 @@ NAMES = {ecodes.BTN_LEFT:'LEFT', ecodes.BTN_RIGHT:'RIGHT', ecodes.BTN_MIDDLE:'MI
 # the dead zone is off for them. It has its own section at the end.
 ns['PAN_DEADZONE'] = 0
 
+# Same for the other-mouse yield dead zone: a bare tr.yield_stroke() with no
+# arguments must still read as an immediate, deliberate yield everywhere except its
+# own dedicated section further down.
+ns['PAN_YIELD_DEADZONE'] = 0
+
 class StubUI:
     def __init__(self, log=None): self.log = [] if log is None else log
     def write(self, t, c, v):
@@ -971,6 +976,80 @@ for e in motion(1):
 disabled = tr._panning and pressed(log)
 print(f"{'PASS' if disabled else 'FAIL'}  pan_deadzone_px = 0 starts panning immediately")
 results.append(disabled)
+
+# --- other-mouse yield dead zone --------------------------------------------------
+# The other mouse stirring should not tear down a pan over a bump or a resting hand
+# — only a deliberate push, measured the same way as pan_deadzone_px, or a button /
+# wheel signal, which is always immediate.
+
+ns['PAN_YIELD_DEADZONE'] = 10
+
+def yz_setup():
+    """A translator already mid-pan, so yield_stroke has something to drop."""
+    tr, log = dz_setup()
+    for e in motion(4):
+        tr.handle(e)
+    log.clear()
+    return tr, log
+
+def released(log):
+    return ('KEY','RIGHT',0) in [x for x in log if x[0] == 'KEY']
+
+# Under the threshold: the pan survives.
+tr, log = yz_setup()
+tr.yield_stroke(dx=4)
+tr.yield_stroke(dx=4)                    # 8px net, still inside
+survives = tr._panning and not released(log) and tr.yields == 0
+print(f"{'PASS' if survives else 'FAIL'}  under the yield dead zone: the pan survives")
+if not survives:
+    print(f"      panning={tr._panning}, yields={tr.yields}, log={log}")
+results.append(survives)
+
+# Crossing it yields.
+tr.yield_stroke(dx=4)                    # 12px net
+crosses = not tr._panning and released(log) and tr.yields == 1
+print(f"{'PASS' if crosses else 'FAIL'}  crossing the yield dead zone drops the pan")
+if not crosses:
+    print(f"      panning={tr._panning}, yields={tr.yields}, log={log}")
+results.append(crosses)
+
+# Diagonal counts as distance, not per-axis.
+tr, log = yz_setup()
+tr.yield_stroke(dx=8, dy=8)
+diagonal = not tr._panning and tr.yields == 1
+print(f"{'PASS' if diagonal else 'FAIL'}  a diagonal nudge crosses on distance, not per axis")
+if not diagonal:
+    print(f"      panning={tr._panning}, travel=({tr._other_travel_x},{tr._other_travel_y})")
+results.append(diagonal)
+
+# A button on the other mouse yields immediately regardless of magnitude.
+tr, log = yz_setup()
+tr.yield_stroke(dx=1, dy=0, immediate=True)
+immediate_ok = not tr._panning and released(log) and tr.yields == 1
+print(f"{'PASS' if immediate_ok else 'FAIL'}  a button/wheel signal yields immediately")
+if not immediate_ok:
+    print(f"      panning={tr._panning}, yields={tr.yields}, log={log}")
+results.append(immediate_ok)
+
+# A stale nudge expires rather than combining with a later one.
+tr, log = yz_setup()
+tr.yield_stroke(dx=8)                    # under 10, not yet yielded
+tr._other_travel_at = time.monotonic() - (ns['PAN_IDLE_RELEASE'] + 0.01)
+tr.yield_stroke(dx=4)                    # would total 12 if it banked, only 4 fresh
+stale_expired = tr._panning and not released(log) and tr.yields == 0
+print(f"{'PASS' if stale_expired else 'FAIL'}  a stale nudge on the other mouse expires instead of accumulating")
+if not stale_expired:
+    print(f"      panning={tr._panning}, yields={tr.yields}, travel=({tr._other_travel_x},{tr._other_travel_y})")
+results.append(stale_expired)
+
+# Zero disables it entirely: the first movement yields.
+ns['PAN_YIELD_DEADZONE'] = 0
+tr, log = yz_setup()
+tr.yield_stroke(dx=1)
+zero_disabled = not tr._panning and released(log) and tr.yields == 1
+print(f"{'PASS' if zero_disabled else 'FAIL'}  pan_yield_deadzone_px = 0 yields on the first movement")
+results.append(zero_disabled)
+ns['PAN_YIELD_DEADZONE'] = 0             # restored for the sections below
 
 # --- nothing under the pointer but canvas ----------------------------------------
 # A pan holds the right button down and drags it. Whatever sits under the pointer

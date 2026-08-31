@@ -53,11 +53,13 @@ def _gate_namespace():
 # ------------------------------------------------------------------ config
 
 CONFIG_KEYS = ("device", "left_click_key", "pan_deadzone_px", "pan_idle_release_ms",
-               "pan_recenter", "pan_recenter_margin_px", "pan_yield_to_other_mice")
+               "pan_recenter", "pan_recenter_margin_px", "pan_yield_to_other_mice",
+               "pan_yield_deadzone_px")
 
 DEFAULT_PAN_IDLE_MS = 150
 DEFAULT_RECENTER_MARGIN = 35
 DEFAULT_DEADZONE_PX = 20
+DEFAULT_YIELD_DEADZONE_PX = 20
 
 RESTART = 'schtasks /Run /TN "Onshape trackball gate"'
 
@@ -184,6 +186,25 @@ def _block(key, device=""):
             "too eagerly.\n"
             "pan_yield_to_other_mice = true\n")
 
+    if key == "pan_yield_deadzone_px":
+        return (
+            "\n# How far the *other* mouse must travel before its motion counts as "
+            "deliberate\n"
+            "# and drops the pan or rotate the gated mouse is holding.\n"
+            "#\n"
+            "# Net displacement, measured the same way as pan_deadzone_px. Below "
+            "this, resting\n"
+            "# a hand on the other mouse or bumping it in passing does not interrupt "
+            "the stroke.\n"
+            "# A button press or a wheel turn on it always interrupts immediately, "
+            "regardless of\n"
+            "# this setting — neither happens by accident.\n"
+            "#\n"
+            "# Accepted range 0-500; 0 yields on the very first movement, which was "
+            "the only\n"
+            "# behaviour before this setting existed.\n"
+            f"pan_yield_deadzone_px = {DEFAULT_YIELD_DEADZONE_PX}\n")
+
     return ""
 
 
@@ -304,6 +325,7 @@ def cmd_drift():
         "pan_recenter_margin_px": margin,
         "pan_yield_to_other_mice": ns["resolve_yield"](config),
         "pan_deadzone_px": ns["resolve_deadzone"](config),
+        "pan_yield_deadzone_px": ns["resolve_yield_deadzone"](config),
         "left_click_key": ns["resolve_left_click"](config)[0],
         "device": config.get("device", ""),
     }

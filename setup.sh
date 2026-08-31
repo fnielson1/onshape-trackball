@@ -23,6 +23,7 @@ LEGACY_DEVICE_FILE="$CONFIG_DIR/device"
 DEFAULT_PAN_IDLE_MS=150
 DEFAULT_RECENTER_MARGIN=35
 DEFAULT_DEADZONE_PX=20
+DEFAULT_YIELD_DEADZONE_PX=20
 UDEV_RULE="/etc/udev/rules.d/99-onshape-mouse.rules"
 UNIT_NAME="onshape-mouse-gate.service"
 UNIT_PATH="$HOME/.config/systemd/user/$UNIT_NAME"
@@ -255,11 +256,27 @@ EOF
 pan_yield_to_other_mice = true
 EOF
       ;;
+    pan_yield_deadzone_px)
+      cat <<EOF
+
+# How far the *other* mouse must travel before its motion counts as deliberate and
+# drops the pan or rotate the gated mouse is holding.
+#
+# Net displacement, measured the same way as pan_deadzone_px. Below this, resting a
+# hand on the other mouse or bumping it in passing does not interrupt the stroke. A
+# button press or a wheel turn on it always interrupts immediately, regardless of
+# this setting — neither happens by accident.
+#
+# Accepted range 0-500; 0 yields on the very first movement, which was the only
+# behaviour before this setting existed.
+pan_yield_deadzone_px = $DEFAULT_YIELD_DEADZONE_PX
+EOF
+      ;;
   esac
 }
 
 CONFIG_KEYS=(device left_click_key pan_deadzone_px pan_idle_release_ms
-             pan_recenter pan_yield_to_other_mice)
+             pan_recenter pan_yield_to_other_mice pan_yield_deadzone_px)
 
 # Creates the config on first run, carrying over a device chosen under the older
 # single-purpose "device" file so an existing install is not disturbed.
@@ -356,6 +373,7 @@ daemon_settings_current() {
   [[ "$(status_field pan_recenter_margin_px 2>/dev/null || true)" == "$(configured_recenter_margin)" ]] || return 1
   [[ "$(status_field left_click_key 2>/dev/null || true)" == "$(config_get left_click_key || printf 'space')" ]] || return 1
   [[ "$(status_field pan_deadzone_px 2>/dev/null || true)" == "$(config_get pan_deadzone_px || printf '%s' "$DEFAULT_DEADZONE_PX")" ]] || return 1
+  [[ "$(status_field pan_yield_deadzone_px 2>/dev/null || true)" == "$(config_get pan_yield_deadzone_px || printf '%s' "$DEFAULT_YIELD_DEADZONE_PX")" ]] || return 1
 }
 
 status_field() {

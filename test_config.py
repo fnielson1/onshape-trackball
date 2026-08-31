@@ -88,6 +88,22 @@ check("a junk dead zone falls back",
 check("an oversized dead zone is clamped",
       ns["resolve_deadzone"](with_config("pan_deadzone_px = 9000\n")), 500)
 
+# --- other-mouse yield dead zone -------------------------------------------------
+check("yield dead zone defaults to 20px",
+      ns["resolve_yield_deadzone"](with_config(None)), 20)
+
+check("a custom yield dead zone is honoured",
+      ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = 8\n")), 8)
+
+check("zero disables the yield dead zone",
+      ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = 0\n")), 0)
+
+check("a junk yield dead zone falls back",
+      ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = far\n")), 20)
+
+check("an oversized yield dead zone is clamped",
+      ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = 9000\n")), 500)
+
 # --- device -------------------------------------------------------------------
 check("device is read from the config",
       ns["resolve_device"](with_config("device = /dev/input/by-id/usb-A-event-mouse\n")),

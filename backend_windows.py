@@ -831,7 +831,9 @@ def _vid_pid(text):
 
 
 def watch_other_pointers(gated_identifier, on_activity, enabled):
-    """Read-only Raw Input watch; any other mouse stirring ends the pan stroke.
+    """Read-only Raw Input watch; motion is reported so the translator can apply its
+    own dead zone, and a button or wheel always reports as immediate since neither
+    happens by accident.
 
     RIDEV_INPUTSINK delivers events even though this window is never focused, and
     Raw Input cannot suppress anything — so unlike the Interception path, a mistake
@@ -867,9 +869,12 @@ def watch_other_pointers(gated_identifier, on_activity, enabled):
                 raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
                 if raw.header.dwType == RIM_TYPEMOUSE:
                     who = _vid_pid(_device_name(raw.header.hDevice))
-                    stirred = (raw.mouse.lLastX or raw.mouse.lLastY
-                               or raw.mouse.b.usButtonFlags)
-                    if stirred and who is not None and who != gated:
+                    dx, dy = raw.mouse.lLastX, raw.mouse.lLastY
+                    # Raw Input folds the wheel into this same flags field (as
+                    # RI_MOUSE_WHEEL, alongside the button bits), so it is already
+                    # exactly the "this was not passive drift" signal we want.
+                    immediate = bool(raw.mouse.b.usButtonFlags)
+                    if (dx or dy or immediate) and who is not None and who != gated:
                         # Raw Input reports our own synthetic strokes too. Rate
                         # limiting is not enough on its own, but combined with the
                         # translator's yield cooldown it keeps a pan from fighting
@@ -878,7 +883,7 @@ def watch_other_pointers(gated_identifier, on_activity, enabled):
                         if now - state["last"] > 0.01:
                             state["last"] = now
                             try:
-                                on_activity()
+                                on_activity(dx, dy, immediate)
                             except Exception as exc:
                                 log(f"yield callback failed: {exc}")
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)

@@ -21,8 +21,12 @@ The interface a backend must provide:
                                    callback(focused, geometry, window_id)
     window_geometry(window_id)  -> (x, y, w, h) or None
     watch_other_pointers(ident, on_activity, enabled)
-                                -> never returns; calls on_activity() when a
-                                   non-gated pointing device stirs
+                                -> never returns; calls
+                                   on_activity(dx, dy, immediate) when a non-gated
+                                   pointing device stirs. dx/dy are its motion, for
+                                   the translator's own dead zone; immediate is True
+                                   for a button or wheel signal, which always bypass
+                                   it
 
 A GatedDevice exposes `.name`, `.events()` yielding objects with
 `.type`/`.code`/`.value`, and `.close()`. Events carry the values in `codes.py`,
