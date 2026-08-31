@@ -337,11 +337,11 @@ def cmd_drift():
 
 def cmd_driver_state():
     try:
-        import interception
+        import interceptor
     except Exception as exc:                       # pragma: no cover - import guard
         print(f"missing|cannot load the binding: {exc}")
         return NO
-    state, message = interception.driver_state()
+    state, message = interceptor.driver_state()
     # Exactly one line, always. Batch reads this with `for /f`, which iterates
     # line by line — a multi-line message means the last line silently overwrites
     # the state, and the "where I looked" detail from a missing DLL is several
@@ -394,8 +394,8 @@ def cmd_device_present(argv):
     if not argv:
         return USAGE
     try:
-        import interception
-        with interception.Context() as ctx:
+        import interceptor
+        with interceptor.Context() as ctx:
             return OK if ctx.devices_for_hardware_id(argv[0]) else NO
     except Exception:
         return NO

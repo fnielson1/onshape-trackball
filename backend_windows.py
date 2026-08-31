@@ -32,7 +32,7 @@ import time
 import winreg
 
 import codes
-import interception
+import interceptor
 
 NAME = "windows"
 
@@ -178,29 +178,29 @@ SYN = Event(codes.EV_SYN, codes.SYN_REPORT, 0)
 # key event with a value. Ordered so a press is seen before a release in the rare
 # stroke that carries both.
 _BUTTON_FLAGS = (
-    (interception.MOUSE_LEFT_BUTTON_DOWN, codes.BTN_LEFT, 1),
-    (interception.MOUSE_LEFT_BUTTON_UP, codes.BTN_LEFT, 0),
-    (interception.MOUSE_RIGHT_BUTTON_DOWN, codes.BTN_RIGHT, 1),
-    (interception.MOUSE_RIGHT_BUTTON_UP, codes.BTN_RIGHT, 0),
-    (interception.MOUSE_MIDDLE_BUTTON_DOWN, codes.BTN_MIDDLE, 1),
-    (interception.MOUSE_MIDDLE_BUTTON_UP, codes.BTN_MIDDLE, 0),
-    (interception.MOUSE_BUTTON_4_DOWN, codes.BTN_SIDE, 1),
-    (interception.MOUSE_BUTTON_4_UP, codes.BTN_SIDE, 0),
-    (interception.MOUSE_BUTTON_5_DOWN, codes.BTN_EXTRA, 1),
-    (interception.MOUSE_BUTTON_5_UP, codes.BTN_EXTRA, 0),
+    (interceptor.MOUSE_LEFT_BUTTON_DOWN, codes.BTN_LEFT, 1),
+    (interceptor.MOUSE_LEFT_BUTTON_UP, codes.BTN_LEFT, 0),
+    (interceptor.MOUSE_RIGHT_BUTTON_DOWN, codes.BTN_RIGHT, 1),
+    (interceptor.MOUSE_RIGHT_BUTTON_UP, codes.BTN_RIGHT, 0),
+    (interceptor.MOUSE_MIDDLE_BUTTON_DOWN, codes.BTN_MIDDLE, 1),
+    (interceptor.MOUSE_MIDDLE_BUTTON_UP, codes.BTN_MIDDLE, 0),
+    (interceptor.MOUSE_BUTTON_4_DOWN, codes.BTN_SIDE, 1),
+    (interceptor.MOUSE_BUTTON_4_UP, codes.BTN_SIDE, 0),
+    (interceptor.MOUSE_BUTTON_5_DOWN, codes.BTN_EXTRA, 1),
+    (interceptor.MOUSE_BUTTON_5_UP, codes.BTN_EXTRA, 0),
 )
 
 _DOWN_FLAG = {
-    (codes.BTN_LEFT, 1): interception.MOUSE_LEFT_BUTTON_DOWN,
-    (codes.BTN_LEFT, 0): interception.MOUSE_LEFT_BUTTON_UP,
-    (codes.BTN_RIGHT, 1): interception.MOUSE_RIGHT_BUTTON_DOWN,
-    (codes.BTN_RIGHT, 0): interception.MOUSE_RIGHT_BUTTON_UP,
-    (codes.BTN_MIDDLE, 1): interception.MOUSE_MIDDLE_BUTTON_DOWN,
-    (codes.BTN_MIDDLE, 0): interception.MOUSE_MIDDLE_BUTTON_UP,
-    (codes.BTN_SIDE, 1): interception.MOUSE_BUTTON_4_DOWN,
-    (codes.BTN_SIDE, 0): interception.MOUSE_BUTTON_4_UP,
-    (codes.BTN_EXTRA, 1): interception.MOUSE_BUTTON_5_DOWN,
-    (codes.BTN_EXTRA, 0): interception.MOUSE_BUTTON_5_UP,
+    (codes.BTN_LEFT, 1): interceptor.MOUSE_LEFT_BUTTON_DOWN,
+    (codes.BTN_LEFT, 0): interceptor.MOUSE_LEFT_BUTTON_UP,
+    (codes.BTN_RIGHT, 1): interceptor.MOUSE_RIGHT_BUTTON_DOWN,
+    (codes.BTN_RIGHT, 0): interceptor.MOUSE_RIGHT_BUTTON_UP,
+    (codes.BTN_MIDDLE, 1): interceptor.MOUSE_MIDDLE_BUTTON_DOWN,
+    (codes.BTN_MIDDLE, 0): interceptor.MOUSE_MIDDLE_BUTTON_UP,
+    (codes.BTN_SIDE, 1): interceptor.MOUSE_BUTTON_4_DOWN,
+    (codes.BTN_SIDE, 0): interceptor.MOUSE_BUTTON_4_UP,
+    (codes.BTN_EXTRA, 1): interceptor.MOUSE_BUTTON_5_DOWN,
+    (codes.BTN_EXTRA, 0): interceptor.MOUSE_BUTTON_5_UP,
 }
 
 _warned_absolute = False
@@ -215,22 +215,22 @@ def stroke_to_events(stroke):
         if stroke.state & flag:
             out.append(Event(codes.EV_KEY, code, value))
 
-    if stroke.state & (interception.MOUSE_WHEEL | interception.MOUSE_HWHEEL):
-        horizontal = bool(stroke.state & interception.MOUSE_HWHEEL)
+    if stroke.state & (interceptor.MOUSE_WHEEL | interceptor.MOUSE_HWHEEL):
+        horizontal = bool(stroke.state & interceptor.MOUSE_HWHEEL)
         rolling = stroke.rolling
         # A whole number of clicks is the ordinary case and maps to REL_WHEEL. A
         # high-resolution wheel sends fractions of a click, and REL_WHEEL_HI_RES is
         # counted in exactly Windows' unit, so neither direction loses precision.
-        if rolling % interception.WHEEL_DELTA == 0:
+        if rolling % interceptor.WHEEL_DELTA == 0:
             code = codes.REL_HWHEEL if horizontal else codes.REL_WHEEL
             out.append(Event(codes.EV_REL, code,
-                             rolling // interception.WHEEL_DELTA))
+                             rolling // interceptor.WHEEL_DELTA))
         else:
             code = (codes.REL_HWHEEL_HI_RES if horizontal
                     else codes.REL_WHEEL_HI_RES)
             out.append(Event(codes.EV_REL, code, rolling))
 
-    if stroke.flags & interception.MOUSE_MOVE_ABSOLUTE:
+    if stroke.flags & interceptor.MOUSE_MOVE_ABSOLUTE:
         # Tablets and RDP report absolute coordinates. The translator's whole model
         # is relative deltas, so mistranslating would be worse than declining.
         if (stroke.x or stroke.y) and not _warned_absolute:
@@ -303,7 +303,7 @@ def _collect_name(key, names):
 
 def enumerate_mice():
     """[(hardware_id, display_name)] for every mouse the driver can see."""
-    with interception.Context() as ctx:
+    with interceptor.Context() as ctx:
         found = ctx.mice()
 
     names = _friendly_names()
@@ -333,7 +333,7 @@ def detect_mouse(timeout):
     Every mouse is filtered for the duration, so each stroke has to be sent back on
     or the machine loses its pointer while the user is being asked to move one.
     """
-    with interception.Context() as ctx:
+    with interceptor.Context() as ctx:
         devices = {d: h for d, h in ctx.mice()}
         if not devices:
             return None
@@ -351,7 +351,7 @@ def detect_mouse(timeout):
                 if stroke is None:
                     continue
                 ctx.send_mouse(device, stroke)      # keep the mouse alive
-                if stroke.flags & interception.MOUSE_MOVE_ABSOLUTE:
+                if stroke.flags & interceptor.MOUSE_MOVE_ABSOLUTE:
                     continue
                 moved = abs(stroke.x) + abs(stroke.y)
                 if not moved:
@@ -377,11 +377,11 @@ class GatedDevice:
 
     def __init__(self, hardware_id):
         self.hardware_id = hardware_id
-        self.ctx = interception.Context()
+        self.ctx = interceptor.Context()
         self.device = _wait_for_device(self.ctx, hardware_id)
         self.name = _label_for(hardware_id)
         self.template = self
-        self.ctx.filter_device(self.device, interception.FILTER_MOUSE_ALL)
+        self.ctx.filter_device(self.device, interceptor.FILTER_MOUSE_ALL)
         self._closed = False
 
     def events(self):
@@ -455,7 +455,7 @@ class VirtualOutput:
 
     def _reset(self):
         self._state = 0
-        self._flags = interception.MOUSE_MOVE_RELATIVE
+        self._flags = interceptor.MOUSE_MOVE_RELATIVE
         self._rolling = 0
         self._x = 0
         self._y = 0
@@ -474,16 +474,16 @@ class VirtualOutput:
             elif code == codes.REL_Y:
                 self._y += value
             elif code == codes.REL_WHEEL:
-                self._state |= interception.MOUSE_WHEEL
-                self._rolling += value * interception.WHEEL_DELTA
+                self._state |= interceptor.MOUSE_WHEEL
+                self._rolling += value * interceptor.WHEEL_DELTA
             elif code == codes.REL_HWHEEL:
-                self._state |= interception.MOUSE_HWHEEL
-                self._rolling += value * interception.WHEEL_DELTA
+                self._state |= interceptor.MOUSE_HWHEEL
+                self._rolling += value * interceptor.WHEEL_DELTA
             elif code == codes.REL_WHEEL_HI_RES:
-                self._state |= interception.MOUSE_WHEEL
+                self._state |= interceptor.MOUSE_WHEEL
                 self._rolling += value
             elif code == codes.REL_HWHEEL_HI_RES:
-                self._state |= interception.MOUSE_HWHEEL
+                self._state |= interceptor.MOUSE_HWHEEL
                 self._rolling += value
             else:
                 return
@@ -498,7 +498,7 @@ class VirtualOutput:
     def syn(self):
         if not self._pending:
             return
-        stroke = interception.MouseStroke(
+        stroke = interceptor.MouseStroke(
             state=self._state, flags=self._flags, rolling=self._rolling,
             x=self._x, y=self._y, information=0)
         self._reset()

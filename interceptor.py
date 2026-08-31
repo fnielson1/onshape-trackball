@@ -2,7 +2,7 @@
 
 Only the calls this project needs. A wrapper rather than a dependency for the same
 reason `Pointer` used raw ctypes over python-xlib on Linux: the surface is a dozen
-functions, and vendoring it keeps the install to "put interception.dll somewhere".
+functions, and vendoring it keeps the install to "put interceptor.dll somewhere".
 
 The driver is what makes a Windows exclusive grab possible at all. It sits above the
 mouse class driver, so a stroke it hands us has not reached any application — if we
@@ -89,20 +89,17 @@ class InterceptionError(RuntimeError):
 
 
 def _candidate_paths():
-    """Where interception.dll might be, most specific first."""
+    """Where interceptor.dll might be, most specific first."""
     here = os.path.dirname(os.path.abspath(__file__))
-    arch = "x64" if sys.maxsize > 2 ** 32 else "x86"
-    yield os.path.join(here, "vendor", "interception", arch, "interception.dll")
-    yield os.path.join(here, "vendor", "interception.dll")
-    yield os.path.join(here, "interception.dll")
-    yield "interception.dll"          # PATH / system32
+    yield os.path.join(here, "interceptor.dll")
+    yield "interceptor.dll"          # PATH / system32
 
 
 _lib = None
 
 
 def library():
-    """Load interception.dll, cached. Raises InterceptionError if it is not there."""
+    """Load interceptor.dll, cached. Raises InterceptionError if it is not there."""
     global _lib
     if _lib is not None:
         return _lib
@@ -119,45 +116,44 @@ def library():
         return _lib
 
     raise InterceptionError(
-        "interception.dll not found. Looked in:\n  " + "\n  ".join(tried)
-        + "\nInstall the Interception driver and place the DLL beside gate.py "
-          "(or in vendor/interception/<arch>/).")
+        "interceptor.dll not found. Looked in:\n  " + "\n  ".join(tried)
+        + "\nInstall the Interception driver and place the DLL beside gate.py.")
 
 
 def _bind(lib):
-    lib.interception_create_context.restype = ctypes.c_void_p
-    lib.interception_create_context.argtypes = []
+    lib.interceptor_create_context.restype = ctypes.c_void_p
+    lib.interceptor_create_context.argtypes = []
 
-    lib.interception_destroy_context.restype = None
-    lib.interception_destroy_context.argtypes = [ctypes.c_void_p]
+    lib.interceptor_destroy_context.restype = None
+    lib.interceptor_destroy_context.argtypes = [ctypes.c_void_p]
 
-    lib.interception_set_filter.restype = None
-    lib.interception_set_filter.argtypes = [ctypes.c_void_p, PREDICATE,
+    lib.interceptor_set_filter.restype = None
+    lib.interceptor_set_filter.argtypes = [ctypes.c_void_p, PREDICATE,
                                             ctypes.c_ushort]
 
-    lib.interception_wait.restype = ctypes.c_int
-    lib.interception_wait.argtypes = [ctypes.c_void_p]
+    lib.interceptor_wait.restype = ctypes.c_int
+    lib.interceptor_wait.argtypes = [ctypes.c_void_p]
 
-    lib.interception_wait_with_timeout.restype = ctypes.c_int
-    lib.interception_wait_with_timeout.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    lib.interceptor_wait_with_timeout.restype = ctypes.c_int
+    lib.interceptor_wait_with_timeout.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 
-    lib.interception_send.restype = ctypes.c_int
-    lib.interception_send.argtypes = [ctypes.c_void_p, ctypes.c_int,
+    lib.interceptor_send.restype = ctypes.c_int
+    lib.interceptor_send.argtypes = [ctypes.c_void_p, ctypes.c_int,
                                       ctypes.c_void_p, ctypes.c_uint]
 
-    lib.interception_receive.restype = ctypes.c_int
-    lib.interception_receive.argtypes = [ctypes.c_void_p, ctypes.c_int,
+    lib.interceptor_receive.restype = ctypes.c_int
+    lib.interceptor_receive.argtypes = [ctypes.c_void_p, ctypes.c_int,
                                          ctypes.c_void_p, ctypes.c_uint]
 
-    lib.interception_get_hardware_id.restype = ctypes.c_uint
-    lib.interception_get_hardware_id.argtypes = [ctypes.c_void_p, ctypes.c_int,
+    lib.interceptor_get_hardware_id.restype = ctypes.c_uint
+    lib.interceptor_get_hardware_id.argtypes = [ctypes.c_void_p, ctypes.c_int,
                                                  ctypes.c_void_p, ctypes.c_uint]
 
-    lib.interception_is_mouse.restype = ctypes.c_int
-    lib.interception_is_mouse.argtypes = [ctypes.c_int]
+    lib.interceptor_is_mouse.restype = ctypes.c_int
+    lib.interceptor_is_mouse.argtypes = [ctypes.c_int]
 
-    lib.interception_is_keyboard.restype = ctypes.c_int
-    lib.interception_is_keyboard.argtypes = [ctypes.c_int]
+    lib.interceptor_is_keyboard.restype = ctypes.c_int
+    lib.interceptor_is_keyboard.argtypes = [ctypes.c_int]
 
 
 class Context:
@@ -171,7 +167,7 @@ class Context:
     def __init__(self):
         lib = library()
         self._lib = lib
-        handle = lib.interception_create_context()
+        handle = lib.interceptor_create_context()
         if not handle:
             raise InterceptionError(
                 "the Interception driver is installed but not accepting a context. "
@@ -183,7 +179,7 @@ class Context:
 
     def close(self):
         if self._ctx is not None:
-            self._lib.interception_destroy_context(self._ctx)
+            self._lib.interceptor_destroy_context(self._ctx)
             self._ctx = None
 
     def __enter__(self):
@@ -202,7 +198,7 @@ class Context:
         """
         size = 1024
         buf = ctypes.create_unicode_buffer(size)
-        written = self._lib.interception_get_hardware_id(
+        written = self._lib.interceptor_get_hardware_id(
             self._ctx, device, buf, size * ctypes.sizeof(ctypes.c_wchar))
         if not written or written > size * ctypes.sizeof(ctypes.c_wchar):
             return ""
@@ -245,7 +241,7 @@ class Context:
             return 1 if candidate == device else 0
 
         self._predicate = PREDICATE(predicate)
-        self._lib.interception_set_filter(self._ctx, self._predicate, filter_bits)
+        self._lib.interceptor_set_filter(self._ctx, self._predicate, filter_bits)
 
     def filter_devices(self, devices, filter_bits=FILTER_MOUSE_ALL):
         """Route several devices to us at once — what detection needs, since it has
@@ -256,7 +252,7 @@ class Context:
             return 1 if candidate in wanted else 0
 
         self._predicate = PREDICATE(predicate)
-        self._lib.interception_set_filter(self._ctx, self._predicate, filter_bits)
+        self._lib.interceptor_set_filter(self._ctx, self._predicate, filter_bits)
 
     def clear_filter(self):
         """Stop filtering. The device goes back to behaving normally immediately."""
@@ -264,7 +260,7 @@ class Context:
             return 0
 
         self._predicate = PREDICATE(predicate)
-        self._lib.interception_set_filter(self._ctx, self._predicate,
+        self._lib.interceptor_set_filter(self._ctx, self._predicate,
                                           FILTER_MOUSE_NONE)
 
     # --- i/o -----------------------------------------------------------------------
@@ -272,13 +268,13 @@ class Context:
     def wait(self, timeout_ms=None):
         """Device number with a stroke ready, or 0 on timeout."""
         if timeout_ms is None:
-            return self._lib.interception_wait(self._ctx)
-        return self._lib.interception_wait_with_timeout(self._ctx, timeout_ms)
+            return self._lib.interceptor_wait(self._ctx)
+        return self._lib.interceptor_wait_with_timeout(self._ctx, timeout_ms)
 
     def receive_mouse(self, device):
         """One mouse stroke, or None."""
         buf = Stroke()
-        got = self._lib.interception_receive(self._ctx, device,
+        got = self._lib.interceptor_receive(self._ctx, device,
                                              ctypes.byref(buf), 1)
         if got <= 0:
             return None
@@ -287,12 +283,12 @@ class Context:
     def send_mouse(self, device, stroke):
         buf = Stroke()
         ctypes.memmove(buf, ctypes.byref(stroke), ctypes.sizeof(MouseStroke))
-        return self._lib.interception_send(self._ctx, device, ctypes.byref(buf), 1)
+        return self._lib.interceptor_send(self._ctx, device, ctypes.byref(buf), 1)
 
     def send_key(self, device, stroke):
         buf = Stroke()
         ctypes.memmove(buf, ctypes.byref(stroke), ctypes.sizeof(KeyStroke))
-        return self._lib.interception_send(self._ctx, device, ctypes.byref(buf), 1)
+        return self._lib.interceptor_send(self._ctx, device, ctypes.byref(buf), 1)
 
 
 # Device class GUIDs, and the filter driver Interception prepends to each. It
@@ -341,12 +337,12 @@ def driver_state():
         library()
     except InterceptionError:
         # Deliberately short, and careful not to conflate two separate things: the
-        # driver is installed by install-interception.exe, while interception.dll is
+        # driver is installed by install-interception.exe, while interceptor.dll is
         # a file you copy yourself. Installing the driver and stopping there is the
         # easy mistake, and "is the driver installed?" would send you to check the
         # one thing that is already done.
         return ("missing",
-                "interception.dll not found - copy it next to gate.py "
+                "interceptor.dll not found - copy it next to gate.py "
                 "(this is a separate step from installing the driver)")
 
     try:
@@ -360,7 +356,7 @@ def driver_state():
                     "the driver is installed but not yet active - reboot to "
                     "activate it, then run this again")
         return ("missing",
-                "interception.dll is here but the driver is not installed - run "
+                "interceptor.dll is here but the driver is not installed - run "
                 "install-interception.exe /install from an admin prompt, "
                 "then reboot")
     try:

@@ -119,7 +119,7 @@ is attempted, and it resumes rather than repeating work.
 1. **Driver** *(administrator)* — installs Interception. Download it from
    [oblitum/Interception](https://github.com/oblitum/Interception), run
    `install-interception.exe /install` from an elevated prompt, and put
-   `interception.dll` next to `gate.py` or in `vendor\interception\x64\`.
+   `interceptor.dll` next to `gate.py`.
 2. **Reboot** — the driver only takes effect on a fresh boot. The script stops
    here and tells you, then continues from step 3 on the next run. This is the
    Windows counterpart of the Linux udev-rule-and-re-login gate.
@@ -286,7 +286,7 @@ extension yourself at `chrome://extensions`.
 | `backend.py` | Picks a platform backend and defines the interface |
 | `backend_linux.py` | evdev/uinput capture, libX11 cursor, `xprop` focus |
 | `backend_windows.py` | Interception capture, Win32 cursor, focus and Raw Input |
-| `interception.py` | ctypes binding for `interception.dll` |
+| `interceptor.py` | ctypes binding for `interceptor.dll` |
 | `codes.py` | Input event constants, so the core needs no evdev |
 | `pick-mouse.py` | Lists mice, or detects one by movement (Linux) |
 | `extension/` | Chrome MV3 extension reporting the active tab |

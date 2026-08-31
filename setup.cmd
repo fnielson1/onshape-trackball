@@ -265,8 +265,8 @@ echo.
 echo   1. Download the release from https://github.com/oblitum/Interception
 echo   2. From an administrator prompt, in its command line folder:
 echo          install-interception.exe /install
-echo   3. Copy interception.dll ^(x64^) next to gate.py, or into
-echo          %REPO_DIR%\vendor\interception\x64\
+echo   3. Copy interceptor.dll ^(x64^) next to gate.py:
+echo          %REPO_DIR%\interceptor.dll
 echo   4. Reboot, then run this script again.
 echo.
 call :is_admin

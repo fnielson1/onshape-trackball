@@ -184,7 +184,7 @@ user is `setup.cmd --uninstall` plus an opt-in driver removal.
 
 **Resolved during implementation:**
 
-- *Which Interception binding.* An in-repo `ctypes` wrapper (`interception.py`), for
+- *Which Interception binding.* An in-repo `ctypes` wrapper (`../../../interceptor.py`), for
   the reason anticipated: the surface actually needed is a dozen calls, and it keeps
   the install to "put the DLL somewhere" rather than adding a pip dependency.
 - *Whether to accept other Chromium builds.* No — `chrome.exe` only. The extension
