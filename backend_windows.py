@@ -27,6 +27,7 @@ be collateral damage.
 import ctypes
 import ctypes.wintypes as wt
 import os
+import re
 import time
 import winreg
 
@@ -807,12 +808,26 @@ def _device_name(handle):
     return buf.value
 
 
-def _normalise(name):
-    """Raw Input device paths and Interception hardware IDs describe the same device
-    with different punctuation: `\\\\?\\HID#VID_046D&PID_C52B#7&...` against
-    `HID\\VID_046D&PID_C52B`. Flattening the separators lets one be tested against
-    the other with a substring check."""
-    return name.upper().replace("\\", "#").replace("?", "").strip("#")
+_VID_PID = re.compile(r"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})")
+
+
+def _vid_pid(text):
+    """(vid, pid) from either an Interception hardware ID or a Raw Input path.
+
+    The two name the same device differently, and not merely in punctuation:
+
+        Interception  HID\\VID_04CA&PID_0061&REV_0100
+        Raw Input     \\\\?\\HID#VID_04CA&PID_0061#9&299ea37&0&0000#{378de44c-...}
+
+    Interception carries a REV_ component that the device interface path does not,
+    and the path carries an instance id and interface GUID that the hardware ID does
+    not. A substring test between them therefore never matches — which meant the
+    gated mouse was never recognised as itself, so its own motion (including the
+    strokes we inject) counted as "another pointer stirred" and cancelled the very
+    pan it was drawing. VID and PID are the part both forms agree on.
+    """
+    m = _VID_PID.search(text or "")
+    return (m.group(1).upper(), m.group(2).upper()) if m else None
 
 
 def watch_other_pointers(gated_identifier, on_activity, enabled):
@@ -822,7 +837,16 @@ def watch_other_pointers(gated_identifier, on_activity, enabled):
     Raw Input cannot suppress anything — so unlike the Interception path, a mistake
     here can never leave one of the user's other mice dead.
     """
-    gated = _normalise(gated_identifier)
+    gated = _vid_pid(gated_identifier)
+    if gated is None:
+        # Yielding on everything is exactly the pathology this exclusion exists to
+        # avoid: it would cancel every pan the gated mouse draws. If the gated
+        # device cannot be identified, not yielding at all is the safe failure.
+        log(f"cannot read a VID/PID from {gated_identifier!r}; "
+            f"pan_yield_to_other_mice disabled")
+        while True:
+            time.sleep(60)
+
     class_name = "OnshapeGateRawInput"
     hinstance = kernel32.GetModuleHandleW(None)
     state = {"last": 0.0}
@@ -842,10 +866,10 @@ def watch_other_pointers(gated_identifier, on_activity, enabled):
             if got and got != -1:
                 raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
                 if raw.header.dwType == RIM_TYPEMOUSE:
-                    name = _normalise(_device_name(raw.header.hDevice))
+                    who = _vid_pid(_device_name(raw.header.hDevice))
                     stirred = (raw.mouse.lLastX or raw.mouse.lLastY
                                or raw.mouse.b.usButtonFlags)
-                    if stirred and gated and gated not in name:
+                    if stirred and who is not None and who != gated:
                         # Raw Input reports our own synthetic strokes too. Rate
                         # limiting is not enough on its own, but combined with the
                         # translator's yield cooldown it keeps a pan from fighting

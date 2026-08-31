@@ -162,7 +162,42 @@ MOTION_AXES = (ecodes.REL_X, ecodes.REL_Y)
 
 
 def log(msg):
-    print(f"[gate] {msg}", flush=True)
+    # Tolerant of there being nowhere to write. Under pythonw both streams are None
+    # until _open_log runs, and a logging call is never worth taking the daemon down.
+    stream = sys.stdout or sys.stderr
+    if stream is None:
+        return
+    try:
+        print(f"[gate] {msg}", file=stream, flush=True)
+    except Exception:
+        pass
+
+
+def _open_log():
+    """Send both streams to a file when there is no console.
+
+    The daemon is started directly by the scheduled task rather than through a shell,
+    so there is no `>>` to redirect it — and pythonw gives a process no stdout at all.
+    Without this a crash would leave nothing behind but a service that stopped.
+
+    Only when the streams are genuinely absent: run from a console, it keeps the
+    console.
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    path = os.environ.get("ONSHAPE_GATE_LOG")
+    if not path:
+        base = (os.environ.get("LOCALAPPDATA") if sys.platform == "win32"
+                else os.environ.get("XDG_STATE_HOME"))
+        base = base or os.path.expanduser("~")
+        path = os.path.join(base, "onshape-trackball", "gate.log")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        stream = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    sys.stdout = stream
+    sys.stderr = stream
 
 
 POINTER = backend.Pointer()
@@ -975,6 +1010,7 @@ def main():
     global DEVICE_PATH, PAN_IDLE_RELEASE, RECENTER, RECENTER_MARGIN, PAN_YIELD
     global PAN_DEADZONE
     global LEFT_CLICK_KEY, LEFT_CLICK_CODE
+    _open_log()
     config = read_config()
     DEVICE_PATH = resolve_device(config)
     PAN_IDLE_RELEASE = resolve_pan_idle(config)

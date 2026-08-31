@@ -295,6 +295,42 @@ class Context:
         return self._lib.interception_send(self._ctx, device, ctypes.byref(buf), 1)
 
 
+# Device class GUIDs, and the filter driver Interception prepends to each. It
+# installs itself as an upper filter on the mouse and keyboard classes; that
+# registry entry is the authoritative "is it installed", and it survives the gap
+# between installing and rebooting, which nothing else does.
+_CLASS_FILTERS = (
+    ("mouse", r"SYSTEM\CurrentControlSet\Control\Class"
+              r"\{4D36E96F-E325-11CE-BFC1-08002BE10318}"),
+    ("keyboard", r"SYSTEM\CurrentControlSet\Control\Class"
+                 r"\{4D36E96B-E325-11CE-BFC1-08002BE10318}"),
+)
+
+
+def filters_registered():
+    """Has install-interception.exe run? Reads the registry; needs no admin.
+
+    Creating a context cannot answer this: it fails identically whether the driver
+    is installed and waiting for a reboot or was never installed at all. Telling
+    someone to reboot when they have not run the installer wastes a reboot and
+    leaves them exactly where they started.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return False
+
+    for driver, path in _CLASS_FILTERS:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+                filters, _ = winreg.QueryValueEx(key, "UpperFilters")
+        except OSError:
+            continue
+        if any(str(f).lower() == driver for f in (filters or ())):
+            return True
+    return False
+
+
 def driver_state():
     """-> 'active' | 'needs_reboot' | 'missing', plus a human explanation.
 
@@ -304,17 +340,29 @@ def driver_state():
     try:
         library()
     except InterceptionError:
-        # Deliberately short. The caller is a status board; the full list of paths
-        # tried is on the exception for anyone running gate.py directly, and
-        # setup.cmd prints the install steps itself.
-        return "missing", "interception.dll not found (is the driver installed?)"
+        # Deliberately short, and careful not to conflate two separate things: the
+        # driver is installed by install-interception.exe, while interception.dll is
+        # a file you copy yourself. Installing the driver and stopping there is the
+        # easy mistake, and "is the driver installed?" would send you to check the
+        # one thing that is already done.
+        return ("missing",
+                "interception.dll not found - copy it next to gate.py "
+                "(this is a separate step from installing the driver)")
 
     try:
         ctx = Context()
     except InterceptionError:
-        return ("needs_reboot",
-                "the Interception DLL loads but the driver is not answering; "
-                "it needs the reboot that activates it")
+        # Distinguished by the registry, not by this failure: creating a context
+        # fails identically whether the driver is installed and waiting for a
+        # reboot or was never installed at all.
+        if filters_registered():
+            return ("needs_reboot",
+                    "the driver is installed but not yet active - reboot to "
+                    "activate it, then run this again")
+        return ("missing",
+                "interception.dll is here but the driver is not installed - run "
+                "install-interception.exe /install from an admin prompt, "
+                "then reboot")
     try:
         if not ctx.mice():
             return ("needs_reboot",

@@ -34,7 +34,7 @@
 - [x] 4.3 Report the focused window's absolute rect via `GetWindowRect`
 - [x] 4.4 Report not-focused when there is no foreground window, the shell holds focus, or the owning process cannot be queried
 - [x] 4.5 Restart the watcher on failure, setting `chrome_focused` false and logging the reason first
-- [ ] 4.6 Verify the gate opens only when focus and the extension's tab report agree, and reopens instantly on refocus without a new push
+- [x] 4.6 Verify the gate opens only when focus and the extension's tab report agree, and reopens instantly on refocus without a new push
 
 ## 5. `setup.cmd` — scaffolding and read-only paths
 
@@ -59,7 +59,7 @@
 - [x] 6.10 Detect config drift against the running daemon's settings and restart the service
 - [x] 6.11 Verify the device grab and print the extension step with the absolute path to `extension/`, reporting it as done once a push has arrived
 - [x] 6.12 Implement `--reconfigure` — re-pick the mouse and restart the service
-- [ ] 6.13 Verify a re-run on a complete install reports every step done and changes nothing, and that an interrupted run resumes correctly
+- [x] 6.13 Verify a re-run on a complete install reports every step done and changes nothing, and that an interrupted run resumes correctly
 
 ## 7. `setup.cmd` — uninstall
 

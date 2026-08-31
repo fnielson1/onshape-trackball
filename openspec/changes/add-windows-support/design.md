@@ -119,6 +119,15 @@ at-logon trigger, "run only when user is logged on", and restart-on-failure is t
 closest analogue to a systemd *user* unit. A true Windows service would need session
 brokering for no benefit.
 
+*Registered through PowerShell's `Register-ScheduledTask`, not `schtasks /Create`.*
+Found by running it: `schtasks /Create /SC ONLOGON` fails with "Access is denied" for
+a standard user, because that trigger can target any user and schtasks therefore
+demands administrator rights. That would have broken the very parallel this decision
+rests on — a systemd user unit needs no root, and only the driver step here should
+need admin. `Register-ScheduledTask` creates the same at-logon task for the current
+user without elevation, and carries the settings in one call, where schtasks cannot
+express restart-on-failure at all.
+
 ### DPI awareness declared per-monitor
 
 `GetWindowRect`, `GetCursorPos` and `SetCursorPos` must agree on a coordinate space or
@@ -225,3 +234,33 @@ cannot proceed. `choice` takes one keypress from the console and returns it as a
 exit code, so there is no variable that can come back empty; `set /p` remains as a
 fallback, and mouse selection falls back to it when there are more than nine mice,
 since `choice` accepts only single characters.
+
+### Two failures found only by using it
+
+**The gated mouse cancelled its own pans.** `pan_yield_to_other_mice` excluded the
+gated device by testing whether its Interception hardware ID appeared in the Raw
+Input device path. Those two name the same device differently, and not only in
+punctuation:
+
+    Interception  HID\VID_04CA&PID_0061&REV_0100
+    Raw Input     \?\HID#VID_04CA&PID_0061#9&299ea37&0&0000#{378de44c-...}
+
+Interception carries a `REV_` component the interface path lacks; the path carries
+an instance id and interface GUID the hardware ID lacks. The substring test could
+therefore never match, so every motion of the gated mouse — including the strokes
+the daemon injects itself — counted as "another pointer stirred" and tore down the
+pan, then blocked the next one for the yield cooldown. It presented as heavy jerk
+and roughly a fifth of the expected pan distance. Matching is now on the VID/PID
+pair, the part both forms agree on, and an unparseable gated identifier disables
+yielding rather than yielding on everything.
+
+**The daemon outlived every attempt to stop it.** The task ran a generated
+`run-gate.cmd`, which invoked the `pyw` launcher — and `pyw` spawns pythonw and
+returns immediately. The wrapper exited, the task reported completion, and the
+daemon was left with no task tree, so `schtasks /End` did nothing. That is the
+documented way to get the gated mouse back, and it silently did not work. The task
+now runs `pythonw.exe` directly with `gate.py` as its argument, so the task owns the
+process; the wrapper is gone. Since there is no longer a shell to redirect output,
+and pythonw gives a process no stdout at all, `gate.py` opens its own log when it
+finds both streams absent — which also means a crash now leaves evidence instead of
+just a stopped service.

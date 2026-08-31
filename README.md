@@ -189,6 +189,7 @@ interprets it for you.
 | Mouse completely dead | `gate_open` — needs `chrome_focused` **and** `onshape_tab` |
 | Gate never opens | `seconds_since_extension_push` is `null` → extension not loaded |
 | Mouse works everywhere | Daemon not running, so nothing is grabbing it |
+| Cursor strays onto the feature tree while panning | `canvas_rect` is `null` → the content script is not running, so the cursor is penned to the whole window. **Reload the Onshape tab** — Chrome does not inject content scripts into pages that were already open when the extension was loaded |
 | Motion does not pan | Onshape's `View manipulation` preference must accept Ctrl + right-drag |
 | Changes not taking effect | `daemon settings match the config` in `--status` |
 
