@@ -1,0 +1,11 @@
+# cmd.exe seeks by byte offset when it runs `goto` or `call`, and computes that
+# offset assuming CRLF. A batch file checked out with LF endings therefore lands
+# mid-line and executes garbage — progressively, one byte further off per line,
+# so it fails in a way that looks like the file is corrupt rather than misencoded.
+# Forced, not merely normalised, because a clone with core.autocrlf=input would
+# otherwise produce a script that cannot run.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Shell scripts break the other way: CRLF leaves \r on the shebang.
+*.sh text eol=lf

@@ -1,12 +1,25 @@
-"""Drive Translator with synthetic evdev events against a stub UInput."""
+"""Drive Translator with synthetic events against a stub virtual device."""
 import os, sys, time, types
-from evdev import ecodes, InputEvent
 
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gate.py')).read()
 src = src.replace('if __name__ == "__main__":', 'if False:')
 ns = {}
 exec(compile(src, 'gate.py', 'exec'), ns)
 Translator = ns['Translator']
+
+# Codes come from the module under test, not from evdev directly, so this suite runs
+# on Windows as well — where evdev cannot be installed at all. The values are the
+# same either way; backend_linux asserts as much at import.
+ecodes = ns['ecodes']
+
+
+class InputEvent:
+    """evdev's constructor signature over the three fields Translator reads."""
+    __slots__ = ('sec', 'usec', 'type', 'code', 'value')
+
+    def __init__(self, sec, usec, etype, code, value):
+        self.sec, self.usec = sec, usec
+        self.type, self.code, self.value = etype, code, value
 
 NAMES = {ecodes.BTN_LEFT:'LEFT', ecodes.BTN_RIGHT:'RIGHT', ecodes.BTN_MIDDLE:'MIDDLE',
          ecodes.KEY_LEFTCTRL:'CTRL', ecodes.KEY_SPACE:'SPACE'}

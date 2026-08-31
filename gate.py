@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Turn the left-hand mouse into an Onshape navigation device.
 
-The physical device is grabbed exclusively (EVIOCGRAB) so X11 never sees it, and its
-events are translated onto a virtual uinput clone only while onshape.com is frontmost.
+The physical device is grabbed exclusively so the desktop never sees it, and its
+events are translated onto a synthetic device only while onshape.com is frontmost.
 
 Translation, while the gate is open:
     motion                  -> pan    (synthesised as a held Ctrl + right-drag)
@@ -11,49 +11,39 @@ Translation, while the gate is open:
     left button             -> clear the selection (taps space; the click is swallowed)
 
 The gate opens when both of these agree:
-  * X11 says the focused window belongs to Google Chrome  (tracked via `xprop -root -spy`)
+  * the focused window belongs to Google Chrome
   * the Chrome extension says the focused window's active tab is on onshape.com
 
-Either signal alone is insufficient: X11 cannot see a tab's URL, and the extension's
-MV3 service worker can be suspended while Chrome sits in the background.
+Either signal alone is insufficient: the window manager cannot see a tab's URL, and
+the extension's MV3 service worker can be suspended while Chrome sits in the
+background.
+
+Everything in this file is platform-neutral. The four things that are not — exclusive
+capture, synthetic output, the cursor, and focus tracking — live behind `backend.py`,
+which picks an implementation from sys.platform. Both test suites exec this file, so
+it must stay importable on a machine with no driver, no display and no hardware.
 """
 
-import ctypes
-import glob
 import json
 import os
+import signal
 import sys
-import re
-import select
-import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import evdev
-from evdev import UInput, ecodes
+import backend
+import codes as ecodes
 
-# Settings live in a "key = value" file written by setup.sh. Everything here is
-# resolved lazily in main() so the module stays importable (test_translator.py execs
-# this file) on a machine with no config yet.
-_CONFIG_DIR = os.path.join(
-    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-    "onshape-trackball",
-)
+# Settings live in a "key = value" file written by the setup script. Everything here
+# is resolved lazily in main() so the module stays importable (test_translator.py
+# execs this file) on a machine with no config yet.
+_CONFIG_DIR = backend.config_dir()
 CONFIG_PATH = os.path.join(_CONFIG_DIR, "config")
 
 # Superseded by CONFIG_PATH; still read so an older install keeps working.
 LEGACY_DEVICE_PATH = os.path.join(_CONFIG_DIR, "device")
 
-VIRTUAL_NAME = "Onshape-gated Mouse"
-MODIFIER_NAME = "Onshape-gated Modifier"
-
-# python-evdev stamps every uinput device with the same vendor/product/phys, so
-# libinput lumps them into one LIBINPUT_DEVICE_GROUP and X exposes only the first —
-# the keyboard half then silently never arrives. Distinct ids keep them separate.
-VIRTUAL_VENDOR = 0x6f73
-VIRTUAL_PRODUCT_MOUSE = 0x0001
-VIRTUAL_PRODUCT_MODIFIER = 0x0002
 PORT = 47653
 
 # Panning is Ctrl + right-drag; plain right-drag rotates. Ctrl is held on a second
@@ -64,9 +54,9 @@ PORT = 47653
 
 # Ctrl must land before the button and lift after it. The other order leaves a moment
 # of plain right-drag, which Onshape reads as rotate.
-# The button release and the Ctrl release travel through two independent uinput
-# devices, so nothing but this gap enforces their order — and out of order means a
-# moment of plain right-drag, which Onshape rotates on.
+# The button release and the Ctrl release travel through two independent devices, so
+# nothing but this gap enforces their order — and out of order means a moment of
+# plain right-drag, which Onshape rotates on.
 #
 # Sized by measurement, not guesswork. At 2ms: 26 rotate episodes in 25s of panning.
 # At 8ms: still 18, clustered at 16-20ms, i.e. one per stroke teardown with the gap
@@ -128,15 +118,15 @@ RECENTER_MARGIN = 20
 CANVAS_STALE_AFTER = 5.0
 
 # The warp must not land while the pan button is down: Onshape would read the jump as
-# one enormous pan. So the button is lifted, X is given a moment to settle, then it is
-# pressed again. Only paid at an edge, not per motion event.
+# one enormous pan. So the button is lifted, the desktop is given a moment to settle,
+# then it is pressed again. Only paid at an edge, not per motion event.
 RECENTER_SETTLE = 0.012
 
-# XQueryPointer is a server round-trip; a 1000Hz mouse would make that per-event cost
+# Reading the cursor is a round-trip; a 1000Hz mouse would make that per-event cost
 # real, so the edge check is throttled.
 RECENTER_CHECK_INTERVAL = 0.03
 
-# Both mice drive one shared X11 pointer, so a held pan gesture applies to whatever the
+# Both mice drive one shared pointer, so a held pan gesture applies to whatever the
 # *other* mouse does: its motion pans, and its wheel reaches the page with the button
 # still down rather than as a clean scroll. Watching the other mice read-only and
 # dropping the gesture the moment one of them stirs keeps them independent.
@@ -148,7 +138,7 @@ PAN_YIELD = True
 #
 # Applies to panning alone. Rotating, zooming and the left button are unaffected: the
 # cursor keeps tracking your hand throughout, it simply is not panning yet.
-PAN_DEADZONE = 10
+PAN_DEADZONE = 20
 
 # A press and release with nothing in between is a click, and Ctrl + right-click
 # opens Chrome's context menu. Every release we emit is preceded by at least this
@@ -164,89 +154,18 @@ GEOMETRY_REFRESH = 2.0
 # ping-pong. Staying released briefly after a yield lets a zoom finish in peace.
 YIELD_COOLDOWN = 0.15
 
-MOUSE_GLOB = "/dev/input/by-id/*-event-mouse"
-
 # The extension pushes on every real transition and heartbeats every 30s via
 # chrome.alarms. If we go this long with nothing at all, assume it died and fail closed.
 STALE_AFTER = 120.0
 
-CHROME_WM_CLASSES = ("google-chrome", "chromium")
 MOTION_AXES = (ecodes.REL_X, ecodes.REL_Y)
 
 
 def log(msg):
-    print(f"[onshape-mouse] {msg}", flush=True)
+    print(f"[gate] {msg}", flush=True)
 
 
-class Pointer:
-    """XQueryPointer / XWarpPointer via ctypes, so recentring needs no python-xlib.
-
-    Only the device read loop touches this, so the unsynchronised Xlib connection is
-    safe: no XInitThreads needed.
-    """
-
-    def __init__(self):
-        self.ok = False
-        self._dpy = None
-        try:
-            self._x = ctypes.CDLL("libX11.so.6")
-        except OSError as exc:
-            log(f"libX11 unavailable ({exc}); pan recentring disabled")
-            return
-
-        x = self._x
-        x.XOpenDisplay.restype = ctypes.c_void_p
-        x.XOpenDisplay.argtypes = [ctypes.c_char_p]
-        x.XDefaultRootWindow.restype = ctypes.c_ulong
-        x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
-        x.XQueryPointer.restype = ctypes.c_int
-        x.XQueryPointer.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulong,
-            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
-            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_uint),
-        ]
-        x.XWarpPointer.restype = ctypes.c_int
-        x.XWarpPointer.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
-            ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
-            ctypes.c_int, ctypes.c_int,
-        ]
-        x.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
-
-        display = os.environ.get("DISPLAY")
-        self._dpy = x.XOpenDisplay(display.encode() if display else None)
-        if not self._dpy:
-            log(f"cannot open X display {display!r}; pan recentring disabled")
-            return
-        self._root = x.XDefaultRootWindow(self._dpy)
-        self.ok = True
-
-    def position(self):
-        if not self.ok:
-            return None
-        root_ret = ctypes.c_ulong(); child_ret = ctypes.c_ulong()
-        rx = ctypes.c_int(); ry = ctypes.c_int()
-        wx = ctypes.c_int(); wy = ctypes.c_int()
-        mask = ctypes.c_uint()
-        got = self._x.XQueryPointer(
-            self._dpy, self._root,
-            ctypes.byref(root_ret), ctypes.byref(child_ret),
-            ctypes.byref(rx), ctypes.byref(ry),
-            ctypes.byref(wx), ctypes.byref(wy), ctypes.byref(mask),
-        )
-        return (rx.value, ry.value) if got else None
-
-    def warp(self, x_pos, y_pos):
-        if not self.ok:
-            return
-        self._x.XWarpPointer(self._dpy, 0, self._root, 0, 0, 0, 0,
-                             int(x_pos), int(y_pos))
-        self._x.XSync(self._dpy, 0)
-
-
-POINTER = Pointer()
+POINTER = backend.Pointer()
 
 
 class Translator:
@@ -418,10 +337,10 @@ class Translator:
         """Every right-button release goes through here, so none of them can ever
         land as a bare click.
 
-        The syn is essential, not tidiness: the modifier lives on a second uinput
-        device with its own stream, and an unflushed button release would reach X
-        *after* the Ctrl release that follows it — leaving a moment of plain
-        right-drag, which Onshape rotates on.
+        The syn is essential, not tidiness: the modifier lives on a second device
+        with its own stream, and an unflushed button release would arrive *after*
+        the Ctrl release that follows it — leaving a moment of plain right-drag,
+        which Onshape rotates on.
         """
         if not self._right_emitted:
             return
@@ -433,8 +352,9 @@ class Translator:
     def _emit_pan_up(self, keep_modifier=False):
         """keep_modifier is for the recentre, which lifts and re-presses the button
         mid-stroke. Dropping Ctrl there too was pure cost: it doubled the number of
-        modifier transitions and opened a window where X could see the button still
-        down with Ctrl already gone, which is a plain right-drag and rotates.
+        modifier transitions and opened a window where the desktop could see the
+        button still down with Ctrl already gone, which is a plain right-drag and
+        rotates.
         """
         # Button first: dropping Ctrl while the button is still down would leave a
         # plain right-drag, which Onshape rotates on.
@@ -583,7 +503,7 @@ class Translator:
 
     def yield_stroke(self):
         """Another pointing device stirred. Drop everything the gated mouse is
-        holding, so the shared X11 pointer is not carrying it into someone else's
+        holding, so the shared pointer is not carrying it into someone else's
         gesture.
 
         Deliberately not conditioned on _panning. After the hand-off to rotate that
@@ -710,7 +630,7 @@ class Gate:
             focused = self._chrome_focused
         if not focused or not window_id:
             return
-        geometry = window_geometry(window_id)
+        geometry = backend.window_geometry(window_id)
         if geometry is None:
             return
         with self._lock:
@@ -774,6 +694,7 @@ class Gate:
             }
             translator = self.translator
         state["device"] = DEVICE_PATH
+        state["platform"] = backend.name
         state["pan_idle_release_ms"] = round(PAN_IDLE_RELEASE * 1000)
         state["pan_recenter"] = RECENTER and POINTER.ok
         state["pan_recenter_margin_px"] = RECENTER_MARGIN
@@ -863,81 +784,62 @@ def pan_timer():
             GATE.refresh_geometry()
 
 
-WIN_ID = re.compile(r"(0x[0-9a-fA-F]+|\d+)\s*$")
+def install_signal_handlers():
+    """Lift whatever is held before the process goes away.
+
+    The synthetic button and Ctrl outlive us: they are pressed in the real input
+    stream, so nothing releases them on our behalf. The `finally` in main() covers an
+    ordinary exit, and these cover the ways a service gets stopped. A hard kill still
+    cannot be caught anywhere — `clear_stale_holds` is what cleans up after one.
+    """
+    def bail(signum, _frame):
+        translator = GATE.translator
+        if translator is not None:
+            try:
+                translator.release_all()
+            except Exception:
+                pass
+        log(f"stopping on signal {signum}")
+        raise SystemExit(0)
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, bail)
+        except (ValueError, OSError):
+            pass            # not the main thread, or not supported here
 
 
-def window_is_chrome(win_id):
+def clear_stale_holds(ui, modifier):
+    """Undo a previous run that was killed outright while holding something.
+
+    A button-up nobody pressed is ignored, so this is safe to do unconditionally —
+    and it turns "my right button is stuck down" into "restart the service".
+    """
     try:
-        out = subprocess.run(
-            ["xprop", "-id", win_id, "WM_CLASS"],
-            capture_output=True, text=True, timeout=2,
-        ).stdout.lower()
-    except Exception:
-        return False
-    return any(c in out for c in CHROME_WM_CLASSES)
-
-
-def parse_active(line):
-    m = WIN_ID.search(line.strip())
-    return m.group(1) if m else None
-
-
-def window_geometry(win_id):
-    """Absolute rect of a window, via xwininfo. Only run on a focus change."""
-    try:
-        out = subprocess.run(
-            ["xwininfo", "-id", win_id],
-            capture_output=True, text=True, timeout=2,
-        ).stdout
-    except Exception:
-        return None
-
-    fields = {}
-    for line in out.splitlines():
-        line = line.strip()
-        for key, label in (
-            ("x", "Absolute upper-left X:"), ("y", "Absolute upper-left Y:"),
-            ("w", "Width:"), ("h", "Height:"),
-        ):
-            if line.startswith(label):
-                try:
-                    fields[key] = int(line[len(label):].strip())
-                except ValueError:
-                    return None
-    if len(fields) != 4:
-        return None
-    return (fields["x"], fields["y"], fields["w"], fields["h"])
-
-
-def focus_from(line):
-    """-> (chrome_is_focused, geometry_or_None, window_id_or_None)"""
-    wid = parse_active(line)
-    if not wid or wid == "0x0" or not window_is_chrome(wid):
-        return False, None, None
-    return True, window_geometry(wid), wid
+        ui.write(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0)
+        ui.syn()
+        if modifier is not None:
+            modifier.write(ecodes.EV_KEY, ecodes.KEY_LEFTCTRL, 0)
+            modifier.syn()
+    except Exception as exc:
+        log(f"could not clear stale holds: {exc}")
 
 
 def watch_focus():
-    """Follow _NET_ACTIVE_WINDOW. `xprop -spy` streams a line per change, so this is
-    event-driven rather than polled."""
-    while True:
-        try:
-            first = subprocess.run(
-                ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
-                capture_output=True, text=True, timeout=2,
-            ).stdout
-            GATE.set_chrome_focused(*focus_from(first))
+    backend.watch_focus(GATE.set_chrome_focused)
 
-            proc = subprocess.Popen(
-                ["xprop", "-root", "-spy", "_NET_ACTIVE_WINDOW"],
-                stdout=subprocess.PIPE, text=True,
-            )
-            for line in proc.stdout:
-                GATE.set_chrome_focused(*focus_from(line))
-        except Exception as exc:
-            log(f"focus watcher restarting after error: {exc}")
-        GATE.set_chrome_focused(False, None, None)
-        time.sleep(2)
+
+def watch_other_pointers(gated_identifier):
+    def on_activity():
+        translator = GATE.translator
+        if translator is not None:
+            translator.yield_stroke()
+
+    backend.watch_other_pointers(gated_identifier, on_activity,
+                                 lambda: PAN_YIELD)
 
 
 DEVICE_PATH = None
@@ -981,9 +883,10 @@ def resolve_device(config):
     if device:
         return device
 
+    setup = "setup.cmd" if backend.name == "windows" else "setup.sh"
     raise SystemExit(
-        f"No mouse configured. Run setup.sh to choose one, or pass a device path.\n"
-        f"Expected 'device = /dev/input/by-id/...' in {CONFIG_PATH}"
+        f"No mouse configured. Run {setup} to choose one, or pass a device.\n"
+        f"Expected '{backend.DEVICE_HINT}' in {CONFIG_PATH}"
     )
 
 
@@ -1068,95 +971,6 @@ def resolve_pan_idle(config):
     return clamped / 1000.0
 
 
-def make_modifier_device():
-    """A separate keyboard-only virtual device for Ctrl.
-
-    Kept apart from the mouse clone so X classifies each cleanly rather than getting
-    one hybrid device.
-    """
-    # Advertise a normal keyboard key block, not just KEY_LEFTCTRL. libinput refuses
-    # to classify a single-key device as a keyboard, so X silently never adds it and
-    # the modifier goes nowhere. Only KEY_LEFTCTRL is ever emitted.
-    keys = list(range(ecodes.KEY_ESC, ecodes.KEY_F12 + 1))
-    assert ecodes.KEY_LEFTCTRL in keys
-    try:
-        return UInput({ecodes.EV_KEY: keys}, name=MODIFIER_NAME,
-                      vendor=VIRTUAL_VENDOR, product=VIRTUAL_PRODUCT_MODIFIER,
-                      phys="onshape-gate/modifier")
-    except OSError as exc:
-        log(f"cannot create the Ctrl device ({exc})")
-        return None
-
-
-def other_mice(gated_path):
-    """Every pointing device except the one we grabbed (and our own virtual clone)."""
-    gated = os.path.realpath(gated_path)
-    return [p for p in sorted(glob.glob(MOUSE_GLOB))
-            if os.path.realpath(p) != gated]
-
-
-def watch_other_pointers(gated_path):
-    """Read-only watch on the other mice; any activity ends the current pan stroke.
-
-    Opened without EVIOCGRAB, so those mice keep working completely normally.
-    """
-    opened = {}
-    while True:
-        if not PAN_YIELD:
-            time.sleep(5)
-            continue
-
-        for path in other_mice(gated_path):
-            if path in opened:
-                continue
-            try:
-                dev = evdev.InputDevice(path)
-            except OSError:
-                continue
-            if dev.name == VIRTUAL_NAME:      # never react to our own output
-                dev.close()
-                continue
-            opened[path] = dev
-            log(f"watching '{dev.name}' so it can interrupt a pan stroke")
-
-        if not opened:
-            time.sleep(2)
-            continue
-
-        fdmap = {dev.fd: (path, dev) for path, dev in opened.items()}
-        try:
-            ready, _, _ = select.select(list(fdmap), [], [], 2.0)
-        except OSError:
-            ready = []
-
-        for fd in ready:
-            path, dev = fdmap[fd]
-            try:
-                for event in dev.read():
-                    if event.type in (ecodes.EV_REL, ecodes.EV_KEY):
-                        translator = GATE.translator
-                        if translator is not None:
-                            translator.yield_stroke()
-                        break
-            except OSError:
-                # Unplugged: drop it and let the next scan pick it back up.
-                try:
-                    dev.close()
-                except Exception:
-                    pass
-                opened.pop(path, None)
-
-
-def wait_for_device(path):
-    warned = False
-    while not os.path.exists(path):
-        if not warned:
-            log(f"waiting for {path} to appear (mouse unplugged?)")
-            warned = True
-        time.sleep(1)
-    return evdev.InputDevice(path)
-
-
 def main():
     global DEVICE_PATH, PAN_IDLE_RELEASE, RECENTER, RECENTER_MARGIN, PAN_YIELD
     global PAN_DEADZONE
@@ -1169,6 +983,12 @@ def main():
     PAN_DEADZONE = resolve_deadzone(config)
     LEFT_CLICK_KEY, LEFT_CLICK_CODE = resolve_left_click(config)
 
+    # Must happen before any window rect is read: on Windows an un-declared process
+    # gets virtualised coordinates from GetWindowRect while the cursor answers in
+    # physical ones, and recentring then warps somewhere unrelated.
+    log(f"coordinate space: {backend.declare_dpi_aware()}")
+    install_signal_handlers()
+
     threading.Thread(target=serve, daemon=True).start()
     threading.Thread(target=watch_focus, daemon=True).start()
     threading.Thread(target=pan_timer, daemon=True).start()
@@ -1179,41 +999,52 @@ def main():
     log(f"listening on 127.0.0.1:{PORT}, gating {DEVICE_PATH} "
         f"(pan by Ctrl+right-drag, dead zone {PAN_DEADZONE}px, "
         f"idle release {PAN_IDLE_RELEASE * 1000:.0f}ms, "
-        f"{recentring})")
+        f"{recentring}, backend {backend.name})")
 
     while True:
-        dev = wait_for_device(DEVICE_PATH)
+        dev = None
         ui = None
         modifier = None
         try:
-            ui = UInput.from_device(dev, name=VIRTUAL_NAME,
-                                    vendor=VIRTUAL_VENDOR,
-                                    product=VIRTUAL_PRODUCT_MOUSE,
-                                    phys="onshape-gate/mouse")
+            dev = backend.open_gated_device(DEVICE_PATH)
+            ui = backend.VirtualOutput(dev.template)
 
             # Ctrl lives on this device, so panning cannot work without it.
-            modifier = make_modifier_device()
+            modifier = backend.modifier_output()
             if modifier is None:
                 raise SystemExit(
                     "cannot create the Ctrl device, so Ctrl+right-drag panning is "
                     "impossible; see the error above")
+            clear_stale_holds(ui, modifier)
             translator = Translator(ui, modifier)
             GATE.translator = translator
-            dev.grab()
-            log(f"grabbed {dev.name} -> virtual '{VIRTUAL_NAME}'")
-            for event in dev.read_loop():
+            log(f"grabbed {dev.name}")
+            for event in dev.events():
                 if GATE.is_open():
                     translator.handle(event)
                 else:
                     translator.note_while_closed(event)
-        except OSError as exc:
+        except Exception as exc:
+            # Deliberately broad. evdev raises OSError, but the Interception binding
+            # raises its own RuntimeError, and a backend that fails in some third way
+            # must still leave a retrying daemon rather than a dead mouse and no
+            # process. SystemExit and KeyboardInterrupt are BaseException, so the
+            # real exits still get through.
             log(f"device error ({exc}); waiting for it to come back")
             time.sleep(1)
         finally:
+            translator = GATE.translator
             GATE.translator = None
-            for close in (dev.ungrab, dev.close):
+            # Anything still held has to come up before the device is handed back,
+            # or the mouse returns to normal with a button stuck down.
+            if translator is not None:
                 try:
-                    close()
+                    translator.release_all()
+                except Exception:
+                    pass
+            if dev is not None:
+                try:
+                    dev.close()
                 except Exception:
                     pass
             for handle in (ui, modifier):
