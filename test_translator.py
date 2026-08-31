@@ -68,6 +68,42 @@ def run(name, events, expect_keys, post=None):
         print(f"      full log: {log}")
     return ok
 
+# The gesture cases below need a region the cursor is allowed to occupy: a pan
+# will not start without one, because a press with nowhere known-safe to land is
+# exactly what puts the right button on a toolbar. Here that region is the whole
+# window; the recentring section further down uses a canvas smaller than the
+# window, which is what makes it able to tell the two apart.
+class StubPointer:
+    def __init__(self, pos): self.ok = True; self._pos = pos; self.warps = []
+    def position(self): return self._pos
+    def warp(self, x, y): self.warps.append((x, y)); self._pos = (x, y)
+
+class StubGate:
+    """geometry() is the Chrome window; view_rect() is what the cursor must stay
+    inside — the region verified to be 3D view and nothing else. They differ so a test
+    can tell which one the code actually consulted.
+
+    view_rect() deliberately does not fall back to the window when no canvas is known:
+    the daemon does not either, because a pan press needs somewhere known to be safe.
+    Passing canvas=None is therefore how a test says "no safe region right now"."""
+    def __init__(self, geom, canvas=None):
+        self._geom = geom
+        self._canvas = canvas
+    def geometry(self): return self._geom
+    def view_rect(self): return self._canvas
+
+WINDOW = (0, 0, 1920, 1080)          # x, y, w, h
+CENTRE = (960, 540)
+
+ns['GATE'] = StubGate(WINDOW, WINDOW)
+
+# Stubbed together with the gate, and not optional. Once view_rect() returns a region,
+# every motion event runs the edge check for real — and with the live POINTER that
+# reads the actual mouse cursor, so a cursor sitting near a screen edge while the suite
+# ran would insert a recentre's button cycle into cases that are only about gesture
+# ordering. Parked in the middle, nothing is ever near an edge.
+ns['POINTER'] = StubPointer(CENTRE)
+
 results = []
 
 # 1. Bare motion presses Ctrl then the right button, and holds them.
@@ -147,27 +183,10 @@ results.append(_no_middle)
 # The ordering here is the whole point: a warp landing while the pan button is
 # still down would be read by Onshape as one enormous pan.
 
-class StubPointer:
-    def __init__(self, pos): self.ok = True; self._pos = pos; self.warps = []
-    def position(self): return self._pos
-    def warp(self, x, y): self.warps.append((x, y)); self._pos = (x, y)
-
-class StubGate:
-    """geometry() is the Chrome window; view_rect() is what the cursor must stay
-    inside — the canvas when one is known. They differ so a test can tell which one
-    the code actually consulted."""
-    def __init__(self, geom, canvas=None):
-        self._geom = geom
-        self._canvas = canvas
-    def geometry(self): return self._geom
-    def view_rect(self): return self._canvas if self._canvas is not None else self._geom
-
-WINDOW = (0, 0, 1920, 1080)          # x, y, w, h
-CENTRE = (960, 540)
 
 def run_recentre(name, pointer_at, expect_warps, expect_log):
     ui = StubUI(); tr = Translator(ui)
-    ns['GATE'] = StubGate(WINDOW)
+    ns['GATE'] = StubGate(WINDOW, WINDOW)
     # Start centred, so opening the pan stroke does not itself trigger a warp;
     # handle() calls _recenter_if_near_edge on every motion event.
     pointer = StubPointer(CENTRE)
@@ -205,7 +224,7 @@ run_recentre("near the bottom edge: same handling",
 # Motion keeps flowing between strokes and through the yield cooldown, and without
 # this the cursor wanders out of the view and over the feature tree.
 ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW)
+ns['GATE'] = StubGate(WINDOW, WINDOW)
 pointer = StubPointer((5, 5)); ns['POINTER'] = pointer
 tr._last_edge_check = 0.0
 tr._recenter_if_near_edge()
@@ -217,7 +236,7 @@ results.append(warped_bare)
 
 # Inside the view with no stroke running: leave it alone.
 ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW)
+ns['GATE'] = StubGate(WINDOW, WINDOW)
 pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
 tr._last_edge_check = 0.0
 tr._recenter_if_near_edge()
@@ -228,7 +247,7 @@ results.append(left_alone)
 # A recentre stalls the read loop, so it must refresh the idle deadline or the
 # timer tears down the stroke it just restored.
 ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW)
+ns['GATE'] = StubGate(WINDOW, WINDOW)
 pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
 for e in motion(5):
     tr.handle(e)
@@ -247,7 +266,7 @@ results.append(survived)
 # Another mouse stirring must drop the stroke, so its wheel reaches the page as a
 # clean scroll rather than wheel-with-button-held.
 ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW)
+ns['GATE'] = StubGate(WINDOW, WINDOW)
 ns['POINTER'] = StubPointer(CENTRE)
 for e in motion(5):
     tr.handle(e)
@@ -271,7 +290,7 @@ results.append(quiet)
 # Straight after a yield the cooldown holds panning off, so a wheel-zoom burst on
 # the other mouse is not fought over press-by-press.
 ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW)
+ns['GATE'] = StubGate(WINDOW, WINDOW)
 ns['POINTER'] = StubPointer(CENTRE)
 for e in motion(5):
     tr.handle(e)
@@ -305,7 +324,7 @@ results.append(resumed)
 OUTSIDE = (WINDOW[0] + WINDOW[2] + 200, WINDOW[1] + 100)   # right of the window
 
 ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW)
+ns['GATE'] = StubGate(WINDOW, WINDOW)
 pointer = StubPointer(OUTSIDE); ns['POINTER'] = pointer
 tr._press_pan()
 x, y = pointer._pos
@@ -319,7 +338,7 @@ results.append(pulled_in)
 
 # A press already inside must not be disturbed.
 ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW)
+ns['GATE'] = StubGate(WINDOW, WINDOW)
 pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
 tr._press_pan()
 undisturbed = pointer._pos == CENTRE and tr.presses_recentred == 0 and pointer.warps == []
@@ -341,7 +360,7 @@ def ctrl_setup(pos=CENTRE):
     log = []
     ui, mod = SharedUI(log), SharedUI(log)
     tr = Translator(ui, mod)
-    ns['GATE'] = StubGate(WINDOW)
+    ns['GATE'] = StubGate(WINDOW, WINDOW)
     ns['POINTER'] = StubPointer(pos)
     return tr, log
 
@@ -530,9 +549,12 @@ CANVAS_RECT = (400, 200, 900, 700)
 
 gate = ns['Gate']()
 gate.set_chrome_focused(True, WINDOW_RECT, "0x1")
-falls_back = gate.view_rect() == WINDOW_RECT
-print(f"{'PASS' if falls_back else 'FAIL'}  view_rect uses the window when no canvas is known")
-results.append(falls_back)
+# The window is not an acceptable substitute for the view: it contains the tab strip,
+# the bookmarks bar and the feature tree. With no canvas known there is no safe region,
+# and saying so is the only honest answer.
+no_canvas = gate.view_rect() is None
+print(f"{'PASS' if no_canvas else 'FAIL'}  view_rect reports nothing when no canvas is known")
+results.append(no_canvas)
 
 gate.set_canvas(CANVAS_RECT)
 prefers = gate.view_rect() == CANVAS_RECT
@@ -540,9 +562,104 @@ print(f"{'PASS' if prefers else 'FAIL'}  view_rect prefers the canvas when it is
 results.append(prefers)
 
 gate._canvas_at -= (ns['CANVAS_STALE_AFTER'] + 1)
-stale = gate.view_rect() == WINDOW_RECT
-print(f"{'PASS' if stale else 'FAIL'}  view_rect falls back once the canvas goes stale")
+stale = gate.view_rect() is None
+print(f"{'PASS' if stale else 'FAIL'}  view_rect reports nothing once the canvas goes stale")
 results.append(stale)
+
+# --- diagnosing a context menu ----------------------------------------------------
+# A context menu that opens mid-pan is the one failure with no trace: it is browser UI,
+# it is gone by the time you look, and the state that caused it has moved on. The page
+# reports the event; the daemon pairs it with what it was doing. What matters is that
+# the pairing names a *distinct* cause for each case, because the fixes differ.
+
+class StubTranslator:
+    def __init__(self, panning, last_release=None):
+        self._panning = panning
+        self.last_release = last_release
+
+def classify(panning, last_release, event):
+    g = ns['Gate']()
+    g.translator = StubTranslator(panning, last_release)
+    g.record_context_menu([event])
+    return g._context_menus[-1]
+
+fresh = lambda moved: {"at": time.monotonic(), "moved_px": moved, "nudged": False,
+                       "at_pos": (900, 500), "in_view_rect": True}
+
+cases = [
+    ("an overlay inside the region we called safe",
+     True, fresh(40.0),
+     {"onCanvas": False, "inRegion": True, "target": "div.toolbar", "x": 900, "y": 500},
+     "probe missed it"),
+
+    ("an overlay outside the region",
+     True, fresh(40.0),
+     {"onCanvas": False, "inRegion": False, "target": "div.tree", "x": 100, "y": 500},
+     "should not have been there"),
+
+    ("the canvas itself, after too short a drag",
+     True, fresh(1.0),
+     {"onCanvas": True, "inRegion": True, "target": "canvas", "x": 900, "y": 500},
+     "read it as a click"),
+
+    # Same place, same gesture, but the drag was real — so this is Onshape offering its
+    # own canvas menu, which is not the bug being hunted. Reporting both the same way
+    # would send you looking for a fault that is not there.
+    ("the canvas after a healthy drag",
+     True, fresh(40.0),
+     {"onCanvas": True, "inRegion": True, "target": "canvas", "x": 900, "y": 500},
+     "Onshape's own canvas menu"),
+
+    ("nothing to do with us",
+     False, None,
+     {"onCanvas": False, "inRegion": None, "target": "div.menu", "x": 10, "y": 10},
+     "not during a pan"),
+]
+
+for label, panning, release, event, expect in cases:
+    record = classify(panning, release, event)
+    ok = expect in record["why"]
+    print(f"{'PASS' if ok else 'FAIL'}  context menu on {label} is diagnosed")
+    if not ok:
+        print(f"      expected {expect!r} in why; got {record['why']!r}")
+    results.append(ok)
+
+# The native menu actually appearing is a different fact from the event firing: Onshape
+# suppresses the ones it handles itself, and only the unsuppressed ones are the browser
+# menu the user complains about.
+suppressed = classify(True, fresh(40.0),
+                      {"onCanvas": True, "inRegion": True, "target": "canvas",
+                       "x": 900, "y": 500, "prevented": True})
+shown = classify(True, fresh(40.0),
+                 {"onCanvas": True, "inRegion": True, "target": "canvas",
+                  "x": 900, "y": 500, "prevented": False})
+distinguishes = (suppressed["menu_shown"] is False
+                 and shown["menu_shown"] is True)
+print(f"{'PASS' if distinguishes else 'FAIL'}  a suppressed menu is told apart from one the browser showed")
+results.append(distinguishes)
+
+# Only the most recent reports are kept, or --status becomes a log file.
+g = ns['Gate']()
+g.translator = StubTranslator(True, fresh(40.0))
+g.record_context_menu([{"onCanvas": True, "inRegion": True, "target": f"c{i}",
+                        "x": 1, "y": 1} for i in range(ns['CONTEXT_MENU_HISTORY'] + 15)])
+bounded = len(g._context_menus) == ns['CONTEXT_MENU_HISTORY']
+print(f"{'PASS' if bounded else 'FAIL'}  the context-menu history stays bounded")
+if not bounded:
+    print(f"      kept {len(g._context_menus)}")
+results.append(bounded)
+
+# Junk off the network must not take the daemon down with it.
+g = ns['Gate']()
+g.translator = StubTranslator(True, fresh(40.0))
+try:
+    g.record_context_menu(["nonsense", None, 42, {}])
+    survived = True
+except Exception as exc:
+    survived = False
+    print(f"      raised {exc!r}")
+print(f"{'PASS' if survived else 'FAIL'}  malformed context-menu reports are ignored, not fatal")
+results.append(survived)
 
 # The point of all this: a cursor comfortably inside the window but at the canvas
 # edge must still be recentred, into the canvas rather than the window.
@@ -772,7 +889,7 @@ def dz_setup():
     log = []
     ui, mod = StubUI(log), StubUI(log)
     tr = Translator(ui, mod)
-    ns['GATE'] = StubGate(WINDOW)
+    ns['GATE'] = StubGate(WINDOW, WINDOW)
     ns['POINTER'] = StubPointer(CENTRE)
     return tr, log
 
@@ -854,6 +971,59 @@ for e in motion(1):
 disabled = tr._panning and pressed(log)
 print(f"{'PASS' if disabled else 'FAIL'}  pan_deadzone_px = 0 starts panning immediately")
 results.append(disabled)
+
+# --- nothing under the pointer but canvas ----------------------------------------
+# A pan holds the right button down and drags it. Whatever sits under the pointer
+# receives that press and that release, so the button may only ever go down inside a
+# region the extension has verified is 3D view and nothing else. No region, no pan:
+# the alternative is a right-button release on a toolbar, which opens a context menu
+# or activates whatever it lands on.
+
+ns['PAN_DEADZONE'] = 0
+
+# No safe region at all: motion still reaches the page, but no button is pressed.
+log = []
+ui, modifier = StubUI(log), StubUI(log)
+tr = Translator(ui, modifier)
+ns['GATE'] = StubGate(WINDOW, None)
+ns['POINTER'] = StubPointer(CENTRE)
+for e in motion(5) + motion(7):
+    tr.handle(e)
+no_press = not tr._panning and not any(x[0] == 'KEY' for x in log)
+print(f"{'PASS' if no_press else 'FAIL'}  no verified view region: motion passes, no button is pressed")
+if not no_press:
+    print(f"      panning={tr._panning} log={[x for x in log if x[0] == 'KEY']}")
+results.append(no_press)
+
+# And it is not a permanent refusal: the region coming back re-enables panning.
+ns['GATE'] = StubGate(WINDOW, WINDOW)
+for e in motion(5):
+    tr.handle(e)
+recovers = tr._panning and any(x[0] == 'KEY' and x[1] == 'RIGHT' and x[2] == 1 for x in log)
+print(f"{'PASS' if recovers else 'FAIL'}  panning resumes once a view region is reported again")
+results.append(recovers)
+
+# The region vanishing mid-stroke — a dialog opening over the view, or the extension
+# going quiet — must let go of the button rather than keep dragging it across whatever
+# just appeared.
+log = []
+ui, modifier = StubUI(log), StubUI(log)
+tr = Translator(ui, modifier)
+ns['GATE'] = StubGate(WINDOW, WINDOW)
+pointer = StubPointer(CENTRE)
+ns['POINTER'] = pointer
+for e in motion(5):
+    tr.handle(e)
+started = tr._panning
+log.clear()
+ns['GATE'] = StubGate(WINDOW, None)      # the safe region disappears
+tr._last_edge_check = 0.0
+tr._recenter_if_near_edge()
+let_go = started and not tr._panning and ('KEY', 'RIGHT', 0) in log
+print(f"{'PASS' if let_go else 'FAIL'}  the view region vanishing mid-stroke releases the button")
+if not let_go:
+    print(f"      started={started} panning={tr._panning} log={[x for x in log if x[0] == 'KEY']}")
+results.append(let_go)
 
 print()
 print(f"{sum(results)}/{len(results)} passed")

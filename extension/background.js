@@ -48,8 +48,25 @@ chrome.storage.session.get(["canvasRect", "canvasDiag"]).then(stored => {
   if (canvasDiag === null && stored.canvasDiag) canvasDiag = stored.canvasDiag;
 }).catch(() => {});
 
+// Context-menu reports ride along on the next push and are then dropped. They are
+// diagnostics, so none of this is worth persisting or retrying: the daemon logs each
+// one as it arrives, and a report lost to a service-worker restart is a report about an
+// event the user already saw happen.
+let pendingContextMenus = [];
+
 chrome.runtime.onMessage.addListener((message, sender) => {
-  if (!message || !("canvas" in message)) return;
+  if (!message) return;
+
+  if (message.contextmenu) {
+    pendingContextMenus.push(message.contextmenu);
+    if (pendingContextMenus.length > 20) pendingContextMenus.shift();
+    // Pushed immediately rather than on the next heartbeat: the daemon lines these up
+    // against what it was doing at the time, and that has moved on within a second.
+    push(sender.tab && sender.tab.windowId);
+    return;
+  }
+
+  if (!("canvas" in message)) return;
   canvasRect = message.canvas;
   if (message.diag) canvasDiag = message.diag;
   chrome.storage.session.set({ canvasRect, canvasDiag }).catch(() => {});
@@ -58,6 +75,9 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
 async function push(windowId) {
   const onshape = await activeTabIsOnshape(windowId);
+  // Claimed before the await below, so a second push cannot send them twice.
+  const contextmenu = pendingContextMenus;
+  pendingContextMenus = [];
   try {
     await fetch(ENDPOINT, {
       method: "POST",
@@ -69,7 +89,8 @@ async function push(windowId) {
         // and the content script only refreshes it once a second — and not at all
         // while Chrome throttles timers in a background tab.
         canvas: canvasRect,
-        diag: canvasDiag
+        diag: canvasDiag,
+        contextmenu
       })
     });
   } catch {

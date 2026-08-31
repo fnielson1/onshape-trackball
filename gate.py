@@ -146,11 +146,14 @@ RECENTER = True
 RECENTER_MARGIN = 35
 
 # The usable view rect comes from the extension's content script, which probes the
-# page with elementFromPoint to find the region that genuinely belongs to the 3D view
-# — the canvas minus whatever Onshape stacks on top of it. Goes stale if the script
-# stops reporting (tab closed, extension reloaded), at which point we fall back to the
-# whole Chrome window.
+# page to find the region that genuinely belongs to the 3D view — the canvas minus
+# whatever Onshape stacks on top of it. Goes stale if the script stops reporting (tab
+# closed, extension reloaded), at which point there is no region and panning stops.
 CANVAS_STALE_AFTER = 5.0
+
+# How many contextmenu reports to keep for --status. Enough to cover a session's
+# worth of "it just happened again" without the snapshot becoming a log file.
+CONTEXT_MENU_HISTORY = 20
 
 # The warp must not land while the pan button is down: Onshape would read the jump as
 # one enormous pan. So the button is lifted, the desktop is given a moment to settle,
@@ -267,6 +270,7 @@ class Translator:
         self._yield_until = 0.0
         self.presses_recentred = 0
         self.left_taps = 0
+        self.last_release = None    # see _release_right_button
 
     # --- callers must hold self._lock -------------------------------------------
 
@@ -320,6 +324,13 @@ class Translator:
 
         if PAN_DEADZONE > 0 and self._within_deadzone():
             return          # not a deliberate push yet
+
+        # A pan presses the right button somewhere on screen, so it must not start
+        # without a region known to be 3D view and nothing else. Without one, that
+        # press lands wherever the cursor happens to be — a toolbar button, the
+        # feature tree — and the release opens a context menu.
+        if GATE.view_rect() is None:
+            return
 
         self._press_pan()
         self._panning = True
@@ -384,14 +395,21 @@ class Translator:
         right-click opens Chrome's context menu mid-pan. Moving first makes every
         gesture read as a drag instead. The move does pan the model by MIN_DRAG_PX,
         which is why it is kept small.
+
+        Returns (measured_px, nudged) for the release record: how far the cursor had
+        actually travelled since the press, and whether we had to make up the
+        difference. A context menu arriving just after a release with a small
+        measured_px is the signature of a drag that the page read as a click.
         """
         position = POINTER.position() if POINTER.ok else None
 
+        measured = None
         if position is not None and self._last_press_pos is not None:
             dx = position[0] - self._last_press_pos[0]
             dy = position[1] - self._last_press_pos[1]
+            measured = (dx * dx + dy * dy) ** 0.5
             if dx * dx + dy * dy >= MIN_DRAG_PX * MIN_DRAG_PX:
-                return                      # already dragged far enough
+                return measured, False      # already dragged far enough
 
         direction = 1
         geometry = GATE.view_rect()
@@ -403,6 +421,7 @@ class Translator:
         self._ui.write(ecodes.EV_REL, ecodes.REL_X, direction * MIN_DRAG_PX)
         self._ui.syn()
         self.drag_nudges += 1
+        return measured, True
 
     def _release_right_button(self):
         """Every right-button release goes through here, so none of them can ever
@@ -415,7 +434,20 @@ class Translator:
         """
         if not self._right_emitted:
             return
-        self._nudge_for_drag()
+        measured, nudged = self._nudge_for_drag()
+
+        # Kept so a context-menu report arriving from the page can be lined up against
+        # the release that most likely caused it. This is the daemon's half of that
+        # story; the page supplies what the menu actually opened on.
+        position = POINTER.position() if POINTER.ok else None
+        self.last_release = {
+            "at": time.monotonic(),
+            "moved_px": None if measured is None else round(measured, 1),
+            "nudged": nudged,
+            "at_pos": position,
+            "in_view_rect": _inside(GATE.view_rect(), position),
+        }
+
         self._ui.write(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0)
         self._ui.syn()
         self._right_emitted = False
@@ -530,11 +562,15 @@ class Translator:
         self._edge_travel = 0.0
 
         geometry = GATE.view_rect()
-        if geometry is None:
+        if geometry is None or geometry[2] <= 0 or geometry[3] <= 0:
+            # The safe region went away mid-stroke — a dialog opened over the view, or
+            # the extension stopped reporting. There is now nowhere the cursor is known
+            # to be harmless, so let go of the button rather than keep dragging it
+            # across whatever appeared.
+            if self._panning:
+                self._end_pan(syn=True)
             return
         win_x, win_y, win_w, win_h = geometry
-        if win_w <= 0 or win_h <= 0:
-            return
 
         # Widened by the distance covered since the last check, which bounds the
         # overshoot two ways at once: that much motion has already been sent but may
@@ -677,6 +713,7 @@ class Gate:
         self._canvas_at = 0.0
         self._canvas_diag = None
         self._canvas_diag_at = 0.0
+        self._context_menus = []
         self.translator = None
 
     def _compute_locked(self):
@@ -734,19 +771,113 @@ class Gate:
                 self._canvas_diag_at = time.monotonic()
 
     def view_rect(self):
-        """The area the cursor should stay inside: the usable 3D view when the
-        extension is reporting it, otherwise the whole Chrome window.
+        """The area the cursor may occupy while panning: the region the extension has
+        verified belongs to the 3D view and nothing else. None when there is no fresh
+        one, and None means do not pan.
 
         It is deliberately not the canvas's own rect. Onshape lays controls over the
         canvas and, with the feature list collapsed, the canvas runs underneath the
         slide-out entirely. Those are ordinary DOM elements, so a right-button release
-        over one opens a context menu.
+        over one opens a context menu and a press over one activates it.
+
+        There used to be a fall back to the whole Chrome window here, for when the
+        extension went quiet. That was worse than no answer: the window includes the
+        tab strip, the bookmarks bar and the feature tree, so the fallback licensed
+        the cursor to sit on precisely the things this rect exists to avoid. Panning
+        stops instead — the same way the gate itself fails closed.
         """
         with self._lock:
             if (self._canvas is not None
                     and time.monotonic() - self._canvas_at <= CANVAS_STALE_AFTER):
                 return self._canvas
-            return self._geometry
+            return None
+
+    def record_context_menu(self, events):
+        """A contextmenu event fired on the page. Log it with enough of both sides to
+        say *why*, because that is the thing that is otherwise impossible to catch: by
+        the time you see the menu, whatever caused it is long gone.
+
+        The page supplies what the menu opened on and where. The daemon supplies what
+        it was doing at the time. Between them the causes separate cleanly:
+
+          overlay, inside our region  -> the region was wrong; the probe missed
+                                         something, and the pointer was legitimately
+                                         somewhere we had declared safe
+          overlay, outside our region -> the cursor got somewhere it should not have:
+                                         a recentre that did not keep up, or a press
+                                         that landed before one
+          canvas, short release       -> our own drag read as a click, so Onshape (or
+                                         Chrome) offered a menu on the canvas itself;
+                                         look at moved_px against MIN_DRAG_PX
+          not while panning           -> not ours at all; the other mouse, or a real
+                                         right-click
+        """
+        translator = self.translator
+        release = getattr(translator, "last_release", None) if translator else None
+        panning = bool(translator and translator._panning)
+
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+
+            since_release = (None if not release
+                             else round(time.monotonic() - release["at"], 3))
+            on_canvas = bool(event.get("onCanvas"))
+            in_region = event.get("inRegion")
+
+            if not panning and (since_release is None or since_release > 1.0):
+                why = "not during a pan (other mouse, or a real right-click)"
+            elif on_canvas:
+                # On the canvas the region was right and the cursor was where we meant
+                # it to be, so the cause is the gesture itself — but only if the drag
+                # really was too short. A menu after a healthy drag is Onshape's own
+                # canvas menu, which is a different thing entirely and not a bug here.
+                moved = release and release.get("moved_px")
+                if moved is None:
+                    why = "on the canvas, with no release measurement to compare"
+                elif moved < MIN_DRAG_PX:
+                    why = (f"on the canvas after only {moved}px of drag "
+                           f"(MIN_DRAG_PX={MIN_DRAG_PX}) — the page read it as a click")
+                else:
+                    why = (f"on the canvas after {moved}px of drag — a real drag, so "
+                           f"this is Onshape's own canvas menu, not a stray press")
+            elif in_region is True:
+                why = "on an overlay INSIDE the region we reported safe — probe missed it"
+            elif in_region is False:
+                why = "on an overlay outside the region — the cursor should not have been there"
+            else:
+                why = "on an overlay, with no region reported at the time"
+
+            suppressed = bool(event.get("suppressed"))
+            record = {
+                "at": time.strftime("%H:%M:%S"),
+                "target": str(event.get("target"))[:120],
+                "on_canvas": on_canvas,
+                "at_point": [event.get("x"), event.get("y")],
+                "in_reported_region": in_region,
+                # Whether a menu actually reached the user. `suppressed` is our own
+                # doing; `menu_shown` is the outcome, and stays true if something raised
+                # one anyway — which is the only way to tell suppression is working
+                # rather than merely being attempted.
+                "suppressed": suppressed,
+                "suppressed_why": event.get("suppressedWhy"),
+                "menu_shown": not event.get("prevented", False),
+                "drag_px": event.get("dragPx"),
+                "ctrl_held": event.get("ctrl"),
+                "panning": panning,
+                "seconds_since_release": since_release,
+                "release": release,
+                "why": why,
+            }
+
+            with self._lock:
+                self._context_menus.append(record)
+                del self._context_menus[:-CONTEXT_MENU_HISTORY]
+
+            outcome = "SUPPRESSED" if suppressed else (
+                "menu shown" if record["menu_shown"] else "handled by the page")
+            log(f"context menu [{outcome}]: {why} | target={record['target']} "
+                f"at={record['at_point']} drag={record['drag_px']}px")
 
     def set_onshape(self, onshape):
         with self._lock:
@@ -773,6 +904,7 @@ class Gate:
                 "canvas_age": (None if self._canvas_at == 0.0
                                else round(time.monotonic() - self._canvas_at, 1)),
                 "canvas_diag": self._canvas_diag,
+                "context_menus": list(reversed(self._context_menus)),
                 "canvas_diag_age": (None if self._canvas_diag_at == 0.0
                                     else round(time.monotonic() - self._canvas_diag_at, 1)),
             }
@@ -814,6 +946,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
             GATE.set_onshape(bool(body.get("onshape")))
             GATE.set_canvas(parse_rect(body.get("canvas")), body.get("diag"))
+            menus = body.get("contextmenu")
+            if isinstance(menus, list) and menus:
+                GATE.record_context_menu(menus[:CONTEXT_MENU_HISTORY])
         except Exception as exc:
             self.send_error(400, str(exc))
             return
@@ -836,6 +971,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+def _inside(rect, position):
+    """Was `position` within `rect`? None when either is unknown, which is itself worth
+    recording — "we had no idea where the cursor was" is a different diagnosis from
+    "the cursor was outside the view"."""
+    if rect is None or position is None:
+        return None
+    x, y, w, h = rect
+    return x <= position[0] < x + w and y <= position[1] < y + h
 
 
 def parse_rect(raw):
