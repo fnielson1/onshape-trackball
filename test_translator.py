@@ -245,7 +245,7 @@ if not survived:
 results.append(survived)
 
 # Another mouse stirring must drop the stroke, so its wheel reaches the page as a
-# clean scroll rather than wheel-with-middle-held.
+# clean scroll rather than wheel-with-button-held.
 ui = StubUI(); tr = Translator(ui)
 ns['GATE'] = StubGate(WINDOW)
 ns['POINTER'] = StubPointer(CENTRE)
@@ -562,6 +562,48 @@ print(f"{'PASS' if to_canvas else 'FAIL'}  recentres to the canvas centre, not t
 if not to_canvas:
     print(f"      warps={pointer.warps}, expected [{canvas_centre}]")
 results.append(to_canvas)
+
+# The edge margin has to scale with pan speed. The check is throttled, so the ground
+# a flick covers between two checks is unbounded by any fixed margin — which is how
+# a quick pan used to sail past 20px and land on the feature tree.
+#
+# Both cases below put the cursor at the same spot, 60px inside the canvas edge:
+# outside the static margin, inside the reach of the flick. Only the travel leading
+# up to them differs, so the travel is the only thing that can change the verdict.
+NEAR_EDGE = (CANVAS_RECT[0] + 60, CANVAS_RECT[1] + 300)
+
+def recentre_after(travel):
+    ui = StubUI(); tr = Translator(ui)
+    ns['GATE'] = StubGate(WINDOW_RECT, CANVAS_RECT)
+    pointer = StubPointer((CANVAS_RECT[0] + CANVAS_RECT[2] // 2,
+                           CANVAS_RECT[1] + CANVAS_RECT[3] // 2))
+    ns['POINTER'] = pointer
+    for e in motion(5):
+        tr.handle(e)
+    # Hold the throttle closed so the motion below only accumulates travel, exactly
+    # as it does between two real checks.
+    tr._last_edge_check = time.monotonic()
+    for e in motion(travel):
+        tr.handle(e)
+    pointer._pos = NEAR_EDGE
+    pointer.warps.clear()
+    tr._last_edge_check = 0.0
+    tr._recenter_if_near_edge()
+    return pointer.warps
+
+crept = recentre_after(4)
+stays = crept == []
+print(f"{'PASS' if stays else 'FAIL'}  a slow pan near the edge is left alone")
+if not stays:
+    print(f"      warps={crept}, expected none")
+results.append(stays)
+
+flicked = recentre_after(200)
+rescued = flicked == [canvas_centre]
+print(f"{'PASS' if rescued else 'FAIL'}  a fast flick recentres before it clears the edge")
+if not rescued:
+    print(f"      warps={flicked}, expected [{canvas_centre}]")
+results.append(rescued)
 
 # A recentre must not drop Ctrl. Releasing and re-pressing it mid-stroke opened a
 # window where X saw the button still down with Ctrl gone — a plain right-drag,

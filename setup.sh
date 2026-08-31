@@ -21,7 +21,7 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/onshape-trackball"
 CONFIG_FILE="$CONFIG_DIR/config"
 LEGACY_DEVICE_FILE="$CONFIG_DIR/device"
 DEFAULT_PAN_IDLE_MS=150
-DEFAULT_RECENTER_MARGIN=20
+DEFAULT_RECENTER_MARGIN=35
 DEFAULT_DEADZONE_PX=20
 UDEV_RULE="/etc/udev/rules.d/99-onshape-mouse.rules"
 UNIT_NAME="onshape-mouse-gate.service"
@@ -189,9 +189,9 @@ EOF
 
 # How long a pan stroke stays live after you stop moving, in milliseconds.
 #
-# Panning is synthesised by holding the middle button down. A mouse never says
-# "I stopped", so this timeout is what ends a stroke: the button is released this
-# long after the last motion. Without it the button would stay down for ever.
+# A mouse never says "I stopped", so this timeout is what ends a stroke: the
+# pan button is released this long after the last motion. Without it the button
+# would stay down for ever.
 #
 #   lower   strokes end sooner; brief pauses split one pan into several
 #   higher  the button stays held longer after you stop moving
@@ -245,7 +245,7 @@ EOF
 
 # Both mice drive one shared X11 pointer, so while a pan stroke is live the held
 # pan button applies to whatever your other mouse does too: its motion pans, and
-# its wheel arrives as wheel-with-middle-held instead of a clean scroll.
+# its wheel arrives as wheel-with-button-held instead of a clean scroll.
 #
 # With this on, the other mice are watched read-only (never grabbed, so they keep
 # working normally) and any activity on one drops the pan stroke immediately.
@@ -875,15 +875,18 @@ fi
 printf '%sOnshape trackball gate — setup%s\n' "$BOLD" "$OFF"
 printf '%s%s%s\n' "$DIM" "$REPO_DIR" "$OFF"
 
-preflight
-
-# Before the status board, so a first run reports the config it just created.
+# Before preflight, and before the status board. The config needs nothing but a
+# writable home directory, while preflight dies on a missing evdev or a Wayland
+# session -- so leaving it until later means the very installs that stop early are
+# the ones left with no file to read or edit. Written first, it is always there.
 if (( ! STATUS_ONLY )); then
   head_ "Configuration"
   ensure_config
   ensure_config_keys
   [[ -f $CONFIG_FILE ]] && ok "using $CONFIG_FILE"
 fi
+
+preflight
 
 show_status
 

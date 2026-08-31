@@ -51,20 +51,20 @@ check("whitespace and comments are ignored",
           "# a comment\n\n   pan_idle_release_ms   =   150   \n")), 0.15)
 
 # --- recentring ---------------------------------------------------------------
-check("recentring defaults to on at 20px",
-      ns["resolve_recenter"](with_config(None)), (True, 20))
+check("recentring defaults to on at 35px",
+      ns["resolve_recenter"](with_config(None)), (True, 35))
 
 check("recentring can be switched off",
-      ns["resolve_recenter"](with_config("pan_recenter = false\n")), (False, 20))
+      ns["resolve_recenter"](with_config("pan_recenter = false\n")), (False, 35))
 
 check("'yes' also enables it",
-      ns["resolve_recenter"](with_config("pan_recenter = yes\n")), (True, 20))
+      ns["resolve_recenter"](with_config("pan_recenter = yes\n")), (True, 35))
 
 check("a custom margin is honoured",
       ns["resolve_recenter"](with_config("pan_recenter_margin_px = 220\n")), (True, 220))
 
 check("a junk margin falls back",
-      ns["resolve_recenter"](with_config("pan_recenter_margin_px = wide\n")), (True, 20))
+      ns["resolve_recenter"](with_config("pan_recenter_margin_px = wide\n")), (True, 35))
 
 check("an oversized margin is clamped",
       ns["resolve_recenter"](with_config("pan_recenter_margin_px = 5000\n")), (True, 600))

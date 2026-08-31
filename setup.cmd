@@ -72,8 +72,13 @@ echo.
 echo Onshape trackball gate - Windows install
 echo.
 
-call :step_driver     || exit /b !errorlevel!
+rem  Config first, deliberately. It needs nothing but a writable %APPDATA%, while
+rem  the driver step stops the install dead on any machine that has not installed
+rem  Interception and rebooted yet - which is every machine, on the first run. Left
+rem  in its old place after the driver, the config only ever appeared on the second
+rem  run, so there was nothing to read or edit while working through step 1.
 call :step_config     || exit /b !errorlevel!
+call :step_driver     || exit /b !errorlevel!
 call :step_device     || exit /b !errorlevel!
 call :step_service    || exit /b !errorlevel!
 call :step_grab
@@ -112,9 +117,10 @@ echo                       for you, and never removes the driver.
 echo   -h, --help          This text.
 echo.
 echo INSTALL STEPS
-echo   1. Driver        install Interception                        ^(administrator^)
-echo   2. Reboot        required before the driver takes effect
-echo   3. Config        create %%APPDATA%%\onshape-trackball\config
+echo   1. Config        create %%APPDATA%%\onshape-trackball\config, with every
+echo                    setting at its default, if it is not there already
+echo   2. Driver        install Interception                        ^(administrator^)
+echo   3. Reboot        required before the driver takes effect
 echo   4. Choose mouse  pick from a list, or 'd' to detect by moving it
 echo   5. Service       register and start the scheduled task
 echo   6. Mouse grab    confirm the daemon has the device
@@ -230,9 +236,10 @@ exit /b %errorlevel%
 
 
 rem ===========================================================================
-rem  step 1-2: driver, and the reboot it needs
+rem  step 2-3: driver, and the reboot it needs
 rem ===========================================================================
 :step_driver
+echo.
 echo Driver
 for /f "tokens=1,* delims=|" %%A in ('%PY% "%HELPER%" driver-state 2^>nul') do (
   set "DRIVER_STATE=%%A"
@@ -293,10 +300,10 @@ goto :eof
 
 
 rem ===========================================================================
-rem  step 3: config
+rem  step 1: config. Runs before everything else, so the file and its documented
+rem  defaults exist even when a later step stops the install.
 rem ===========================================================================
 :step_config
-echo.
 echo Configuration
 for /f "delims=" %%P in ('%PY% "%HELPER%" config-path') do set "CONFIG_FILE=%%P"
 for /f "delims=" %%R in ('%PY% "%HELPER%" ensure-config "%DEVICE_OVERRIDE%"') do set "CFG_RESULT=%%R"

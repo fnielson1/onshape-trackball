@@ -56,7 +56,7 @@ CONFIG_KEYS = ("device", "left_click_key", "pan_deadzone_px", "pan_idle_release_
                "pan_recenter", "pan_recenter_margin_px", "pan_yield_to_other_mice")
 
 DEFAULT_PAN_IDLE_MS = 150
-DEFAULT_RECENTER_MARGIN = 20
+DEFAULT_RECENTER_MARGIN = 35
 DEFAULT_DEADZONE_PX = 20
 
 RESTART = 'schtasks /Run /TN "Onshape trackball gate"'
@@ -307,6 +307,19 @@ def cmd_drift():
         "left_click_key": ns["resolve_left_click"](config)[0],
         "device": config.get("device", ""),
     }
+
+    # Config is not the only thing that goes stale. Editing gate.py leaves the daemon
+    # running code that no longer exists on disk, and every value above still matches
+    # because none of them changed -- so the fingerprint of the source is compared
+    # too. The daemon reports the hash it started from; this is the file as it stands.
+    #
+    # Skipped when either side is unknown: a daemon predating this field reports
+    # nothing, and an unreadable gate.py hashes to None. Neither is drift worth
+    # restarting for, and guessing would make the check cry wolf forever.
+    running = state.get("code")
+    on_disk = ns["source_hash"](os.path.join(HERE, "gate.py"))
+    if running and on_disk:
+        wanted["code"] = on_disk
 
     # pan_recenter is deliberately not compared: the daemon reports it as "enabled in
     # the config AND the cursor API answered", so a machine where recentring is off

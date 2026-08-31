@@ -24,6 +24,7 @@ which picks an implementation from sys.platform. Both test suites exec this file
 it must stay importable on a machine with no driver, no display and no hardware.
 """
 
+import hashlib
 import json
 import os
 import signal
@@ -45,6 +46,32 @@ CONFIG_PATH = os.path.join(_CONFIG_DIR, "config")
 LEGACY_DEVICE_PATH = os.path.join(_CONFIG_DIR, "device")
 
 PORT = 47653
+
+
+# Editing this file leaves a daemon running code that no longer exists on disk, and
+# until now nothing noticed: the installer's drift check compares config values, and
+# a code edit touches none of them. So the daemon publishes a fingerprint of the
+# source it actually started from and the installer compares it against the file.
+#
+# globals().get rather than a bare __file__ because this module is also exec'd
+# without one — by test_translator.py and by the installer's own _gate_namespace,
+# neither of which should blow up on import just to compute a hash.
+SOURCE_PATH = os.path.abspath(globals().get("__file__") or "gate.py")
+
+
+def source_hash(path=None):
+    """Short SHA-256 of gate.py, or None when it cannot be read."""
+    try:
+        with open(path or SOURCE_PATH, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()[:12]
+    except OSError:
+        return None
+
+
+# Captured at import, deliberately: computing this per request would re-read the
+# edited file and report the new hash, so a stale daemon would look up to date and
+# the check would never fire once.
+SOURCE_HASH = source_hash()
 
 # Panning is Ctrl + right-drag; plain right-drag rotates. Ctrl is held on a second
 # virtual device and the right button on the mouse one.
@@ -108,7 +135,15 @@ PAN_TICK = 0.05
 # Recentring warps the pointer back to the middle of the window when it nears an edge,
 # which makes panning effectively unlimited.
 RECENTER = True
-RECENTER_MARGIN = 20
+
+# The static part of the edge margin. On its own it can only be right for one pan
+# speed: the edge check is throttled (RECENTER_CHECK_INTERVAL), so the distance the
+# cursor covers between two checks grows with how fast the ball is spun, while a
+# fixed margin does not. A quick flick therefore clears 20px and lands on the feature
+# tree before the next check runs. What actually bounds the overshoot is the travel
+# term added in _recenter_if_near_edge; this stays small so that panning slowly is
+# not penalized with a shrunken view and needless recentres.
+RECENTER_MARGIN = 35
 
 # The usable view rect comes from the extension's content script, which probes the
 # page with elementFromPoint to find the region that genuinely belongs to the 3D view
@@ -124,7 +159,7 @@ RECENTER_SETTLE = 0.012
 
 # Reading the cursor is a round-trip; a 1000Hz mouse would make that per-event cost
 # real, so the edge check is throttled.
-RECENTER_CHECK_INTERVAL = 0.03
+RECENTER_CHECK_INTERVAL = 0.02
 
 # Both mice drive one shared pointer, so a held pan gesture applies to whatever the
 # *other* mouse does: its motion pans, and its wheel reaches the page with the button
@@ -143,7 +178,7 @@ PAN_DEADZONE = 20
 # A press and release with nothing in between is a click, and Ctrl + right-click
 # opens Chrome's context menu. Every release we emit is preceded by at least this
 # much displacement, so the gesture always reads as a drag.
-MIN_DRAG_PX = 8
+MIN_DRAG_PX = 12
 
 # How often the cached window rect is re-read, to survive a move or resize that
 # happens without any focus change.
@@ -221,6 +256,7 @@ class Translator:
         self._last_motion = 0.0
         self._right_down = False
         self._last_edge_check = 0.0
+        self._edge_travel = 0.0     # distance sent since the last edge check
         self.recenters = 0
         self.yields = 0
         self._last_press_pos = None
@@ -460,6 +496,10 @@ class Translator:
                         self._travel_x += value
                     else:
                         self._travel_y += value
+                    # Per-axis absolute sum rather than true distance: it overshoots
+                    # a diagonal by up to 41%, and a margin erring large is the safe
+                    # direction to err in.
+                    self._edge_travel += abs(value)
                     self._start_pan()
                     self._last_motion = time.monotonic()
                     self._ui.write_event(event)
@@ -484,6 +524,10 @@ class Translator:
         if now - self._last_edge_check < RECENTER_CHECK_INTERVAL:
             return
         self._last_edge_check = now
+        # Reset on every check, so this only ever describes recent motion: a flick
+        # widens the margin while it lasts and stops counting as soon as it stops.
+        lookahead = self._edge_travel
+        self._edge_travel = 0.0
 
         geometry = GATE.view_rect()
         if geometry is None:
@@ -492,8 +536,13 @@ class Translator:
         if win_w <= 0 or win_h <= 0:
             return
 
+        # Widened by the distance covered since the last check, which bounds the
+        # overshoot two ways at once: that much motion has already been sent but may
+        # not have reached the cursor yet, so the reading below is stale by up to
+        # this far, and roughly that much more can land before the next check.
+        #
         # A small window must not end up with a safe region of zero.
-        margin = min(RECENTER_MARGIN, win_w // 3, win_h // 3)
+        margin = min(RECENTER_MARGIN + lookahead, win_w // 3, win_h // 3)
 
         position = POINTER.position()
         if position is None:
@@ -730,6 +779,7 @@ class Gate:
             translator = self.translator
         state["device"] = DEVICE_PATH
         state["platform"] = backend.name
+        state["code"] = SOURCE_HASH
         state["pan_idle_release_ms"] = round(PAN_IDLE_RELEASE * 1000)
         state["pan_recenter"] = RECENTER and POINTER.ok
         state["pan_recenter_margin_px"] = RECENTER_MARGIN
