@@ -104,6 +104,29 @@ check("a junk yield dead zone falls back",
 check("an oversized yield dead zone is clamped",
       ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = 9000\n")), 500)
 
+# --- which gesture the right button performs -------------------------------------
+check("defaults to true: hold the button to pan",
+      ns["resolve_pan_button"](with_config(None)), True)
+
+check("can be switched to the original mapping",
+      ns["resolve_pan_button"](with_config("pan_requires_right_button = false\n")), False)
+
+check("'no' also disables it",
+      ns["resolve_pan_button"](with_config("pan_requires_right_button = no\n")), False)
+
+check("an unrecognised value reads as false, same as pan_yield_to_other_mice",
+      ns["resolve_pan_button"](with_config("pan_requires_right_button = sideways\n")), False)
+
+# --- restoring the cursor when panning ends ---------------------------------------
+check("defaults to true: the cursor snaps back",
+      ns["resolve_pan_restore_cursor"](with_config(None)), True)
+
+check("can be switched off",
+      ns["resolve_pan_restore_cursor"](with_config("pan_restore_cursor = false\n")), False)
+
+check("an unrecognised value reads as false",
+      ns["resolve_pan_restore_cursor"](with_config("pan_restore_cursor = maybe\n")), False)
+
 # --- device -------------------------------------------------------------------
 check("device is read from the config",
       ns["resolve_device"](with_config("device = /dev/input/by-id/usb-A-event-mouse\n")),

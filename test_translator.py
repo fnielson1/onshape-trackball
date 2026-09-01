@@ -33,6 +33,11 @@ ns['PAN_DEADZONE'] = 0
 # own dedicated section further down.
 ns['PAN_YIELD_DEADZONE'] = 0
 
+# And for which gesture the right button performs: the cases below are written
+# against the original mapping (bare motion pans, the button rotates) and are about
+# gesture mechanics, not this setting. Its own section at the end flips it.
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = False
+
 class StubUI:
     def __init__(self, log=None): self.log = [] if log is None else log
     def write(self, t, c, v):
@@ -752,6 +757,47 @@ if not cycled:
     print(f"      button events={btn}")
 results.append(cycled)
 
+# The button-held gesture never sets _panning, so it needs its own coverage: this is
+# exactly what pan_requires_right_button = true depends on for the sweep not to run
+# out of screen while the button is held.
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = True
+tr, log = ctrl_setup()
+for e in button(ecodes.BTN_RIGHT, 1) + motion(5):
+    tr.handle(e)
+ns['POINTER']._pos = (8, 540)
+tr._last_edge_check = 0.0
+log.clear()
+tr._recenter_if_near_edge()
+btn = [x for x in log if x[0] == 'KEY' and x[1] == 'RIGHT']
+ctrl_events = [x for x in log if x[0] == 'KEY' and x[1] == 'CTRL']
+button_pan_recentres = (btn == [('KEY','RIGHT',0), ('KEY','RIGHT',1)]
+                         and tr._ctrl_down and ctrl_events == [])
+print(f"{'PASS' if button_pan_recentres else 'FAIL'}  "
+      f"a button-held pan also recentres, Ctrl held throughout")
+if not button_pan_recentres:
+    print(f"      button events={btn}, ctrl_down={tr._ctrl_down}, ctrl events={ctrl_events}")
+results.append(button_pan_recentres)
+
+# Same for a button-held rotate (the original mapping): the button still cycles, and
+# Ctrl is never involved — it was never raised for this gesture to begin with.
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = False
+tr, log = ctrl_setup()
+for e in button(ecodes.BTN_RIGHT, 1) + motion(5):
+    tr.handle(e)
+ns['POINTER']._pos = (8, 540)
+tr._last_edge_check = 0.0
+log.clear()
+tr._recenter_if_near_edge()
+btn = [x for x in log if x[0] == 'KEY' and x[1] == 'RIGHT']
+ctrl_events = [x for x in log if x[0] == 'KEY' and x[1] == 'CTRL']
+button_rotate_recentres = (btn == [('KEY','RIGHT',0), ('KEY','RIGHT',1)]
+                            and not tr._ctrl_down and ctrl_events == [])
+print(f"{'PASS' if button_rotate_recentres else 'FAIL'}  "
+      f"a button-held rotate also recentres, Ctrl never involved")
+if not button_rotate_recentres:
+    print(f"      button events={btn}, ctrl_down={tr._ctrl_down}, ctrl events={ctrl_events}")
+results.append(button_rotate_recentres)
+
 # --- left click clears the selection ---------------------------------------------
 # The cursor is penned in the middle of the view, so a real left click would just
 # select whatever geometry is under it. Onshape clears the whole selection on space.
@@ -1103,6 +1149,168 @@ print(f"{'PASS' if let_go else 'FAIL'}  the view region vanishing mid-stroke rel
 if not let_go:
     print(f"      started={started} panning={tr._panning} log={[x for x in log if x[0] == 'KEY']}")
 results.append(let_go)
+
+# --- pan_requires_right_button: swapping which gesture the button performs -------
+# Everything above ran with the original mapping (bare motion pans, the button
+# rotates). This flips it: the button should now bracket pan, and bare motion should
+# rotate — with no Ctrl anywhere in the rotate cases. The underlying machinery (dead
+# zone, idle release, recentring, hand-off) is exactly what the cases above already
+# covered, so these only check which gesture gets Ctrl.
+
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = True
+ns['PAN_DEADZONE'] = 0
+ns['GATE'] = StubGate(WINDOW, WINDOW)
+ns['POINTER'] = StubPointer(CENTRE)
+
+results.append(run("bare motion rotates instead of panning",
+    motion(5) + motion(7),
+    [('KEY','RIGHT',1)]))
+
+results.append(run("holding the right button pans instead of rotating",
+    button(ecodes.BTN_RIGHT, 1) + motion(9),
+    [('KEY','CTRL',1), ('KEY','RIGHT',1)]))
+
+results.append(run("releasing the button after a button-held pan drops Ctrl, "
+                    "button before Ctrl",
+    button(ecodes.BTN_RIGHT, 1) + motion(5) + button(ecodes.BTN_RIGHT, 0),
+    [('KEY','CTRL',1), ('KEY','RIGHT',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)]))
+
+# Idle release still ends a bare-motion rotate — no Ctrl was ever raised for it.
+results.append(run("idle release ends a bare-motion rotate, no Ctrl involved",
+    motion(5),
+    [('KEY','RIGHT',1), ('KEY','RIGHT',0)],
+    post=idle_then_tick))
+
+# The hand-off now runs the other way: a rotate already under way (bare motion, no
+# Ctrl) must not be double-pressed when the button comes down — it adds Ctrl instead
+# of dropping it, turning the same drag into a pan.
+log = []
+ui, modifier = StubUI(log), StubUI(log)
+tr = Translator(ui, modifier)
+for e in motion(5) + button(ecodes.BTN_RIGHT, 1) + motion(9):
+    tr.handle(e)
+keys = [x for x in log if x[0] == 'KEY']
+handed_off_to_pan = (keys == [('KEY','RIGHT',1), ('KEY','CTRL',1)]
+                      and not tr._panning and tr._right_emitted and tr._ctrl_down)
+print(f"{'PASS' if handed_off_to_pan else 'FAIL'}  the button hands a rotate off to pan without a double press")
+if not handed_off_to_pan:
+    print(f"      keys={keys}, panning={tr._panning}, "
+          f"right_emitted={tr._right_emitted}, ctrl_down={tr._ctrl_down}")
+results.append(handed_off_to_pan)
+
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = False    # restore the default this file exercises
+
+# --- pan_restore_cursor: snapping back to where panning began --------------------
+
+# A genuine end restores it: idle release, the ordinary case.
+tr, log = ctrl_setup(pos=(100, 200))
+for e in motion(5):
+    tr.handle(e)
+ns['POINTER'].warps.clear()
+ns['POINTER']._pos = (777, 888)      # stand-in for wherever the drag left the cursor
+idle_then_tick(tr)
+restored = ns['POINTER'].warps == [(100, 200)]
+print(f"{'PASS' if restored else 'FAIL'}  idle release snaps the cursor back to where panning began")
+if not restored:
+    print(f"      warps={ns['POINTER'].warps}")
+results.append(restored)
+
+# A recentre mid-stroke must not move the target: the restore goes all the way back
+# to before panning began, not to wherever the last recentre happened to leave it.
+tr, log = ctrl_setup(pos=(100, 200))
+for e in motion(5):
+    tr.handle(e)
+ns['POINTER']._pos = (8, 540)        # near the window edge
+tr._last_edge_check = 0.0
+tr._recenter_if_near_edge()          # recentres to the window centre, CENTRE
+recentred = ns['POINTER']._pos == CENTRE
+ns['POINTER'].warps.clear()
+idle_then_tick(tr)
+survives_recentre = recentred and ns['POINTER'].warps == [(100, 200)]
+print(f"{'PASS' if survives_recentre else 'FAIL'}  the restore target survives a recentre mid-stroke")
+if not survives_recentre:
+    print(f"      recentred={recentred}, warps={ns['POINTER'].warps}")
+results.append(survives_recentre)
+
+# A hand-off away from pan (button comes down mid bare-motion pan, dropping Ctrl to
+# rotate) must not move the cursor — the drag is still live under the user's hand.
+tr, log = ctrl_setup(pos=(100, 200))
+for e in motion(5):
+    tr.handle(e)
+ns['POINTER']._pos = (300, 400)
+ns['POINTER'].warps.clear()
+tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1))    # hand off to rotate
+handoff_quiet = ns['POINTER'].warps == []
+print(f"{'PASS' if handoff_quiet else 'FAIL'}  a hand-off away from pan does not move the cursor")
+if not handoff_quiet:
+    print(f"      warps={ns['POINTER'].warps}")
+results.append(handoff_quiet)
+
+# ...and the rotate that follows must not restore anything either when it later
+# ends for real — Ctrl was already dropped at the hand-off, not here.
+tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0))    # the real button comes back up
+handoff_end_quiet = ns['POINTER'].warps == []
+print(f"{'PASS' if handoff_end_quiet else 'FAIL'}  the rotate a hand-off leads into does not restore on its own end")
+if not handoff_end_quiet:
+    print(f"      warps={ns['POINTER'].warps}")
+results.append(handoff_end_quiet)
+
+# Yielding to the other mouse is a genuine end too.
+tr, log = ctrl_setup(pos=(100, 200))
+for e in motion(5):
+    tr.handle(e)
+ns['POINTER']._pos = (777, 888)
+ns['POINTER'].warps.clear()
+tr.yield_stroke()
+yield_restores = ns['POINTER'].warps == [(100, 200)]
+print(f"{'PASS' if yield_restores else 'FAIL'}  yielding to the other mouse restores the cursor")
+if not yield_restores:
+    print(f"      warps={ns['POINTER'].warps}")
+results.append(yield_restores)
+
+# The gate closing must not move the cursor: the user has likely already switched
+# away from Onshape, and warping a background window's cursor would be a surprise.
+tr, log = ctrl_setup(pos=(100, 200))
+for e in motion(5):
+    tr.handle(e)
+ns['POINTER']._pos = (777, 888)
+ns['POINTER'].warps.clear()
+tr.release_all()
+gate_close_quiet = ns['POINTER'].warps == []
+print(f"{'PASS' if gate_close_quiet else 'FAIL'}  the gate closing does not move the cursor")
+if not gate_close_quiet:
+    print(f"      warps={ns['POINTER'].warps}")
+results.append(gate_close_quiet)
+
+# A button-held pan (pan_requires_right_button = true) restores on release too.
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = True
+tr, log = ctrl_setup(pos=(100, 200))
+for e in button(ecodes.BTN_RIGHT, 1) + motion(5):
+    tr.handle(e)
+ns['POINTER']._pos = (777, 888)
+ns['POINTER'].warps.clear()
+tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0))
+button_pan_restores = ns['POINTER'].warps == [(100, 200)]
+print(f"{'PASS' if button_pan_restores else 'FAIL'}  a button-held pan restores the cursor on release")
+if not button_pan_restores:
+    print(f"      warps={ns['POINTER'].warps}")
+results.append(button_pan_restores)
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = False
+
+# pan_restore_cursor = false disables it, even on a genuine end.
+ns['PAN_RESTORE_CURSOR'] = False
+tr, log = ctrl_setup(pos=(100, 200))
+for e in motion(5):
+    tr.handle(e)
+ns['POINTER']._pos = (777, 888)
+ns['POINTER'].warps.clear()
+idle_then_tick(tr)
+restore_disabled = ns['POINTER'].warps == []
+print(f"{'PASS' if restore_disabled else 'FAIL'}  pan_restore_cursor = false leaves the cursor alone")
+if not restore_disabled:
+    print(f"      warps={ns['POINTER'].warps}")
+results.append(restore_disabled)
+ns['PAN_RESTORE_CURSOR'] = True
 
 print()
 print(f"{sum(results)}/{len(results)} passed")

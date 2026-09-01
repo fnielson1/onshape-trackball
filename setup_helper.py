@@ -52,7 +52,8 @@ def _gate_namespace():
 
 # ------------------------------------------------------------------ config
 
-CONFIG_KEYS = ("device", "left_click_key", "pan_deadzone_px", "pan_idle_release_ms",
+CONFIG_KEYS = ("device", "left_click_key", "pan_requires_right_button",
+               "pan_restore_cursor", "pan_deadzone_px", "pan_idle_release_ms",
                "pan_recenter", "pan_recenter_margin_px", "pan_yield_to_other_mice",
                "pan_yield_deadzone_px")
 
@@ -101,6 +102,41 @@ def _block(key, device=""):
             "#   esc     send Escape instead\n"
             "#   none    pass the click straight through, as an ordinary left click\n"
             "left_click_key = space\n")
+
+    if key == "pan_requires_right_button":
+        return (
+            "\n# Which of pan and rotate the gated mouse's right button performs.\n"
+            "#\n"
+            "# One of the two is bracketed by the right button's own press and "
+            "release; the\n"
+            "# other is driven by bare motion instead, started once it clears "
+            "pan_deadzone_px\n"
+            "# and ended by pan_idle_release_ms after it stops, since bare motion has "
+            "no\n"
+            "# button of its own to mark either.\n"
+            "#\n"
+            "#   true    hold the right button to pan, move without it to rotate\n"
+            "#   false   move to pan, hold the right button to rotate — the original "
+            "mapping\n"
+            "pan_requires_right_button = true\n")
+
+    if key == "pan_restore_cursor":
+        return (
+            "\n# When panning ends, snap the cursor back to where it was before "
+            "panning began.\n"
+            "#\n"
+            "# The cursor's position while panning is a side effect of the drag and "
+            "of edge\n"
+            "# recentring, not something meant to persist — this puts it back so a "
+            "click right\n"
+            "# after a pan lands where it would have without the pan in between. Only "
+            "for a\n"
+            "# genuine end: a hand-off where the same drag carries on as rotate under "
+            "the\n"
+            "# still-held button does not move the cursor, since the user's hand is "
+            "still\n"
+            "# actively dragging it.\n"
+            "pan_restore_cursor = true\n")
 
     if key == "pan_idle_release_ms":
         return (
@@ -326,6 +362,8 @@ def cmd_drift():
         "pan_yield_to_other_mice": ns["resolve_yield"](config),
         "pan_deadzone_px": ns["resolve_deadzone"](config),
         "pan_yield_deadzone_px": ns["resolve_yield_deadzone"](config),
+        "pan_requires_right_button": ns["resolve_pan_button"](config),
+        "pan_restore_cursor": ns["resolve_pan_restore_cursor"](config),
         "left_click_key": ns["resolve_left_click"](config)[0],
         "device": config.get("device", ""),
     }

@@ -6,10 +6,13 @@ tabs, other windows, the desktop — that mouse does nothing at all.
 
 | Left mouse | Onshape sees | Result |
 | --- | --- | --- |
-| move | synthetic Ctrl + right-drag | **pan** |
-| right button + move | Ctrl dropped, same drag | **rotate** |
+| right button + move | synthetic Ctrl + right-drag | **pan** |
+| move | plain right-drag | **rotate** |
 | wheel | wheel | zoom |
 | left button | space | **clear the selection** |
+
+Which gesture the right button maps to is configurable — see `pan_requires_right_button`
+under [Configuration](#configuration).
 
 ## How it works
 
@@ -40,23 +43,29 @@ hold the four things that genuinely differ:
 | Focus | `xprop -root -spy` | `SetWinEventHook` |
 | Service | systemd user unit | scheduled task |
 
-Panning is synthesised by holding Ctrl and the right button — one of Onshape's two
-documented pan gestures. The other, middle-drag, is deliberately unused: panning
-presses the same button repeatedly, and two presses inside the double-click window
-are a double middle-click, which Onshape reads as Zoom to Fit.
+Pan is synthesised as Ctrl + right-drag — one of Onshape's two documented pan
+gestures. The other, middle-drag, is deliberately unused: panning presses the same
+button repeatedly, and two presses inside the double-click window are a double
+middle-click, which Onshape reads as Zoom to Fit.
 
-A mouse never reports "I stopped moving", so a timeout ends the stroke — see
-`pan_idle_release_ms` below.
+One of pan and rotate is driven by the right button being physically held —
+bracketed by its own press and release, so it needs no further help — and the other
+by bare motion, which has no button of its own to mark where it starts or ends. Which
+is which is `pan_requires_right_button`; by default the held gesture is pan.
 
-Because panning holds the right button down and drags it, whatever sits under the
-pointer receives that press and that release. On the canvas that is a pan; on any
-ordinary DOM element it is a context menu, or a toolbar button being clicked. So the
-content script reports the region that is *verified* to be 3D view and nothing else,
-and the cursor is penned inside it. It finds that region by hit-testing a coarse grid
-to discover which elements overlay the canvas, measuring each one exactly, and then
-solving for the largest overlay-free rectangle — which is what catches the things that
-float over the middle of the view, like the view cube and the context toolbar, as well
-as the chrome anchored to its edges.
+A mouse never reports "I stopped moving", so whichever gesture bare motion drives
+ends on a timeout instead of a release — see `pan_idle_release_ms` below.
+
+Because the motion-driven gesture holds the right button down and drags it, whatever
+sits under the pointer receives that press and that release. On the canvas that is
+pan or rotate as configured; on any ordinary DOM element it is a context menu, or a
+toolbar button being clicked. So the content script reports the region that is
+*verified* to be 3D view and nothing else, and the cursor is penned inside it. It
+finds that region by hit-testing a coarse grid to discover which elements overlay the
+canvas, measuring each one exactly, and then solving for the largest overlay-free
+rectangle — which is what catches the things that float over the middle of the view,
+like the view cube and the context toolbar, as well as the chrome anchored to its
+edges.
 
 When no such region can be found — a dialog covering the view, the content script not
 running — the daemon **refuses to pan** and releases the button if a stroke is already
@@ -204,13 +213,13 @@ interprets it for you.
 | Mouse completely dead | `gate_open` — needs `chrome_focused` **and** `onshape_tab` |
 | Gate never opens | `seconds_since_extension_push` is `null` → extension not loaded |
 | Mouse works everywhere | Daemon not running, so nothing is grabbing it |
-| Cursor strays onto the feature tree while panning | `canvas_diag.v` is below 7 → Chrome is running a stale content script. **Reload the extension** at `chrome://extensions`, then **reload the Onshape tab** — Chrome does not inject content scripts into pages that were already open when the extension was loaded |
-| Motion does not pan, everything else works | `canvas_rect` is `null` → no verified view region, so panning is refused on purpose. Either the content script is not running (see above) or something is covering the view |
+| Cursor strays onto the feature tree while navigating | `canvas_diag.v` is below 7 → Chrome is running a stale content script. **Reload the extension** at `chrome://extensions`, then **reload the Onshape tab** — Chrome does not inject content scripts into pages that were already open when the extension was loaded |
+| Motion does not pan or rotate, everything else works | `canvas_rect` is `null` → no verified view region, so the motion-driven gesture is refused on purpose. Either the content script is not running (see above) or something is covering the view |
 | Motion does not pan | Onshape's `View manipulation` preference must accept Ctrl + right-drag |
-| A context menu opened while panning | `context_menus` — see below |
+| A context menu opened while panning or rotating | `context_menus` — see below |
 | Changes not taking effect | `daemon settings match the config` in `--status` |
 
-### A context menu opened while panning
+### A context menu opened while panning or rotating
 
 This one leaves no trace on its own: the menu is browser UI rather than anything in the
 page, and by the time you have seen it the state that caused it is gone. So the content
