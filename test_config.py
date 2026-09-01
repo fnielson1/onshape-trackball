@@ -117,16 +117,6 @@ check("'no' also disables it",
 check("an unrecognised value reads as false, same as pan_yield_to_other_mice",
       ns["resolve_pan_button"](with_config("pan_requires_right_button = sideways\n")), False)
 
-# --- restoring the cursor when panning ends ---------------------------------------
-check("defaults to true: the cursor snaps back",
-      ns["resolve_pan_restore_cursor"](with_config(None)), True)
-
-check("can be switched off",
-      ns["resolve_pan_restore_cursor"](with_config("pan_restore_cursor = false\n")), False)
-
-check("an unrecognised value reads as false",
-      ns["resolve_pan_restore_cursor"](with_config("pan_restore_cursor = maybe\n")), False)
-
 # --- device -------------------------------------------------------------------
 check("device is read from the config",
       ns["resolve_device"](with_config("device = /dev/input/by-id/usb-A-event-mouse\n")),

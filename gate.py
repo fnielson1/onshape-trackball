@@ -181,17 +181,6 @@ RECENTER_SETTLE = 0.012
 # real, so the edge check is throttled.
 RECENTER_CHECK_INTERVAL = 0.02
 
-# Where the cursor was the instant Ctrl went up for a pan-labeled stroke is
-# remembered, and restored when that stroke genuinely ends — a click right after
-# panning then lands where it would have without the intervening drag, rather than
-# wherever the pan's own motion or the edge recentring happened to leave the cursor.
-#
-# Not on a hand-off away from pan (the same drag carrying on as rotate under a still-
-# held button) or on the gate closing — both would warp the cursor while the user's
-# hand is still moving it, or after they have already switched away from Onshape,
-# which is a jump, not a return.
-PAN_RESTORE_CURSOR = True
-
 # Both mice drive one shared pointer, so a held pan gesture applies to whatever the
 # *other* mouse does: its motion pans, and its wheel reaches the page with the button
 # still down rather than as a clean scroll. Watching the other mice read-only and
@@ -307,7 +296,6 @@ class Translator:
         self._other_travel_x = 0.0
         self._other_travel_y = 0.0
         self._other_travel_at = 0.0
-        self._pan_origin = None     # where to snap back to when panning ends
         self.drag_nudges = 0
         self._yield_until = 0.0
         self.presses_recentred = 0
@@ -391,14 +379,14 @@ class Translator:
                 self._panning = False
                 if PAN_REQUIRES_RIGHT_BUTTON:
                     if not self._ctrl_down:
-                        self._begin_pan_ctrl()
+                        self._ctrl(1)
                         time.sleep(MODIFIER_SETTLE)
                 elif self._ctrl_down:
                     time.sleep(MODIFIER_SETTLE)
-                    self._end_pan_ctrl(restore=False)   # same drag, now rotate
+                    self._ctrl(0)
                 return              # button is already down; swallow the duplicate
             if PAN_REQUIRES_RIGHT_BUTTON and not self._ctrl_down:
-                self._begin_pan_ctrl()
+                self._ctrl(1)
                 time.sleep(MODIFIER_SETTLE)
             self._repress_right_button()
             return
@@ -409,7 +397,7 @@ class Translator:
             self._release_right_button()
             if self._ctrl_down:
                 time.sleep(MODIFIER_SETTLE)
-                self._end_pan_ctrl(restore=True)
+                self._ctrl(0)
             self._ui.syn()
 
     def _tap_key(self, code):
@@ -429,32 +417,11 @@ class Translator:
         self._modifier.syn()
         self._ctrl_down = bool(value)
 
-    def _begin_pan_ctrl(self):
-        """Raise Ctrl for a pan-labeled stroke, remembering where the cursor was so
-        _end_pan_ctrl can put it back. Caller holds self._lock and already knows
-        Ctrl is not down yet — Ctrl being down is exactly what "a pan-labeled stroke
-        is active" means here, so this is the one place that fact starts being true.
-        """
-        self._pan_origin = POINTER.position() if POINTER.ok else None
-        self._ctrl(1)
-
-    def _end_pan_ctrl(self, restore):
-        """Drop Ctrl. restore=True is a genuine end of the stroke: snap the cursor
-        back to where panning began. restore=False is a hand-off where the same drag
-        carries on as rotate under the still-held button — warping there would move
-        the cursor while the user's hand is still actively dragging it, which is a
-        jump, not a return. Caller holds self._lock.
-        """
-        self._ctrl(0)
-        if restore and PAN_RESTORE_CURSOR and self._pan_origin is not None and POINTER.ok:
-            POINTER.warp(*self._pan_origin)
-        self._pan_origin = None
-
     def _emit_pan_down(self):
         # Ctrl only when bare motion is the pan trigger; with PAN_REQUIRES_RIGHT_BUTTON
         # this motion-driven stroke is rotate instead, which wants plain right-drag.
         if not PAN_REQUIRES_RIGHT_BUTTON and not self._ctrl_down:
-            self._begin_pan_ctrl()
+            self._ctrl(1)
             time.sleep(MODIFIER_SETTLE)
         self._repress_right_button()
 
@@ -536,13 +503,12 @@ class Translator:
         self._ui.syn()
         self._right_emitted = False
 
-    def _emit_pan_up(self, keep_modifier=False, restore=True):
+    def _emit_pan_up(self, keep_modifier=False):
         """keep_modifier is for the recentre, which lifts and re-presses the button
         mid-stroke. Dropping Ctrl there too was pure cost: it doubled the number of
         modifier transitions and opened a window where the desktop could see the
         button still down with Ctrl already gone, which is a plain right-drag and
-        rotates. restore is meaningless when keep_modifier is set — Ctrl never comes
-        down in that case, so _end_pan_ctrl is never reached to see it.
+        rotates.
         """
         # Button first: dropping Ctrl while the button is still down would leave a
         # plain right-drag, which Onshape rotates on.
@@ -558,15 +524,14 @@ class Translator:
         self._release_right_button()
         if self._ctrl_down and not keep_modifier:
             time.sleep(MODIFIER_SETTLE)
-            self._end_pan_ctrl(restore=restore)
+            self._ctrl(0)
 
-    def _end_pan(self, syn, restore=True):
+    def _end_pan(self, syn):
         """Release the pan gesture. syn=False when the source's own SYN_REPORT is
-        about to flush the same packet. restore=False is for the gate closing —
-        see _end_pan_ctrl."""
+        about to flush the same packet."""
         if not self._panning:
             return
-        self._emit_pan_up(restore=restore)
+        self._emit_pan_up()
         self._panning = False
         self._reset_deadzone()      # the next stroke earns its own dead zone
         if syn:
@@ -759,7 +724,7 @@ class Translator:
             self._release_right_button()     # this is what catches the rotate
             if self._ctrl_down:
                 time.sleep(MODIFIER_SETTLE)  # button before Ctrl, as everywhere else
-                self._end_pan_ctrl(restore=True)
+                self._ctrl(0)
             self._ui.syn()
 
             self._reset_deadzone()
@@ -796,13 +761,10 @@ class Translator:
             if not self._panning and not self._held and not self._right_emitted \
                     and not self._ctrl_down:
                 return
-            # restore=False throughout: the gate is closing, typically because the
-            # user has switched away from Onshape, and warping the cursor back into
-            # a window that is no longer frontmost would be a surprise, not a return.
-            self._end_pan(syn=False, restore=False)
+            self._end_pan(syn=False)
             self._release_right_button()
             if self._ctrl_down:
-                self._end_pan_ctrl(restore=False)
+                self._ctrl(0)
             for code in self._held:
                 self._ui.write(ecodes.EV_KEY, code, 0)
             self._held.clear()
@@ -1044,7 +1006,6 @@ class Gate:
         state["pan_deadzone_px"] = PAN_DEADZONE
         state["pan_yield_deadzone_px"] = PAN_YIELD_DEADZONE
         state["pan_requires_right_button"] = PAN_REQUIRES_RIGHT_BUTTON
-        state["pan_restore_cursor"] = PAN_RESTORE_CURSOR
         state["left_click_key"] = LEFT_CLICK_KEY
         state["device_attached"] = translator is not None
         if translator is not None:
@@ -1330,13 +1291,6 @@ def resolve_pan_button(config):
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-def resolve_pan_restore_cursor(config):
-    raw = config.get("pan_restore_cursor")
-    if raw is None:
-        return PAN_RESTORE_CURSOR
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
 def resolve_pan_idle(config):
     """Seconds to hold the pan button after motion stops. A bad value is a typo in a
     hand-edited file, so warn and fall back rather than refusing to start."""
@@ -1361,7 +1315,6 @@ def resolve_pan_idle(config):
 def main():
     global DEVICE_PATH, PAN_IDLE_RELEASE, RECENTER, RECENTER_MARGIN, PAN_YIELD
     global PAN_DEADZONE, PAN_YIELD_DEADZONE, PAN_REQUIRES_RIGHT_BUTTON
-    global PAN_RESTORE_CURSOR
     global LEFT_CLICK_KEY, LEFT_CLICK_CODE
     _open_log()
     config = read_config()
@@ -1372,7 +1325,6 @@ def main():
     PAN_DEADZONE = resolve_deadzone(config)
     PAN_YIELD_DEADZONE = resolve_yield_deadzone(config)
     PAN_REQUIRES_RIGHT_BUTTON = resolve_pan_button(config)
-    PAN_RESTORE_CURSOR = resolve_pan_restore_cursor(config)
     LEFT_CLICK_KEY, LEFT_CLICK_CODE = resolve_left_click(config)
 
     # Must happen before any window rect is read: on Windows an un-declared process

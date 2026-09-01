@@ -200,20 +200,6 @@ EOF
 pan_requires_right_button = true
 EOF
       ;;
-    pan_restore_cursor)
-      cat <<EOF
-
-# When panning ends, snap the cursor back to where it was before panning began.
-#
-# The cursor's position while panning is a side effect of the drag and of edge
-# recentring, not something meant to persist — this puts it back so a click right
-# after a pan lands where it would have without the pan in between. Only for a
-# genuine end: a hand-off where the same drag carries on as rotate under the
-# still-held button does not move the cursor, since the user's hand is still
-# actively dragging it.
-pan_restore_cursor = true
-EOF
-      ;;
     pan_idle_release_ms)
       cat <<EOF
 
@@ -304,9 +290,9 @@ EOF
   esac
 }
 
-CONFIG_KEYS=(device left_click_key pan_requires_right_button pan_restore_cursor
-             pan_deadzone_px pan_idle_release_ms pan_recenter
-             pan_yield_to_other_mice pan_yield_deadzone_px)
+CONFIG_KEYS=(device left_click_key pan_requires_right_button pan_deadzone_px
+             pan_idle_release_ms pan_recenter pan_yield_to_other_mice
+             pan_yield_deadzone_px)
 
 # Creates the config on first run, carrying over a device chosen under the older
 # single-purpose "device" file so an existing install is not disturbed.
@@ -404,11 +390,10 @@ daemon_settings_current() {
   [[ "$(status_field left_click_key 2>/dev/null || true)" == "$(config_get left_click_key || printf 'space')" ]] || return 1
   [[ "$(status_field pan_deadzone_px 2>/dev/null || true)" == "$(config_get pan_deadzone_px || printf '%s' "$DEFAULT_DEADZONE_PX")" ]] || return 1
   [[ "$(status_field pan_yield_deadzone_px 2>/dev/null || true)" == "$(config_get pan_yield_deadzone_px || printf '%s' "$DEFAULT_YIELD_DEADZONE_PX")" ]] || return 1
-  # pan_requires_right_button and pan_restore_cursor are not checked here:
-  # status_field prints a JSON boolean through Python's str(), which renders
-  # True/False rather than the lowercase true/false the config file and
-  # setup_helper.py's own drift check use — the same reason pan_recenter and
-  # pan_yield_to_other_mice are absent above.
+  # pan_requires_right_button is not checked here: status_field prints a JSON
+  # boolean through Python's str(), which renders True/False rather than the
+  # lowercase true/false the config file and setup_helper.py's own drift check use
+  # — the same reason pan_recenter and pan_yield_to_other_mice are absent above.
 }
 
 status_field() {
