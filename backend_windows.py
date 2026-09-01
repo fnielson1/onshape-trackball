@@ -3,36 +3,51 @@
 The shapes here mirror `backend_linux` one for one, so `gate.py` cannot tell them
 apart:
 
-    exclusive grab   EVIOCGRAB          -> Interception filter on one device
-    synthetic mouse  uinput clone       -> Interception send on the same device
+    exclusive grab   EVIOCGRAB          -> interceptor_set_filter on one device
+    synthetic mouse  uinput clone       -> interceptor_send on the same device
     synthetic keys   second uinput dev  -> SendInput with scancodes
     cursor           XQueryPointer      -> GetCursorPos / SetCursorPos
     focus            xprop -root -spy   -> SetWinEventHook(EVENT_SYSTEM_FOREGROUND)
-    other mice       read-only evdev    -> Raw Input with RIDEV_INPUTSINK
+    other mice       read-only evdev    -> interceptor_set_monitor on the rest
 
 Two of those deserve a note.
 
-Keys go through SendInput rather than an Interception keyboard device: the modifier
-must work even when no keyboard is enumerated by the driver, and SendInput always
-is. It does mean the button and the modifier travel on separate streams, exactly as
+Keys go through SendInput rather than an interceptor.dll keyboard device: the
+modifier must work even when no keyboard is enumerated, and SendInput always is.
+It does mean the button and the modifier travel on separate streams, exactly as
 they do on Linux across two uinput devices — which is what MODIFIER_SETTLE already
 exists to absorb.
 
-Other mice are watched with Raw Input, not Interception. Interception can only
-observe by filtering, and filtering a mouse means it stops working if we stop
-re-sending. Raw Input is read-only by construction, so an unrelated mouse can never
-be collateral damage.
+Other mice are watched with interceptor_set_monitor, not interceptor_set_filter:
+a monitored stroke still reaches the rest of the system untouched, unlike a
+filtered one, so an unrelated mouse can never go dead the way it would if this
+tried to filter it instead. This used to be a second, independent Raw Input
+registration of its own (RegisterRawInputDevices/RIDEV_INPUTSINK) — removed
+because Windows allows only one raw-input registration per device class per
+process, and interceptor.dll's own engine already holds the one for mice; a
+second one silently stole delivery from whichever registered first.
 """
 
 import ctypes
 import ctypes.wintypes as wt
 import os
-import re
 import time
 import winreg
 
 import codes
 import interceptor
+
+# The two hardware-ID shapes this project's DLL has produced over time name the
+# same device differently, and not merely in punctuation:
+#
+#     driver-backed DLL   HID\VID_04CA&PID_0061&REV_0100
+#     current DLL         \\?\HID#VID_04CA&PID_0061#9&299ea37&0&0000#{378de44c-...}
+#
+# Used below both to recognise the gated device against Raw Input's own reports
+# (watch_other_pointers) and to key the registry's friendly-name lookup
+# (_friendly_names) by the one thing every shape agrees on. interceptor.py owns
+# the regex, so there is one definition instead of two drifting copies.
+_vid_pid = interceptor._vid_pid
 
 NAME = "windows"
 
@@ -43,11 +58,6 @@ MOTION_THRESHOLD = 30  # accumulated |delta| units, matching the Linux picker
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-_IS_64 = ctypes.sizeof(ctypes.c_void_p) == 8
-LRESULT = ctypes.c_longlong if _IS_64 else ctypes.c_long
-WPARAM = ctypes.c_ulonglong if _IS_64 else ctypes.c_ulong
-LPARAM = ctypes.c_longlong if _IS_64 else ctypes.c_long
 
 
 def _bind_win32():
@@ -83,25 +93,6 @@ def _bind_win32():
     user32.SendInput.restype = wt.UINT
     user32.SendInput.argtypes = [wt.UINT, ctypes.c_void_p, ctypes.c_int]
 
-    user32.DefWindowProcW.restype = LRESULT
-    user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, WPARAM, LPARAM]
-
-    user32.CreateWindowExW.restype = wt.HWND
-    user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR,
-                                       wt.DWORD, ctypes.c_int, ctypes.c_int,
-                                       ctypes.c_int, ctypes.c_int, wt.HWND,
-                                       wt.HMENU, wt.HINSTANCE, wt.LPVOID]
-
-    user32.GetRawInputData.restype = wt.UINT
-    user32.GetRawInputData.argtypes = [wt.HANDLE, wt.UINT, wt.LPVOID,
-                                       ctypes.POINTER(wt.UINT), wt.UINT]
-
-    user32.GetRawInputDeviceInfoW.restype = wt.UINT
-    user32.GetRawInputDeviceInfoW.argtypes = [wt.HANDLE, wt.UINT, wt.LPVOID,
-                                              ctypes.POINTER(wt.UINT)]
-
-    user32.RegisterRawInputDevices.restype = wt.BOOL
-
     kernel32.OpenProcess.restype = wt.HANDLE
     kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
 
@@ -112,9 +103,6 @@ def _bind_win32():
     kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD,
                                                     wt.LPWSTR,
                                                     ctypes.POINTER(wt.DWORD)]
-
-    kernel32.GetModuleHandleW.restype = wt.HMODULE
-    kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
 
 
 def log(msg):
@@ -251,13 +239,16 @@ def stroke_to_events(stroke):
 
 
 def _friendly_names():
-    """hardware id (upper) -> device description, best effort.
+    """(vid, pid) -> device description, best effort.
 
-    Interception hands back a hardware ID and nothing else; a list of raw
-    `HID\\VID_046D&PID_C52B` strings is close to unusable when the whole point of
-    the step is telling two mice apart. The registry has the descriptions, so this
-    walks the HID enum looking for them and simply gives up if the shape ever
-    changes — a missing pretty name is cosmetic.
+    interceptor.dll hands back a hardware ID and nothing else; a list of raw
+    `HID\\VID_046D&PID_C52B` or `\\\\?\\HID#VID_046D&PID_C52B#...` strings is close
+    to unusable when the whole point of the step is telling two mice apart. The
+    registry has the descriptions, keyed by the old-style PnP HardwareID values,
+    so this walks the HID enum looking for them and keys its own result by
+    (vid, pid) rather than the full string — the one thing every shape of
+    hardware ID this project has produced agrees on. Gives up quietly if the
+    registry shape ever changes: a missing pretty name is cosmetic.
     """
     names = {}
     try:
@@ -298,7 +289,9 @@ def _collect_name(key, names):
     if desc.startswith("@") and ";" in desc:
         desc = desc.split(";", 1)[1]
     for hwid in hwids or ():
-        names.setdefault(hwid.upper(), desc)
+        vp = _vid_pid(hwid)
+        if vp is not None:
+            names.setdefault(vp, desc)
 
 
 def enumerate_mice():
@@ -317,7 +310,7 @@ def enumerate_mice():
             seen[hwid] += 1
             continue
         seen[hwid] = 1
-        label = names.get(hwid.upper(), hwid)
+        label = names.get(_vid_pid(hwid), hwid)
         out.append([hwid, label])
 
     for entry in out:
@@ -416,7 +409,7 @@ class GatedDevice:
 
 
 def _label_for(hardware_id):
-    return _friendly_names().get(hardware_id.upper(), hardware_id)
+    return _friendly_names().get(_vid_pid(hardware_id), hardware_id)
 
 
 def _wait_for_device(ctx, hardware_id):
@@ -746,101 +739,26 @@ def watch_focus(callback):
 
 # ------------------------------------------------------------------ other mice
 
-RIDEV_INPUTSINK = 0x00000100
-RIDEV_REMOVE = 0x00000001
-RID_INPUT = 0x10000003
-RIM_TYPEMOUSE = 0
-RIDI_DEVICENAME = 0x20000007
-WM_INPUT = 0x00FF
-HWND_MESSAGE = -3
-
-
-class RAWINPUTDEVICE(ctypes.Structure):
-    _fields_ = [("usUsagePage", wt.USHORT), ("usUsage", wt.USHORT),
-                ("dwFlags", wt.DWORD), ("hwndTarget", wt.HWND)]
-
-
-class RAWINPUTHEADER(ctypes.Structure):
-    _fields_ = [("dwType", wt.DWORD), ("dwSize", wt.DWORD),
-                ("hDevice", wt.HANDLE), ("wParam", ULONG_PTR)]
-
-
-class _RAWMOUSE_BUTTONS(ctypes.Structure):
-    _fields_ = [("usButtonFlags", wt.USHORT), ("usButtonData", wt.USHORT)]
-
-
-class _RAWMOUSE_UNION(ctypes.Union):
-    _fields_ = [("ulButtons", wt.ULONG), ("b", _RAWMOUSE_BUTTONS)]
-
-
-class RAWMOUSE(ctypes.Structure):
-    _anonymous_ = ("u",)
-    _fields_ = [("usFlags", wt.USHORT), ("u", _RAWMOUSE_UNION),
-                ("ulRawButtons", wt.ULONG), ("lLastX", wt.LONG),
-                ("lLastY", wt.LONG), ("ulExtraInformation", wt.ULONG)]
-
-
-class RAWINPUT(ctypes.Structure):
-    _fields_ = [("header", RAWINPUTHEADER), ("mouse", RAWMOUSE)]
-
-
-WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, WPARAM, LPARAM)
-
-
-class WNDCLASS(ctypes.Structure):
-    _fields_ = [("style", wt.UINT), ("lpfnWndProc", WNDPROC),
-                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
-                ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
-                ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH),
-                ("lpszMenuName", wt.LPCWSTR), ("lpszClassName", wt.LPCWSTR)]
-
-
-def _device_name(handle):
-    size = wt.UINT(0)
-    user32.GetRawInputDeviceInfoW(handle, RIDI_DEVICENAME, None,
-                                  ctypes.byref(size))
-    if not size.value:
-        return ""
-    buf = ctypes.create_unicode_buffer(size.value + 1)
-    if user32.GetRawInputDeviceInfoW(handle, RIDI_DEVICENAME, buf,
-                                     ctypes.byref(size)) in (0, -1):
-        return ""
-    return buf.value
-
-
-_VID_PID = re.compile(r"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})")
-
-
-def _vid_pid(text):
-    """(vid, pid) from either an Interception hardware ID or a Raw Input path.
-
-    The two name the same device differently, and not merely in punctuation:
-
-        Interception  HID\\VID_04CA&PID_0061&REV_0100
-        Raw Input     \\\\?\\HID#VID_04CA&PID_0061#9&299ea37&0&0000#{378de44c-...}
-
-    Interception carries a REV_ component that the device interface path does not,
-    and the path carries an instance id and interface GUID that the hardware ID does
-    not. A substring test between them therefore never matches — which meant the
-    gated mouse was never recognised as itself, so its own motion (including the
-    strokes we inject) counted as "another pointer stirred" and cancelled the very
-    pan it was drawing. VID and PID are the part both forms agree on.
-    """
-    m = _VID_PID.search(text or "")
-    return (m.group(1).upper(), m.group(2).upper()) if m else None
-
 
 def watch_other_pointers(gated_identifier, on_activity, enabled):
-    """Read-only Raw Input watch; motion is reported so the translator can apply its
-    own dead zone, and a button or wheel always reports as immediate since neither
-    happens by accident.
+    """Passively observe every mouse via interceptor_set_monitor; motion is
+    reported so the translator can apply its own dead zone, and a button or
+    wheel always reports as immediate since neither happens by accident.
 
-    RIDEV_INPUTSINK delivers events even though this window is never focused, and
-    Raw Input cannot suppress anything — so unlike the Interception path, a mistake
-    here can never leave one of the user's other mice dead.
+    interceptor_set_monitor never withholds a stroke — unlike interceptor_set_
+    filter, a mistake here can never leave one of the user's other mice dead.
+    See the module docstring's "other mice" note for why this runs its own
+    interceptor.Context() rather than a Raw Input registration of its own.
+
+    All mouse device numbers are monitored unconditionally, including
+    whichever one is the gated mouse: excluding it by device number instead,
+    at set_monitor() time, would race a device that has not been resolved to
+    a number yet (this thread starts before gate.py's own device grab does) or
+    go stale across a replug. Comparing the hardware ID fresh on every stroke
+    costs one more interceptor_get_hardware_id call but is immune to both.
     """
-    gated = _vid_pid(gated_identifier)
-    if gated is None:
+    gated_vidpid = _vid_pid(gated_identifier)
+    if gated_vidpid is None:
         # Yielding on everything is exactly the pathology this exclusion exists to
         # avoid: it would cancel every pan the gated mouse draws. If the gated
         # device cannot be identified, not yielding at all is the safe failure.
@@ -849,78 +767,46 @@ def watch_other_pointers(gated_identifier, on_activity, enabled):
         while True:
             time.sleep(60)
 
-    class_name = "OnshapeGateRawInput"
-    hinstance = kernel32.GetModuleHandleW(None)
+    all_mice = list(range(interceptor.FIRST_MOUSE, interceptor.MAX_DEVICE + 1))
     state = {"last": 0.0}
 
-    def wndproc(hwnd, msg, wparam, lparam):
-        if msg != WM_INPUT or not enabled():
-            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-        size = wt.UINT(0)
-        user32.GetRawInputData(wt.HANDLE(lparam), RID_INPUT, None,
-                               ctypes.byref(size),
-                               ctypes.sizeof(RAWINPUTHEADER))
-        if size.value:
-            buf = ctypes.create_string_buffer(size.value)
-            got = user32.GetRawInputData(wt.HANDLE(lparam), RID_INPUT, buf,
-                                         ctypes.byref(size),
-                                         ctypes.sizeof(RAWINPUTHEADER))
-            if got and got != -1:
-                raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
-                if raw.header.dwType == RIM_TYPEMOUSE:
-                    who = _vid_pid(_device_name(raw.header.hDevice))
-                    dx, dy = raw.mouse.lLastX, raw.mouse.lLastY
-                    # Raw Input folds the wheel into this same flags field (as
-                    # RI_MOUSE_WHEEL, alongside the button bits), so it is already
-                    # exactly the "this was not passive drift" signal we want.
-                    immediate = bool(raw.mouse.b.usButtonFlags)
-                    if (dx or dy or immediate) and who is not None and who != gated:
-                        # Raw Input reports our own synthetic strokes too. Rate
-                        # limiting is not enough on its own, but combined with the
-                        # translator's yield cooldown it keeps a pan from fighting
-                        # its own output.
-                        now = time.monotonic()
-                        if now - state["last"] > 0.01:
-                            state["last"] = now
-                            try:
-                                on_activity(dx, dy, immediate)
-                            except Exception as exc:
-                                log(f"yield callback failed: {exc}")
-        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
     while True:
-        proc = WNDPROC(wndproc)
         try:
-            wc = WNDCLASS()
-            wc.lpfnWndProc = proc
-            wc.hInstance = hinstance
-            wc.lpszClassName = class_name
-            user32.RegisterClassW(ctypes.byref(wc))    # benign if already there
+            with interceptor.Context() as ctx:
+                ctx.set_monitor(all_mice, interceptor.FILTER_MOUSE_ALL)
 
-            hwnd = user32.CreateWindowExW(
-                0, class_name, class_name, 0, 0, 0, 0, 0,
-                wt.HWND(HWND_MESSAGE), None, hinstance, None)
-            if not hwnd:
-                raise OSError(f"CreateWindowEx failed "
-                              f"({ctypes.get_last_error()})")
+                while True:
+                    if not enabled():
+                        time.sleep(0.05)
+                        continue
+                    device = ctx.wait(200)
+                    if not device:
+                        continue
+                    stroke = ctx.receive_mouse(device)
+                    if stroke is None:
+                        continue
 
-            rid = RAWINPUTDEVICE(usUsagePage=0x01, usUsage=0x02,
-                                 dwFlags=RIDEV_INPUTSINK, hwndTarget=hwnd)
-            if not user32.RegisterRawInputDevices(
-                    ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)):
-                raise OSError(f"RegisterRawInputDevices failed "
-                              f"({ctypes.get_last_error()})")
+                    dx, dy = stroke.x, stroke.y
+                    # Folded into the same state field as the button bits, so
+                    # this is already exactly the "not passive drift" signal
+                    # the immediate/deadzone split wants.
+                    immediate = bool(stroke.state)
+                    if not (dx or dy or immediate):
+                        continue
 
-            msg = wt.MSG()
-            while True:
-                got = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-                if got in (0, -1):
-                    break
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
+                    if _vid_pid(ctx.hardware_id(device)) == gated_vidpid:
+                        continue
+
+                    now = time.monotonic()
+                    if now - state["last"] > 0.01:
+                        state["last"] = now
+                        try:
+                            on_activity(dx, dy, immediate)
+                        except Exception as exc:
+                            log(f"yield callback failed: {exc}")
         except Exception as exc:
             log(f"other-pointer watcher restarting after error: {exc}")
-        time.sleep(2)
+            time.sleep(2)
 
 
 # Declared last: the signatures reference the callback types defined above, and a

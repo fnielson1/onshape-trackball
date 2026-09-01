@@ -4,8 +4,8 @@ rem ---------------------------------------------------------------------------
 rem  Setup / resume installer for the Onshape trackball gate, on Windows.
 rem
 rem  The Windows half of setup.sh, option for option. Safe to run repeatedly:
-rem  every step is checked before it is attempted, so re-running after the
-rem  required reboot picks up exactly where it left off.
+rem  every step is checked before it is attempted, so re-running after an
+rem  interrupted install picks up exactly where it left off.
 rem
 rem    setup.cmd                 install, prompting where needed
 rem    setup.cmd --status        show what is done and what is left, change nothing
@@ -73,12 +73,13 @@ echo Onshape trackball gate - Windows install
 echo.
 
 rem  Config first, deliberately. It needs nothing but a writable %APPDATA%, while
-rem  the driver step stops the install dead on any machine that has not installed
-rem  Interception and rebooted yet - which is every machine, on the first run. Left
-rem  in its old place after the driver, the config only ever appeared on the second
-rem  run, so there was nothing to read or edit while working through step 1.
+rem  the library step stops the install dead on any machine where interceptor.dll
+rem  has not been copied next to gate.py yet - easy to still be true on a first
+rem  run. Left in its old place after that step, the config only ever appeared on
+rem  the second run, so there was nothing to read or edit while working through
+rem  step 1.
 call :step_config     || exit /b !errorlevel!
-call :step_driver     || exit /b !errorlevel!
+call :step_library    || exit /b !errorlevel!
 call :step_device     || exit /b !errorlevel!
 call :step_service    || exit /b !errorlevel!
 call :step_grab
@@ -100,7 +101,7 @@ echo and turns its motion into Onshape navigation: move pans ^(Ctrl+right-drag^)
 echo right-button + move rotates, wheel zooms, left click clears the selection.
 echo.
 echo Safe to run repeatedly. Every step is checked before it is attempted, so
-echo re-running after the required reboot resumes where it left off.
+echo re-running after being interrupted resumes where it left off.
 echo.
 echo USAGE
 echo   setup.cmd [options]
@@ -108,23 +109,21 @@ echo.
 echo OPTIONS
 echo   -s, --status        Show what is done and what is left; change nothing.
 echo       --reconfigure   Re-pick which mouse is the left one.
-echo       --device ID     Set the left mouse non-interactively. Takes an
-echo                       Interception hardware ID, as printed by --status.
-echo       --uninstall     Stop and remove the scheduled task and config. Offers
-echo                       to remove the Interception driver too.
+echo       --device ID     Set the left mouse non-interactively. Takes a
+echo                       hardware ID, as printed by --status.
+echo       --uninstall     Stop and remove the scheduled task and config.
 echo   -y, --yes           Assume yes for confirmations. Cannot choose a mouse
-echo                       for you, and never removes the driver.
+echo                       for you.
 echo   -h, --help          This text.
 echo.
 echo INSTALL STEPS
 echo   1. Config        create %%APPDATA%%\onshape-trackball\config, with every
 echo                    setting at its default, if it is not there already
-echo   2. Driver        install Interception                        ^(administrator^)
-echo   3. Reboot        required before the driver takes effect
-echo   4. Choose mouse  pick from a list, or 'd' to detect by moving it
-echo   5. Service       register and start the scheduled task
-echo   6. Mouse grab    confirm the daemon has the device
-echo   7. Extension     load the Chrome extension ^(done by hand, in Chrome^)
+echo   2. Library       confirm interceptor.dll is next to gate.py
+echo   3. Choose mouse  pick from a list, or 'd' to detect by moving it
+echo   4. Service       register and start the scheduled task
+echo   5. Mouse grab    confirm the daemon has the device
+echo   6. Extension     load the Chrome extension ^(done by hand, in Chrome^)
 echo.
 echo EXAMPLES
 echo   setup.cmd                  Install, or resume an interrupted install.
@@ -176,10 +175,6 @@ if errorlevel 1 (
 )
 exit /b 0
 
-:is_admin
-net session >nul 2>&1
-exit /b %errorlevel%
-
 rem  These go through a variable and delayed expansion rather than echoing %~1
 rem  directly. %~1 strips the quotes and cmd then re-parses the result for
 rem  redirection, so any <, >, & or | in a message becomes an operator - a driver
@@ -207,8 +202,10 @@ call :ask "%~1"
 exit /b !errorlevel!
 
 :ask
-rem  Always prompts, even under --yes. The driver removal uses this directly:
-rem  --yes must never take a kernel driver off the machine on the user's behalf.
+rem  The actual prompt; :confirm is the --yes-aware wrapper around it that every
+rem  caller here goes through. Kept separate so a future confirmation that must
+rem  never be skipped by --yes has somewhere to call directly, the way the old
+rem  driver-removal prompt once did.
 rem
 rem  Prefers `choice` over `set /p`. set /p reads whatever stdin happens to be and
 rem  silently yields an empty string when it is not a console the way it expects -
@@ -236,67 +233,27 @@ exit /b %errorlevel%
 
 
 rem ===========================================================================
-rem  step 2-3: driver, and the reboot it needs
+rem  step 2: library
 rem ===========================================================================
-:step_driver
+:step_library
 echo.
-echo Driver
+echo Library
 for /f "tokens=1,* delims=|" %%A in ('%PY% "%HELPER%" driver-state 2^>nul') do (
   set "DRIVER_STATE=%%A"
   set "DRIVER_MSG=%%B"
 )
 if "%DRIVER_STATE%"=="active" (
-  call :ok "Interception driver installed and answering"
+  call :ok "interceptor.dll found and answering"
   exit /b 0
 )
 
-if "%DRIVER_STATE%"=="needs_reboot" (
-  call :bad "!DRIVER_MSG!"
-  echo.
-  echo   Reboot, then run this script again - it continues from the next step.
-  exit /b 1
-)
-
-call :bad "the Interception driver is not installed"
+call :bad "!DRIVER_MSG!"
 echo.
-echo   It is a kernel filter driver, and it is what makes an exclusive grab of one
-echo   mouse possible at all. Nothing in user space can do this.
-echo.
-echo   1. Download the release from https://github.com/oblitum/Interception
-echo   2. From an administrator prompt, in its command line folder:
-echo          install-interception.exe /install
-echo   3. Copy interceptor.dll ^(x64^) next to gate.py:
+echo   No driver, no admin, no reboot needed - interceptor.dll is a plain DLL that
+echo   captures input on its own. Just put it next to gate.py:
 echo          %REPO_DIR%\interceptor.dll
-echo   4. Reboot, then run this script again.
-echo.
-call :is_admin
-if errorlevel 1 (
-  echo   Note: you are not running as administrator. The driver install needs it -
-  echo   right-click cmd.exe and choose "Run as administrator".
-)
-call :driver_blockers
+echo   then run this script again.
 exit /b 1
-
-:driver_blockers
-rem  A refused driver install is nearly always one of these, and "it failed" is a
-rem  useless thing to be told when the fix is specific.
-rem  wmic is gone on current Windows 11 builds, so these go through PowerShell.
-powershell -NoProfile -Command "$d = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction Stop; if ($d.VirtualizationBasedSecurityStatus -ne 0) { exit 0 } else { exit 1 }" >nul 2>&1
-if not errorlevel 1 (
-  echo   Note: virtualization-based security is on, which blocks some filter drivers.
-)
-powershell -NoProfile -Command "if ((Confirm-SecureBootUEFI) -eq $true) { exit 0 } else { exit 1 }" >nul 2>&1
-if not errorlevel 1 (
-  echo   Note: Secure Boot is enabled. Interception is signed, but if the install is
-  echo   rejected anyway this is the first thing to check.
-)
-for %%A in (vgk.sys EasyAntiCheat.sys BEDaisy.sys) do (
-  if exist "%SystemRoot%\System32\drivers\%%A" (
-    echo   Note: %%A is present. Anti-cheat drivers commonly block, or are blocked
-    echo   by, input filter drivers.
-  )
-)
-goto :eof
 
 
 rem ===========================================================================
@@ -352,7 +309,7 @@ for /f "tokens=1,2,3 delims=|" %%A in ('%PY% "%HELPER%" list-mice 2^>nul') do (
   set "COUNT=%%A"
 )
 if "%COUNT%"=="0" (
-  call :bad "no mice found. Is the driver active?"
+  call :bad "no mice found. Is interceptor.dll next to gate.py?"
   exit /b 1
 )
 echo      d^) detect - press d, then MOVE the mouse you want gated
@@ -499,9 +456,9 @@ rem  Registered through PowerShell rather than `schtasks /Create /SC ONLOGON`, w
 rem  fails with "Access is denied" for a standard user: that trigger can target any
 rem  user, so schtasks demands administrator rights for it. Register-ScheduledTask
 rem  creates the same at-logon task for the current user without elevation, which is
-rem  what makes this the real counterpart of a systemd *user* unit - only the driver
-rem  step needs admin. It also carries the settings in one call, where schtasks
-rem  cannot express restart-on-failure at all.
+rem  what makes this the real counterpart of a systemd *user* unit - nothing in
+rem  this install needs admin any more. It also carries the settings in one
+rem  call, where schtasks cannot express restart-on-failure at all.
 rem  Paths travel in the environment, not inline: the action needs the script path
 rem  quoted inside a PowerShell string inside a batch string, and [char]34 keeps
 rem  that nesting out of the batch parser entirely.
@@ -587,13 +544,13 @@ echo.
 echo Onshape trackball gate - status
 echo.
 
-echo Driver
+echo Library
 for /f "tokens=1,* delims=|" %%A in ('%PY% "%HELPER%" driver-state 2^>nul') do (
   set "DRIVER_STATE=%%A"
   set "DRIVER_MSG=%%B"
 )
 if "%DRIVER_STATE%"=="active" (
-  call :ok "installed and answering"
+  call :ok "interceptor.dll found and answering"
 ) else (
   call :bad "!DRIVER_MSG!"
 )
@@ -725,21 +682,6 @@ if exist "%CONFIG_FILE%" (
 )
 
 echo.
-rem  The driver is shared state: other software may rely on it, and removing it
-rem  costs a reboot. Asked separately, and defaulting to no, exactly as setup.sh
-rem  treats the udev rule and the 'input' group.
-echo   The Interception driver is shared with anything else that uses it, and
-echo   removing it needs another reboot.
-call :ask "  Remove the Interception driver too?"
-if not errorlevel 1 (
-  echo   Run this from an administrator prompt, in the driver's folder:
-  echo       install-interception.exe /uninstall
-  echo   then reboot.
-) else (
-  call :ok "kept the Interception driver"
-)
-
-echo.
 echo   The Chrome extension has to be removed by hand: chrome://extensions.
-echo   Nothing in %REPO_DIR% was touched.
+echo   interceptor.dll and the rest of %REPO_DIR% were left in place.
 exit /b 0

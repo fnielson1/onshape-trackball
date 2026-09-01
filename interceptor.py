@@ -15,6 +15,7 @@ created, so `gate.py` still execs on a machine without it.
 
 import ctypes
 import os
+import re
 import sys
 
 MAX_KEYBOARD = 10
@@ -88,6 +89,36 @@ class InterceptionError(RuntimeError):
     pass
 
 
+_VID_PID = re.compile(r"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})")
+
+
+def _vid_pid(text):
+    """(vid, pid) from a hardware ID string, in whichever shape this project's
+    DLL has produced over time -- interceptor.dll built against the kernel
+    driver reports a bare PnP hardware ID (HID\\VID_04CA&PID_0061&REV_0100);
+    the current user-mode-backed DLL reports a Raw Input device interface path
+    (\\\\?\\HID#VID_04CA&PID_0061#9&299ea37&0&0000#{guid}) instead. Neither is a
+    substring of the other, but both carry VID_xxxx&PID_xxxx verbatim, which is
+    what hardware_ids_match() below uses to bridge the two.
+    """
+    m = _VID_PID.search(text or "")
+    return (m.group(1).upper(), m.group(2).upper()) if m else None
+
+
+def hardware_ids_match(a, b):
+    """Same device, tolerant of the hardware-ID shape a DLL upgrade changes.
+
+    Exact match first (cheap, and the only correct answer when two identical
+    devices need telling apart within one DLL generation); VID/PID as a
+    fallback, so a `device = ...` value a config saved against an older DLL
+    still resolves after interceptor.dll is replaced.
+    """
+    if a == b:
+        return True
+    vp_a = _vid_pid(a)
+    return vp_a is not None and vp_a == _vid_pid(b)
+
+
 def _candidate_paths():
     """Where interceptor.dll might be, most specific first."""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -117,7 +148,7 @@ def library():
 
     raise InterceptionError(
         "interceptor.dll not found. Looked in:\n  " + "\n  ".join(tried)
-        + "\nInstall the Interception driver and place the DLL beside gate.py.")
+        + "\nPlace the DLL beside gate.py.")
 
 
 def _bind(lib):
@@ -130,6 +161,13 @@ def _bind(lib):
     lib.interceptor_set_filter.restype = None
     lib.interceptor_set_filter.argtypes = [ctypes.c_void_p, PREDICATE,
                                             ctypes.c_ushort]
+
+    lib.interceptor_set_monitor.restype = None
+    lib.interceptor_set_monitor.argtypes = [ctypes.c_void_p, PREDICATE,
+                                             ctypes.c_ushort]
+
+    lib.interceptor_get_monitor.restype = ctypes.c_ushort
+    lib.interceptor_get_monitor.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
     lib.interceptor_wait.restype = ctypes.c_int
     lib.interceptor_wait.argtypes = [ctypes.c_void_p]
@@ -170,10 +208,11 @@ class Context:
         handle = lib.interceptor_create_context()
         if not handle:
             raise InterceptionError(
-                "the Interception driver is installed but not accepting a context. "
-                "This is what it looks like before the reboot that activates it.")
+                "interceptor.dll would not open a context; see its own log/stderr "
+                "output, if any, for why.")
         self._ctx = ctypes.c_void_p(handle)
         self._predicate = None
+        self._monitor_predicate = None
 
     # --- lifecycle ----------------------------------------------------------------
 
@@ -231,7 +270,8 @@ class Context:
         Two identical mice genuinely share an ID and cannot be told apart; callers
         decide what to do about the collision rather than having it hidden here.
         """
-        return [device for device, hwid in self.mice() if hwid == hardware_id]
+        return [device for device, hwid in self.mice()
+                if hardware_ids_match(hwid, hardware_id)]
 
     # --- filtering ----------------------------------------------------------------
 
@@ -263,6 +303,24 @@ class Context:
         self._lib.interceptor_set_filter(self._ctx, self._predicate,
                                           FILTER_MOUSE_NONE)
 
+    def set_monitor(self, devices, filter_bits=FILTER_MOUSE_ALL):
+        """Passively observe several devices' strokes without withholding them.
+
+        The monitor counterpart of filter_devices(): a stroke matching this still
+        reaches the rest of the system untouched, a copy is only *also* delivered
+        here. Use this instead of a second RegisterRawInputDevices call of your
+        own for devices this context isn't filtering — Windows allows only one
+        raw-input registration per device class per process, and interceptor.dll
+        already holds the one for keyboards and mice.
+        """
+        wanted = set(devices)
+
+        def predicate(candidate):
+            return 1 if candidate in wanted else 0
+
+        self._monitor_predicate = PREDICATE(predicate)
+        self._lib.interceptor_set_monitor(self._ctx, self._monitor_predicate, filter_bits)
+
     # --- i/o -----------------------------------------------------------------------
 
     def wait(self, timeout_ms=None):
@@ -291,79 +349,28 @@ class Context:
         return self._lib.interceptor_send(self._ctx, device, ctypes.byref(buf), 1)
 
 
-# Device class GUIDs, and the filter driver Interception prepends to each. It
-# installs itself as an upper filter on the mouse and keyboard classes; that
-# registry entry is the authoritative "is it installed", and it survives the gap
-# between installing and rebooting, which nothing else does.
-_CLASS_FILTERS = (
-    ("mouse", r"SYSTEM\CurrentControlSet\Control\Class"
-              r"\{4D36E96F-E325-11CE-BFC1-08002BE10318}"),
-    ("keyboard", r"SYSTEM\CurrentControlSet\Control\Class"
-                 r"\{4D36E96B-E325-11CE-BFC1-08002BE10318}"),
-)
-
-
-def filters_registered():
-    """Has install-interception.exe run? Reads the registry; needs no admin.
-
-    Creating a context cannot answer this: it fails identically whether the driver
-    is installed and waiting for a reboot or was never installed at all. Telling
-    someone to reboot when they have not run the installer wastes a reboot and
-    leaves them exactly where they started.
-    """
-    try:
-        import winreg
-    except ImportError:
-        return False
-
-    for driver, path in _CLASS_FILTERS:
-        try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
-                filters, _ = winreg.QueryValueEx(key, "UpperFilters")
-        except OSError:
-            continue
-        if any(str(f).lower() == driver for f in (filters or ())):
-            return True
-    return False
-
-
 def driver_state():
-    """-> 'active' | 'needs_reboot' | 'missing', plus a human explanation.
+    """-> 'active' | 'missing', plus a human explanation.
 
-    The three are genuinely different situations with different fixes, and setup
-    must not collapse them into "something went wrong".
+    interceptor.dll is a plain user-mode DLL now (see input-interceptor's
+    README): no kernel driver, no signing, no reboot. The only way this can
+    fail is the DLL not being where interceptor.py looks for it, or -- in
+    principle, and not one we have seen -- Context() itself failing, which
+    the second branch below still reports rather than letting it raise.
+
+    Whether any mice are actually attached is a separate question, answered
+    by mice()/enumerate_mice(): a working library with nothing plugged into
+    it is still "active".
     """
     try:
         library()
     except InterceptionError:
-        # Deliberately short, and careful not to conflate two separate things: the
-        # driver is installed by install-interception.exe, while interceptor.dll is
-        # a file you copy yourself. Installing the driver and stopping there is the
-        # easy mistake, and "is the driver installed?" would send you to check the
-        # one thing that is already done.
         return ("missing",
-                "interceptor.dll not found - copy it next to gate.py "
-                "(this is a separate step from installing the driver)")
+                "interceptor.dll not found - copy it next to gate.py")
 
     try:
         ctx = Context()
-    except InterceptionError:
-        # Distinguished by the registry, not by this failure: creating a context
-        # fails identically whether the driver is installed and waiting for a
-        # reboot or was never installed at all.
-        if filters_registered():
-            return ("needs_reboot",
-                    "the driver is installed but not yet active - reboot to "
-                    "activate it, then run this again")
-        return ("missing",
-                "interceptor.dll is here but the driver is not installed - run "
-                "install-interception.exe /install from an admin prompt, "
-                "then reboot")
-    try:
-        if not ctx.mice():
-            return ("needs_reboot",
-                    "the driver is answering but reports no mice, which is what a "
-                    "half-activated install looks like; reboot and try again")
-        return "active", "the Interception driver is installed and answering"
-    finally:
-        ctx.close()
+    except InterceptionError as exc:
+        return "missing", str(exc)
+    ctx.close()
+    return "active", "interceptor.dll is present and answering"

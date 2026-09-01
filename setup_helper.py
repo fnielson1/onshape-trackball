@@ -424,7 +424,7 @@ def cmd_device_name(argv):
         return USAGE
     import backend_windows
     try:
-        print(backend_windows._friendly_names().get(argv[0].upper(), argv[0]))
+        print(backend_windows._label_for(argv[0]))
     except Exception:
         print(argv[0])
     return OK
