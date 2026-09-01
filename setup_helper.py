@@ -55,12 +55,14 @@ def _gate_namespace():
 CONFIG_KEYS = ("device", "left_click_key", "pan_requires_right_button",
                "pan_deadzone_px", "pan_idle_release_ms",
                "pan_recenter", "pan_recenter_margin_px", "pan_yield_to_other_mice",
-               "pan_yield_deadzone_px")
+               "pan_yield_deadzone_px", "rotate_scale", "min_drag_px")
 
 DEFAULT_PAN_IDLE_MS = 150
 DEFAULT_RECENTER_MARGIN = 35
-DEFAULT_DEADZONE_PX = 20
+DEFAULT_DEADZONE_PX = 10
 DEFAULT_YIELD_DEADZONE_PX = 20
+DEFAULT_ROTATE_SCALE = 0.5
+DEFAULT_MIN_DRAG_PX = 6
 
 RESTART = 'schtasks /Run /TN "Onshape trackball gate"'
 
@@ -223,6 +225,54 @@ def _block(key, device=""):
             "# behaviour before this setting existed.\n"
             f"pan_yield_deadzone_px = {DEFAULT_YIELD_DEADZONE_PX}\n")
 
+    if key == "rotate_scale":
+        return (
+            "\n# Multiplier applied to rotate's motion.\n"
+            "#\n"
+            "# Rotate is plain motion passed straight through to Onshape's orbit "
+            "gesture,\n"
+            "# with nothing between the physical mouse and the browser to scale it "
+            "down —\n"
+            "# a trackball's raw counts become orbit degrees 1:1, which reads as far "
+            "more\n"
+            "# sensitive than an ordinary pointing device, where the same counts only "
+            "move a\n"
+            "# cursor.\n"
+            "#\n"
+            "#   below 1   a given push rotates the model less\n"
+            "#   1         raw, unscaled motion — how this behaved before this "
+            "setting existed\n"
+            "#   above 1   a given push rotates the model more\n"
+            "#\n"
+            "# Panning is unaffected — it already has its own feel via "
+            "pan_deadzone_px and\n"
+            "# pan_recenter_margin_px.\n"
+            "#\n"
+            "# Accepted range 0.05-5.0; anything outside is clamped.\n"
+            f"rotate_scale = {DEFAULT_ROTATE_SCALE}\n")
+
+    if key == "min_drag_px":
+        return (
+            "\n# A press and release with nothing in between is a click, and Ctrl + "
+            "right-click\n"
+            "# opens Chrome's context menu mid-pan. Every release is preceded by at "
+            "least this\n"
+            "# much real cursor displacement, so it always reads as a drag instead — "
+            "topped up\n"
+            "# with a synthetic nudge if the real motion fell short. That nudge pans "
+            "or\n"
+            "# rotates the model too, which is why it is kept small.\n"
+            "#\n"
+            "#   lower   less forced motion on a short release, but less margin "
+            "against a\n"
+            "#           stray context menu\n"
+            "#   higher  more margin against a context menu, at the cost of a bigger "
+            "nudge on\n"
+            "#           a release that fell well short\n"
+            "#\n"
+            "# Accepted range 0-200; anything outside is clamped.\n"
+            f"min_drag_px = {DEFAULT_MIN_DRAG_PX}\n")
+
     return ""
 
 
@@ -346,6 +396,8 @@ def cmd_drift():
         "pan_yield_deadzone_px": ns["resolve_yield_deadzone"](config),
         "pan_requires_right_button": ns["resolve_pan_button"](config),
         "left_click_key": ns["resolve_left_click"](config)[0],
+        "rotate_scale": ns["resolve_rotate_scale"](config),
+        "min_drag_px": ns["resolve_min_drag_px"](config),
         "device": config.get("device", ""),
     }
 

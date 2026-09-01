@@ -193,7 +193,9 @@ PAN_YIELD = True
 #
 # Applies to panning alone. Rotating, zooming and the left button are unaffected: the
 # cursor keeps tracking your hand throughout, it simply is not panning yet.
-PAN_DEADZONE = 20
+#
+# Overridden by pan_deadzone_px in the config file; this is the fallback.
+PAN_DEADZONE = 10
 
 # How far the *other* mouse must travel, net, before its motion is treated as
 # deliberate and drops the gated mouse's pan or rotate. Below this, resting a hand on
@@ -203,12 +205,14 @@ PAN_DEADZONE = 20
 # regardless of this value, since pressing a button is unambiguous. Like
 # pan_deadzone_px, an idle other mouse forgets what it has accumulated rather than
 # banking a stale nudge toward a later one.
-PAN_YIELD_DEADZONE = 20
+PAN_YIELD_DEADZONE = 10
 
 # A press and release with nothing in between is a click, and Ctrl + right-click
 # opens Chrome's context menu. Every release we emit is preceded by at least this
 # much displacement, so the gesture always reads as a drag.
-MIN_DRAG_PX = 12
+#
+# Overridden by min_drag_px in the config file; this is the fallback.
+MIN_DRAG_PX = 1
 
 # How often the cached window rect is re-read, to survive a move or resize that
 # happens without any focus change.
@@ -222,6 +226,26 @@ YIELD_COOLDOWN = 0.15
 # The extension pushes on every real transition and heartbeats every 30s via
 # chrome.alarms. If we go this long with nothing at all, assume it died and fail closed.
 STALE_AFTER = 120.0
+
+# Rotation is plain motion passed straight through to Onshape's orbit gesture, with
+# no scaling anywhere between the physical mouse and the browser. A trackball's raw
+# counts become orbit degrees 1:1, which reads as far more sensitive than an ordinary
+# pointing device, where the same counts only move a cursor. Below 1 tones that down;
+# above 1 speeds it up.
+#
+# Panning is deliberately not scaled here: it already has its own dedicated feel via
+# PAN_DEADZONE and RECENTER_MARGIN, and slowing the cursor down mid-pan would just
+# make the window take longer to cross for no benefit.
+#
+# Overridden by rotate_scale in the config file; this is the fallback.
+DEFAULT_ROTATE_SCALE = 0.5
+ROTATE_SCALE = DEFAULT_ROTATE_SCALE
+
+# Outside this range the setting stops doing what it says: below the floor a normal
+# push barely rotates the model at all, and above the ceiling it is no longer a scale
+# so much as a typo.
+ROTATE_SCALE_MIN = 0.05
+ROTATE_SCALE_MAX = 5.0
 
 MOTION_AXES = (ecodes.REL_X, ecodes.REL_Y)
 
@@ -293,6 +317,8 @@ class Translator:
         self._last_press_time = 0.0
         self._travel_x = 0.0
         self._travel_y = 0.0
+        self._rotate_remainder_x = 0.0
+        self._rotate_remainder_y = 0.0
         self._other_travel_x = 0.0
         self._other_travel_y = 0.0
         self._other_travel_at = 0.0
@@ -343,6 +369,11 @@ class Translator:
     def _reset_deadzone(self):
         self._travel_x = 0.0
         self._travel_y = 0.0
+        # Carried per-stroke, same as the travel above: a fresh stroke starts rotate
+        # scaling's sub-pixel carry from zero rather than resuming a leftover from
+        # however long ago the last one ended.
+        self._rotate_remainder_x = 0.0
+        self._rotate_remainder_y = 0.0
 
     def _start_pan(self):
         if self._panning:
@@ -444,8 +475,11 @@ class Translator:
 
         A press and release with nothing between them is a click, and Ctrl +
         right-click opens Chrome's context menu mid-pan. Moving first makes every
-        gesture read as a drag instead. The move does pan the model by MIN_DRAG_PX,
-        which is why it is kept small.
+        gesture read as a drag instead. The move does pan or rotate the model too,
+        which is why only the shortfall is added — not a flat MIN_DRAG_PX on top of
+        whatever real motion already happened. A stroke sitting a couple of pixels
+        under the line does not deserve the full nudge; that would read as a stray
+        jump right when a small, deliberate rotate is trying to land on an angle.
 
         Returns (measured_px, nudged) for the release record: how far the cursor had
         actually travelled since the press, and whether we had to make up the
@@ -455,21 +489,37 @@ class Translator:
         position = POINTER.position() if POINTER.ok else None
 
         measured = None
+        nudge_px = MIN_DRAG_PX
+        dx = 0.0
         if position is not None and self._last_press_pos is not None:
             dx = position[0] - self._last_press_pos[0]
             dy = position[1] - self._last_press_pos[1]
             measured = (dx * dx + dy * dy) ** 0.5
-            if dx * dx + dy * dy >= MIN_DRAG_PX * MIN_DRAG_PX:
+            if measured >= MIN_DRAG_PX:
                 return measured, False      # already dragged far enough
+            # +1 rather than the bare shortfall: the nudge only moves along X while
+            # `measured` is the true diagonal, so a stroke that was mostly vertical
+            # needs a little more than the arithmetic difference to actually clear
+            # the line once combined with whatever X displacement already existed.
+            nudge_px = int(MIN_DRAG_PX - measured) + 1
 
-        direction = 1
+        # Continue in whichever direction the stroke was already heading, so the
+        # nudge reads as a bit more of the same rotate rather than a flick the other
+        # way — a rotate to the left must not get finished off with a nudge to the
+        # right. Only when the existing motion was ambiguous (essentially no X
+        # component) does this default to the right, for the edge check below to
+        # override if needed.
+        direction = -1 if dx < 0 else 1
+
         geometry = GATE.view_rect()
         if position is not None and geometry is not None:
             win_x, _, win_w, _ = geometry
-            if position[0] + MIN_DRAG_PX > win_x + win_w - 8:
+            if direction > 0 and position[0] + nudge_px > win_x + win_w - 8:
                 direction = -1
+            elif direction < 0 and position[0] - nudge_px < win_x + 8:
+                direction = 1
 
-        self._ui.write(ecodes.EV_REL, ecodes.REL_X, direction * MIN_DRAG_PX)
+        self._ui.write(ecodes.EV_REL, ecodes.REL_X, direction * nudge_px)
         self._ui.syn()
         self.drag_nudges += 1
         return measured, True
@@ -543,6 +593,47 @@ class Translator:
         elif value == 0:
             self._held.discard(code)
 
+    def _write_motion(self, code, value, is_rotate):
+        """Write one axis of motion, scaled down for whichever gesture is currently
+        rotate. Pan gets the raw value unconditionally — see ROTATE_SCALE.
+        """
+        if is_rotate and ROTATE_SCALE != 1.0:
+            value = self._scale_rotate(code, value)
+            if value == 0:
+                return
+        self._ui.write(ecodes.EV_REL, code, value)
+
+    def _scale_rotate(self, code, value):
+        """value * ROTATE_SCALE, without losing sub-pixel motion to rounding: the
+        remainder left over from one sample carries into the next, so a slow,
+        deliberate rotate at a low scale still moves eventually instead of every
+        sample individually truncating to zero.
+        """
+        if code == ecodes.REL_X:
+            total = self._rotate_remainder_x + value * ROTATE_SCALE
+            scaled = int(total)
+            self._rotate_remainder_x = total - scaled
+        else:
+            total = self._rotate_remainder_y + value * ROTATE_SCALE
+            scaled = int(total)
+            self._rotate_remainder_y = total - scaled
+        return scaled
+
+    def _resume_button_gesture(self):
+        """The right button is still physically down, but a yield dropped its
+        synthetic press mid-stroke (see yield_stroke) while the hand never let go.
+        Motion resuming means the gesture should resume too, exactly as a fresh
+        press would — this mirrors _handle_right_button's own press branch, since a
+        real button event is never coming to do it for us.
+        """
+        if PAN_REQUIRES_RIGHT_BUTTON and not self._ctrl_down:
+            self._ctrl(1)
+            time.sleep(MODIFIER_SETTLE)
+        self._repress_right_button()
+        self._last_press_pos = POINTER.position() if POINTER.ok else None
+        self._last_press_time = time.monotonic()
+        self._reset_deadzone()      # a resumed stroke earns its own dead zone too
+
     # --- public ------------------------------------------------------------------
 
     def handle(self, event):
@@ -580,19 +671,30 @@ class Translator:
                 # diagonal by up to 41%, and a margin erring large is the safe
                 # direction to err in. Tracked for whichever gesture the button is
                 # currently driving too — a long sweep runs the cursor out of screen
-                # the same way regardless of which one it is.
+                # the same way regardless of which one it is. Measured on the raw
+                # value, ahead of any rotate scaling below — erring larger only makes
+                # the recentre margin more conservative, never less.
                 self._edge_travel += abs(value)
-                if not self._right_down:
+                bare_motion = not self._right_down
+                if bare_motion:
                     if code == ecodes.REL_X:
                         self._travel_x += value
                     else:
                         self._travel_y += value
                     self._start_pan()
                     self._last_motion = time.monotonic()
-                    self._ui.write_event(event)
-                    self._recenter_if_near_edge()
-                    return
-                self._ui.write_event(event)
+                elif (not self._right_emitted and not self._ctrl_down
+                        and time.monotonic() >= self._yield_until
+                        and GATE.view_rect() is not None):
+                    # The button is held but nothing is emitted for it: a yield cut
+                    # this stroke off mid-gesture and the button never came back up
+                    # to give it a real press to resume on. Without this, the only
+                    # way out is releasing the physical button — see
+                    # _resume_button_gesture.
+                    self._resume_button_gesture()
+                # See the PAN_REQUIRES_RIGHT_BUTTON comment: bare motion and "button
+                # held" only mean rotate/pan once paired with this setting.
+                self._write_motion(code, value, bare_motion == PAN_REQUIRES_RIGHT_BUTTON)
                 self._recenter_if_near_edge()
                 return
 
@@ -1006,6 +1108,8 @@ class Gate:
         state["pan_deadzone_px"] = PAN_DEADZONE
         state["pan_yield_deadzone_px"] = PAN_YIELD_DEADZONE
         state["pan_requires_right_button"] = PAN_REQUIRES_RIGHT_BUTTON
+        state["rotate_scale"] = ROTATE_SCALE
+        state["min_drag_px"] = MIN_DRAG_PX
         state["left_click_key"] = LEFT_CLICK_KEY
         state["device_attached"] = translator is not None
         if translator is not None:
@@ -1262,6 +1366,23 @@ def resolve_deadzone(config):
     return clamped
 
 
+def resolve_min_drag_px(config):
+    """A bad value is a typo in a hand-edited file, so warn and fall back rather than
+    refusing to start."""
+    raw = config.get("min_drag_px")
+    if raw is None:
+        return MIN_DRAG_PX
+    try:
+        value = int(float(raw))
+    except ValueError:
+        log(f"min_drag_px: '{raw}' is not a number; using {MIN_DRAG_PX}")
+        return MIN_DRAG_PX
+    clamped = max(0, min(200, value))
+    if clamped != value:
+        log(f"min_drag_px: {value} is outside 0-200; using {clamped}")
+    return clamped
+
+
 def resolve_yield_deadzone(config):
     raw = config.get("pan_yield_deadzone_px")
     if raw is None:
@@ -1282,6 +1403,24 @@ def resolve_yield(config):
     if raw is None:
         return PAN_YIELD
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def resolve_rotate_scale(config):
+    """Multiplier applied to rotate's motion. A bad value is a typo in a hand-edited
+    file, so warn and fall back rather than refusing to start."""
+    raw = config.get("rotate_scale")
+    if raw is None:
+        return DEFAULT_ROTATE_SCALE
+    try:
+        value = float(raw)
+    except ValueError:
+        log(f"rotate_scale: '{raw}' is not a number; using {DEFAULT_ROTATE_SCALE}")
+        return DEFAULT_ROTATE_SCALE
+    clamped = max(ROTATE_SCALE_MIN, min(ROTATE_SCALE_MAX, value))
+    if clamped != value:
+        log(f"rotate_scale: {value:g} is outside "
+            f"{ROTATE_SCALE_MIN}-{ROTATE_SCALE_MAX}; using {clamped:g}")
+    return clamped
 
 
 def resolve_pan_button(config):
@@ -1315,7 +1454,7 @@ def resolve_pan_idle(config):
 def main():
     global DEVICE_PATH, PAN_IDLE_RELEASE, RECENTER, RECENTER_MARGIN, PAN_YIELD
     global PAN_DEADZONE, PAN_YIELD_DEADZONE, PAN_REQUIRES_RIGHT_BUTTON
-    global LEFT_CLICK_KEY, LEFT_CLICK_CODE
+    global LEFT_CLICK_KEY, LEFT_CLICK_CODE, ROTATE_SCALE, MIN_DRAG_PX
     _open_log()
     config = read_config()
     DEVICE_PATH = resolve_device(config)
@@ -1326,6 +1465,8 @@ def main():
     PAN_YIELD_DEADZONE = resolve_yield_deadzone(config)
     PAN_REQUIRES_RIGHT_BUTTON = resolve_pan_button(config)
     LEFT_CLICK_KEY, LEFT_CLICK_CODE = resolve_left_click(config)
+    ROTATE_SCALE = resolve_rotate_scale(config)
+    MIN_DRAG_PX = resolve_min_drag_px(config)
 
     # Must happen before any window rect is read: on Windows an un-declared process
     # gets virtualised coordinates from GetWindowRect while the cursor answers in
@@ -1347,6 +1488,7 @@ def main():
         f"({pan_trigger}, dead zone {PAN_DEADZONE}px, "
         f"yield dead zone {PAN_YIELD_DEADZONE}px, "
         f"idle release {PAN_IDLE_RELEASE * 1000:.0f}ms, "
+        f"rotate scale {ROTATE_SCALE:g}, min drag {MIN_DRAG_PX}px, "
         f"{recentring}, backend {backend.name})")
 
     while True:

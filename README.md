@@ -12,7 +12,8 @@ tabs, other windows, the desktop — that mouse does nothing at all.
 | left button | space | **clear the selection** |
 
 Which gesture the right button maps to is configurable — see `pan_requires_right_button`
-under [Configuration](#configuration).
+under [Configuration](#configuration). Rotate's sensitivity is configurable too — see
+`rotate_scale`; it defaults to half of the raw, unscaled motion this used to send.
 
 ## How it works
 

@@ -73,8 +73,8 @@ check("a negative margin is clamped to zero",
       ns["resolve_recenter"](with_config("pan_recenter_margin_px = -40\n")), (True, 0))
 
 # --- pan dead zone --------------------------------------------------------------
-check("dead zone defaults to 20px",
-      ns["resolve_deadzone"](with_config(None)), 20)
+check("dead zone defaults to 10px",
+      ns["resolve_deadzone"](with_config(None)), 10)
 
 check("a custom dead zone is honoured",
       ns["resolve_deadzone"](with_config("pan_deadzone_px = 25\n")), 25)
@@ -83,7 +83,7 @@ check("zero disables the dead zone",
       ns["resolve_deadzone"](with_config("pan_deadzone_px = 0\n")), 0)
 
 check("a junk dead zone falls back",
-      ns["resolve_deadzone"](with_config("pan_deadzone_px = far\n")), 20)
+      ns["resolve_deadzone"](with_config("pan_deadzone_px = far\n")), 10)
 
 check("an oversized dead zone is clamped",
       ns["resolve_deadzone"](with_config("pan_deadzone_px = 9000\n")), 500)
@@ -103,6 +103,41 @@ check("a junk yield dead zone falls back",
 
 check("an oversized yield dead zone is clamped",
       ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = 9000\n")), 500)
+
+# --- rotate scale ---------------------------------------------------------------
+check("rotate scale defaults to 0.5",
+      ns["resolve_rotate_scale"](with_config(None)), 0.5)
+
+check("a custom scale is honoured",
+      ns["resolve_rotate_scale"](with_config("rotate_scale = 1.2\n")), 1.2)
+
+check("1.0 restores raw, unscaled motion",
+      ns["resolve_rotate_scale"](with_config("rotate_scale = 1\n")), 1.0)
+
+check("a junk scale falls back",
+      ns["resolve_rotate_scale"](with_config("rotate_scale = fast\n")), 0.5)
+
+check("below the floor is clamped up",
+      ns["resolve_rotate_scale"](with_config("rotate_scale = 0.001\n")), 0.05)
+
+check("above the ceiling is clamped down",
+      ns["resolve_rotate_scale"](with_config("rotate_scale = 50\n")), 5.0)
+
+# --- minimum drag before a release is nudged -------------------------------------
+check("min drag defaults to 6px",
+      ns["resolve_min_drag_px"](with_config(None)), 6)
+
+check("a custom value is honoured",
+      ns["resolve_min_drag_px"](with_config("min_drag_px = 4\n")), 4)
+
+check("zero disables the nudge's shortfall entirely",
+      ns["resolve_min_drag_px"](with_config("min_drag_px = 0\n")), 0)
+
+check("a junk value falls back",
+      ns["resolve_min_drag_px"](with_config("min_drag_px = far\n")), 6)
+
+check("an oversized value is clamped",
+      ns["resolve_min_drag_px"](with_config("min_drag_px = 9000\n")), 200)
 
 # --- which gesture the right button performs -------------------------------------
 check("defaults to true: hold the button to pan",

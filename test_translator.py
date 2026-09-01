@@ -480,18 +480,53 @@ results.append(clean)
 
 
 # Press then release with the pointer never moving: a nudge must be emitted first.
+# With zero real motion, the shortfall is the whole MIN_DRAG_PX, plus the +1 margin
+# _nudge_for_drag always adds for the X-only-vs-diagonal mismatch.
 tr, log = ctrl_setup()
 tr._press_pan()
 log.clear()
 tr._release_right_button()
 nudged = ([x[0] for x in log] == ['REL', 'SYN', 'KEY', 'SYN']
-          and log[0][1] == 'X' and abs(log[0][2]) == ns['MIN_DRAG_PX']
+          and log[0][1] == 'X' and abs(log[0][2]) == ns['MIN_DRAG_PX'] + 1
           and log[2] == ('KEY','RIGHT',0)
           and tr.drag_nudges == 1)
 print(f"{'PASS' if nudged else 'FAIL'}  a motionless release is nudged into a drag first")
 if not nudged:
     print(f"      log={log}, nudges={tr.drag_nudges}")
 results.append(nudged)
+
+# A stroke that was almost far enough only needs a small top-up, not the flat
+# MIN_DRAG_PX on top — a big unconditional add-on is exactly the kind of stray jump
+# that ruins a small, deliberate rotate landing on an angle.
+tr, log = ctrl_setup()
+tr._press_pan()
+ns['POINTER']._pos = (CENTRE[0] + ns['MIN_DRAG_PX'] - 2, CENTRE[1])   # 2px short
+log.clear()
+tr._release_right_button()
+rel_events = [x for x in log if x[0] == 'REL']
+topped_up = (rel_events and rel_events[0][2] == 3   # shortfall 2px + the 1px margin
+             and tr.drag_nudges == 1)
+print(f"{'PASS' if topped_up else 'FAIL'}  a near-miss release only tops up the shortfall")
+if not topped_up:
+    print(f"      log={log}, nudges={tr.drag_nudges}")
+results.append(topped_up)
+
+# The nudge must continue in the direction the drag was already heading, not always
+# to the right — a rotate to the left must not get finished off with a nudge to the
+# right, which reads as a stray flick the other way rather than more of the same
+# rotate.
+tr, log = ctrl_setup()
+tr._press_pan()
+ns['POINTER']._pos = (CENTRE[0] - (ns['MIN_DRAG_PX'] - 2), CENTRE[1])   # moved left, 2px short
+log.clear()
+tr._release_right_button()
+rel_events = [x for x in log if x[0] == 'REL']
+follows_direction = (rel_events and rel_events[0][2] == -3
+                      and tr.drag_nudges == 1)
+print(f"{'PASS' if follows_direction else 'FAIL'}  the nudge continues in the drag's own direction")
+if not follows_direction:
+    print(f"      log={log}, nudges={tr.drag_nudges}")
+results.append(follows_direction)
 
 # Already dragged far enough: no extra nudge, so no stray pan.
 tr, log = ctrl_setup()
@@ -1198,7 +1233,127 @@ if not handed_off_to_pan:
           f"right_emitted={tr._right_emitted}, ctrl_down={tr._ctrl_down}")
 results.append(handed_off_to_pan)
 
+# The button-held gesture (pan, under this mapping) must resume once the physical
+# button never let go — a right-mouse yield mid-pan used to require an actual
+# release/press to recover from, because nothing re-pressed the synthetic button
+# while _right_down stayed true throughout.
+log = []
+ui, modifier = StubUI(log), StubUI(log)
+tr = Translator(ui, modifier)
+for e in button(ecodes.BTN_RIGHT, 1) + motion(5):
+    tr.handle(e)
+tr.yield_stroke()                            # the other mouse stirs mid-pan
+tr._yield_until = time.monotonic() - 0.001   # cooldown already elapsed
+log.clear()
+for e in motion(4):
+    tr.handle(e)
+keys = [x for x in log if x[0] == 'KEY']
+resumed_on_button = (keys == [('KEY','CTRL',1), ('KEY','RIGHT',1)]
+                      and tr._right_emitted and tr._ctrl_down)
+print(f"{'PASS' if resumed_on_button else 'FAIL'}  "
+      "a button-held pan resumes after a yield without a real release/press")
+if not resumed_on_button:
+    print(f"      keys={keys}, right_emitted={tr._right_emitted}, ctrl_down={tr._ctrl_down}")
+results.append(resumed_on_button)
+
+# Straight after the yield, before the cooldown lapses, motion must not resume it —
+# the same protection the bare-motion gesture already gets against fighting a
+# wheel-zoom burst on the other mouse.
+log2 = []
+ui2, modifier2 = StubUI(log2), StubUI(log2)
+tr2 = Translator(ui2, modifier2)
+for e in button(ecodes.BTN_RIGHT, 1) + motion(5):
+    tr2.handle(e)
+tr2.yield_stroke()
+log2.clear()
+for e in motion(4):
+    tr2.handle(e)
+keys2 = [x for x in log2 if x[0] == 'KEY']
+held_off_on_button = keys2 == [] and not tr2._right_emitted
+print(f"{'PASS' if held_off_on_button else 'FAIL'}  "
+      "cooldown also holds a button-held pan off right after a yield")
+if not held_off_on_button:
+    print(f"      keys={keys2}, right_emitted={tr2._right_emitted}")
+results.append(held_off_on_button)
+
 ns['PAN_REQUIRES_RIGHT_BUTTON'] = False    # restore the default this file exercises
+
+# --- rotate scale ------------------------------------------------------------------
+# Rotate is plain motion with no scaling of its own, so ROTATE_SCALE is what tones it
+# down. Pan must never be touched by it — panning already has its own dedicated feel.
+
+def rs_setup():
+    log = []
+    ui, mod = StubUI(log), StubUI(log)
+    tr = Translator(ui, mod)
+    ns['GATE'] = StubGate(WINDOW, WINDOW)
+    ns['POINTER'] = StubPointer(CENTRE)
+    return tr, log
+
+def rel_x(log):
+    return [x for x in log if x[0] == 'REL' and x[1] == 'X']
+
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = True     # bare motion rotates
+ns['ROTATE_SCALE'] = 0.5
+
+tr, log = rs_setup()
+tr.handle(ev(ecodes.EV_REL, ecodes.REL_X, 10))
+halved = rel_x(log) == [('REL','X',5)]
+print(f"{'PASS' if halved else 'FAIL'}  rotate motion is scaled down by ROTATE_SCALE")
+if not halved:
+    print(f"      log={log}")
+results.append(halved)
+
+# The fractional remainder carries across samples, so a slow rotate at a low scale
+# still moves eventually instead of every sample individually truncating to zero.
+ns['ROTATE_SCALE'] = 0.3
+tr, log = rs_setup()
+for _ in range(10):
+    tr.handle(ev(ecodes.EV_REL, ecodes.REL_X, 1))
+total_sent = sum(x[2] for x in rel_x(log))
+# The running remainder is always under 1px in magnitude, by construction — except
+# floating-point slop can push a sample that should just cross a whole pixel to just
+# miss it instead, so the tolerance allows exactly that much.
+carried = total_sent != 0 and abs(total_sent - 10 * ns['ROTATE_SCALE']) <= 1.0
+print(f"{'PASS' if carried else 'FAIL'}  a sub-1px-per-sample rotate still accumulates instead of vanishing")
+if not carried:
+    print(f"      sent={total_sent}, log={log}")
+results.append(carried)
+
+# 1.0 is raw, unscaled motion — how this behaved before the setting existed.
+ns['ROTATE_SCALE'] = 1.0
+tr, log = rs_setup()
+tr.handle(ev(ecodes.EV_REL, ecodes.REL_X, 7))
+raw_at_one = rel_x(log) == [('REL','X',7)]
+print(f"{'PASS' if raw_at_one else 'FAIL'}  rotate_scale = 1.0 leaves motion untouched")
+if not raw_at_one:
+    print(f"      log={log}")
+results.append(raw_at_one)
+
+# Pan (bare motion, with the original mapping) must be unaffected by ROTATE_SCALE.
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = False    # bare motion pans
+ns['ROTATE_SCALE'] = 0.2
+tr, log = rs_setup()
+tr.handle(ev(ecodes.EV_REL, ecodes.REL_X, 10))
+pan_unaffected = rel_x(log) == [('REL','X',10)]
+print(f"{'PASS' if pan_unaffected else 'FAIL'}  pan motion ignores ROTATE_SCALE")
+if not pan_unaffected:
+    print(f"      log={log}")
+results.append(pan_unaffected)
+
+# The button-held rotate (the original mapping's rotate) is scaled too.
+tr, log = rs_setup()
+tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1))
+log.clear()
+tr.handle(ev(ecodes.EV_REL, ecodes.REL_X, 10))
+button_rotate_scaled = rel_x(log) == [('REL','X',2)]
+print(f"{'PASS' if button_rotate_scaled else 'FAIL'}  a button-held rotate is scaled too")
+if not button_rotate_scaled:
+    print(f"      log={log}")
+results.append(button_rotate_scaled)
+
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = False    # restore the default this file exercises
+ns['ROTATE_SCALE'] = 1.0                   # neutral, so an unrelated future case isn't surprised
 
 print()
 print(f"{sum(results)}/{len(results)} passed")
