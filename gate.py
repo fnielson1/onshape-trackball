@@ -208,6 +208,11 @@ PAN_DEADZONE = 10
 # regardless of this value, since pressing a button is unambiguous. Like
 # pan_deadzone_px, an idle other mouse forgets what it has accumulated rather than
 # banking a stale nudge toward a later one.
+#
+# Does not apply while bare motion is driving rotate (the default mapping) — see
+# yield_stroke's bare_motion_is_rotate. Under that mapping bare motion drives
+# rotate, which gets no dead zone on the way in (see
+# _start_pan's own is_pan check) and, symmetrically, none on the way out either.
 PAN_YIELD_DEADZONE = 10
 
 # A press and release with nothing in between is a click, and Chrome opens a context
@@ -888,7 +893,9 @@ class Translator:
         Plain motion is subject to its own dead zone, pan_yield_deadzone_px, measured
         the same way as the gated mouse's: net displacement since the stroke started
         yielding to it. A button press or a wheel turn is `immediate` and skips it —
-        there is no such thing as an accidental click or an accidental scroll.
+        there is no such thing as an accidental click or an accidental scroll. So
+        does motion while bare motion is driving rotate rather than pan — see
+        bare_motion_is_rotate below.
         """
         with self._lock:
             if not (self._panning or self._right_emitted or self._ctrl_down):
@@ -896,7 +903,23 @@ class Translator:
                 self._other_travel_y = 0.0
                 return
 
-            if not immediate and PAN_YIELD_DEADZONE > 0:
+            # Symmetric with _start_pan's own is_pan check: whichever gesture bare
+            # motion is currently driving gets the same dead-zone treatment leaving
+            # that it gets entering. Under the default mapping bare motion drives
+            # rotate, which _start_pan gives no dead zone at all — so nothing here
+            # should make it wait to leave either. That symmetry also sidesteps a
+            # trap an idle-time check falls into: a trackball's ball keeps rolling a
+            # little after the hand lifts, so _last_motion keeps getting refreshed on
+            # its own and "the gated device has gone quiet" is not something the
+            # other mouse can wait around for.
+            #
+            # Everything else — bare-motion pan (the non-default mapping), and any
+            # gesture already handed off to the physical button, which drops
+            # _panning to False regardless of mapping — keeps the dead zone. A
+            # button-held gesture especially: a pause mid-hold is normal, so it
+            # still needs protecting from a bump.
+            bare_motion_is_rotate = self._panning and PAN_REQUIRES_RIGHT_BUTTON
+            if not immediate and not bare_motion_is_rotate and PAN_YIELD_DEADZONE > 0:
                 now = time.monotonic()
                 if now - self._other_travel_at > PAN_IDLE_RELEASE:
                     self._other_travel_x = 0.0

@@ -1147,6 +1147,36 @@ if not stale_expired:
     print(f"      panning={tr._panning}, yields={tr.yields}, travel=({tr._other_travel_x},{tr._other_travel_y})")
 results.append(stale_expired)
 
+# Symmetric with _start_pan: when bare motion drives rotate (the default mapping)
+# rather than pan, it gets no dead zone on the way out either — the other mouse's
+# very first move ends it, however small, and however recently the gated mouse
+# itself was moving. A trackball's ball can keep rolling a little after the hand
+# lifts, so nothing here may depend on the gated mouse having gone idle first.
+saved_prb = ns['PAN_REQUIRES_RIGHT_BUTTON']
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = True
+tr, log = yz_setup()
+tr.yield_stroke(dx=1)                    # far under 10px
+ns['PAN_REQUIRES_RIGHT_BUTTON'] = saved_prb
+rotate_has_no_yield_deadzone = not tr._panning and released(log) and tr.yields == 1
+print(f"{'PASS' if rotate_has_no_yield_deadzone else 'FAIL'}  bare-motion rotate has no yield dead zone, even fresh")
+if not rotate_has_no_yield_deadzone:
+    print(f"      panning={tr._panning}, yields={tr.yields}, log={log}")
+results.append(rotate_has_no_yield_deadzone)
+
+# But a button-held gesture keeps the dead zone regardless: a pause mid-hold is
+# normal, so it still needs protecting from a bump.
+tr, log = ctrl_setup()
+for e in motion(5):
+    tr.handle(e)
+tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1))    # hand off to the button
+log.clear()
+tr.yield_stroke(dx=1)                    # far under 10px, button-held gesture stays
+handoff_still_protected = tr._right_emitted and tr.yields == 0
+print(f"{'PASS' if handoff_still_protected else 'FAIL'}  a button-held gesture keeps its dead zone")
+if not handoff_still_protected:
+    print(f"      right_emitted={tr._right_emitted}, yields={tr.yields}, log={log}")
+results.append(handoff_still_protected)
+
 # Zero disables it entirely: the first movement yields.
 ns['PAN_YIELD_DEADZONE'] = 0
 tr, log = yz_setup()
