@@ -213,7 +213,10 @@ PAN_DEADZONE = 10
 # yield_stroke's bare_motion_is_rotate. Under that mapping bare motion drives
 # rotate, which gets no dead zone on the way in (see
 # _start_pan's own is_pan check) and, symmetrically, none on the way out either.
-PAN_YIELD_DEADZONE = 10
+#
+# Matches setup_helper.py's/setup.sh's own DEFAULT_YIELD_DEADZONE_PX: a fresh
+# install and a daemon started with no config file at all should agree.
+PAN_YIELD_DEADZONE = 20
 
 # A press and release with nothing in between is a click, and Chrome opens a context
 # menu on one. That part is now covered for free: _release_right_button tags rotate's
