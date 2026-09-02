@@ -89,8 +89,8 @@ check("an oversized dead zone is clamped",
       ns["resolve_deadzone"](with_config("pan_deadzone_px = 9000\n")), 500)
 
 # --- other-mouse yield dead zone -------------------------------------------------
-check("yield dead zone defaults to 20px",
-      ns["resolve_yield_deadzone"](with_config(None)), 20)
+check("yield dead zone defaults to 10px",
+      ns["resolve_yield_deadzone"](with_config(None)), 10)
 
 check("a custom yield dead zone is honoured",
       ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = 8\n")), 8)
@@ -99,7 +99,7 @@ check("zero disables the yield dead zone",
       ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = 0\n")), 0)
 
 check("a junk yield dead zone falls back",
-      ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = far\n")), 20)
+      ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = far\n")), 10)
 
 check("an oversized yield dead zone is clamped",
       ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = 9000\n")), 500)
@@ -124,8 +124,8 @@ check("above the ceiling is clamped down",
       ns["resolve_rotate_scale"](with_config("rotate_scale = 50\n")), 5.0)
 
 # --- minimum drag before a release is nudged -------------------------------------
-check("min drag defaults to 6px",
-      ns["resolve_min_drag_px"](with_config(None)), 6)
+check("min drag defaults to 10px (Onshape's own click-vs-drag check still needs real distance)",
+      ns["resolve_min_drag_px"](with_config(None)), 10)
 
 check("a custom value is honoured",
       ns["resolve_min_drag_px"](with_config("min_drag_px = 4\n")), 4)
@@ -134,7 +134,7 @@ check("zero disables the nudge's shortfall entirely",
       ns["resolve_min_drag_px"](with_config("min_drag_px = 0\n")), 0)
 
 check("a junk value falls back",
-      ns["resolve_min_drag_px"](with_config("min_drag_px = far\n")), 6)
+      ns["resolve_min_drag_px"](with_config("min_drag_px = far\n")), 10)
 
 check("an oversized value is clamped",
       ns["resolve_min_drag_px"](with_config("min_drag_px = 9000\n")), 200)

@@ -191,8 +191,11 @@ PAN_YIELD = True
 # displacement, not distance travelled, so jitter that wanders out and back never
 # trips it — only a deliberate push in some direction does.
 #
-# Applies to panning alone. Rotating, zooming and the left button are unaffected: the
-# cursor keeps tracking your hand throughout, it simply is not panning yet.
+# Applies only when bare motion is driving pan (PAN_REQUIRES_RIGHT_BUTTON = false) —
+# never rotate, zoom or the left button. Rotate gets no dead zone of its own: the
+# cursor keeps tracking your hand throughout regardless, and unlike pan it has no
+# button press to bracket it with, so anything this ate would come straight out of a
+# small deliberate rotate's own drag distance, with nothing to show for it.
 #
 # Overridden by pan_deadzone_px in the config file; this is the fallback.
 PAN_DEADZONE = 10
@@ -207,12 +210,39 @@ PAN_DEADZONE = 10
 # banking a stale nudge toward a later one.
 PAN_YIELD_DEADZONE = 10
 
-# A press and release with nothing in between is a click, and Ctrl + right-click
-# opens Chrome's context menu. Every release we emit is preceded by at least this
-# much displacement, so the gesture always reads as a drag.
+# A press and release with nothing in between is a click, and Chrome opens a context
+# menu on one. That part is now covered for free: _release_right_button tags rotate's
+# release with Ctrl, which extension/content.js checks first and unconditionally,
+# ahead of distance — no motion needed.
+#
+# What still needs real, on-screen distance is Onshape itself. Confirmed by tracing a
+# live repro: Onshape opens its own canvas menu straight out of its own mouseup
+# handling — no `contextmenu` event involved, Ctrl included or not — purely on how the
+# cursor moved between press and release. A gesture that survived the dead zone can
+# still land here, because ROTATE_SCALE halves (by default) whatever distance reaches
+# the screen, deliberately, to keep rotation from feeling hypersensitive.
+#
+# The exact threshold could not be pinned precisely — driving Onshape's canvas
+# directly to bracket it hit a real confound: every accepted "drag" also rotates the
+# camera, and after enough trials the cursor drifts off the part onto empty
+# background, where the click/drag boundary behaves differently, so later readings in
+# the same session cannot be trusted against earlier ones. What held up: real hardware
+# never failed above 6.7px in the daemon's own release logs, and a real right-click
+# with only 3.0px of travel did open Onshape's menu. This sits with margin above that
+# window. Every pixel here is still a pixel Onshape rotates by, so it is not free,
+# just far cheaper than the fix that came before it.
 #
 # Overridden by min_drag_px in the config file; this is the fallback.
-MIN_DRAG_PX = 1
+MIN_DRAG_PX = 8
+
+# The nudge above is split across this many samples rather than written as one lump
+# sum, NUDGE_STEP_INTERVAL apart, so it looks like the tail of a real stroke rather
+# than a teleport — real hardware never reports a lump sum for real motion, a rolling
+# trackball sends dozens of small samples for any genuine movement. Live testing could
+# not fully separate this from the camera-drift confound above, so treat it as a
+# reasonable-and-harmless precaution rather than a proven necessity.
+NUDGE_STEPS = 3
+NUDGE_STEP_INTERVAL = 0.008
 
 # How often the cached window rect is re-read, to survive a move or resize that
 # happens without any focus change.
@@ -383,7 +413,19 @@ class Translator:
         if now < self._yield_until:
             return          # another mouse is mid-gesture; stay out of its way
 
-        if PAN_DEADZONE > 0 and self._within_deadzone():
+        # Only the free gesture actually needs protecting from an accidental bump — a
+        # pan that fires because a hand rested on the trackball is disruptive in a way
+        # a stray twitch of rotate is not, and unlike pan, rotate has no press of its
+        # own to bracket it with, so the dead zone was ever only standing in for one.
+        # But every pixel it eats here is a pixel that never reaches Onshape: the
+        # button does not go down until the dead zone clears, so a small deliberate
+        # rotate that stops right after can leave almost nothing for Onshape's own
+        # click-vs-drag check to see, and it reads the release as a click regardless
+        # of what the browser's own contextmenu event does — see the Ctrl tag in
+        # _release_right_button, which cannot reach that decision at all. So this only
+        # ever applies when bare motion is driving pan; rotate is exempt entirely.
+        is_pan = not PAN_REQUIRES_RIGHT_BUTTON
+        if is_pan and PAN_DEADZONE > 0 and self._within_deadzone():
             return          # not a deliberate push yet
 
         # A pan presses the right button somewhere on screen, so it must not start
@@ -519,14 +561,49 @@ class Translator:
             elif direction < 0 and position[0] - nudge_px < win_x + 8:
                 direction = 1
 
-        self._ui.write(ecodes.EV_REL, ecodes.REL_X, direction * nudge_px)
-        self._ui.syn()
+        # Split rather than written as one lump sum, so it looks like the tail of a
+        # real stroke rather than a teleport — see NUDGE_STEPS.
+        steps = min(NUDGE_STEPS, max(1, nudge_px))
+        base = nudge_px // steps
+        remainder = nudge_px - base * steps
+        for i in range(steps):
+            step_px = base + (1 if i < remainder else 0)
+            if step_px == 0:
+                continue
+            self._ui.write(ecodes.EV_REL, ecodes.REL_X, direction * step_px)
+            self._ui.syn()
+            if i < steps - 1:
+                time.sleep(NUDGE_STEP_INTERVAL)
         self.drag_nudges += 1
         return measured, True
 
     def _release_right_button(self):
         """Every right-button release goes through here, so none of them can ever
         land as a bare click.
+
+        Pan's release already carries Ctrl for free — it has been down throughout —
+        and extension/content.js checks exactly that, unconditionally and ahead of
+        anything it infers from distance: `event.ctrlKey` is the *first* thing
+        suppressionReason() looks at. Rotate never holds Ctrl during the drag — that
+        is what makes it rotate rather than pan — so its release had nothing to give
+        the page the same certainty, and fell back to the nudge below as the only
+        signal available. That fallback works, but every pixel it adds is a pixel
+        Onshape rotates by, which reads as a stray flick right when a small,
+        deliberate rotate is trying to land on an angle.
+
+        So rotate's release borrows pan's own trick instead: Ctrl goes down just for
+        the instant the button lifts, then comes back up. No motion is sent while it
+        is up, so this changes nothing about the drag Onshape already saw — only
+        what the release itself looks like to the page, which is now indistinguishable
+        from pan's — for the browser's own menu.
+
+        Onshape's own canvas menu is a separate problem this cannot touch: it opens
+        straight out of Onshape's own mouseup handling, no `contextmenu` event
+        involved, and does not care about Ctrl either way — only how far the cursor
+        actually moved on screen between press and release, which ROTATE_SCALE has
+        usually shrunk well below what a real hand movement would suggest. The nudge
+        below is what still has to cover that: real, if modest, on-screen distance,
+        because that is the only thing Onshape's own check reads.
 
         The syn is essential, not tidiness: the modifier lives on a second device
         with its own stream, and an unflushed button release would arrive *after*
@@ -535,6 +612,12 @@ class Translator:
         """
         if not self._right_emitted:
             return
+
+        tag_ctrl = not self._ctrl_down
+        if tag_ctrl:
+            self._ctrl(1)
+            time.sleep(MODIFIER_SETTLE)
+
         measured, nudged = self._nudge_for_drag()
 
         # Kept so a context-menu report arriving from the page can be lined up against
@@ -552,6 +635,10 @@ class Translator:
         self._ui.write(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0)
         self._ui.syn()
         self._right_emitted = False
+
+        if tag_ctrl:
+            time.sleep(MODIFIER_SETTLE)
+            self._ctrl(0)
 
     def _emit_pan_up(self, keep_modifier=False):
         """keep_modifier is for the recentre, which lifts and re-presses the button

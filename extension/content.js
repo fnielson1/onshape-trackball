@@ -98,9 +98,12 @@ const MAX_POINTER_HITS = 32;
 // diagnosis alone; reports carry `suppressed` either way, so nothing goes dark.
 const SUPPRESS_CONTEXT_MENU = true;
 
-// What separates a gesture from a click. The daemon guarantees at least MIN_DRAG_PX
-// (12) of travel before releasing, and a hand opening a menu moves a pixel or two at
-// most, so anything past this came from a drag rather than a click.
+// What separates a gesture from a click, for a release with no Ctrl on it. Ctrl is
+// the primary signal now — see suppressionReason() below — because the daemon tags
+// every one of its own releases with it, rotate included, rather than manufacturing
+// travel for us to measure. This stays as the fallback for a release that arrives
+// with neither: a hand opening a menu moves a pixel or two at most, so anything past
+// this came from a drag rather than a click.
 const SUPPRESS_DRAG_PX = 5;
 
 let offset = null;

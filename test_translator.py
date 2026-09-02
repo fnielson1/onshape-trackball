@@ -136,10 +136,13 @@ results.append(run("right button drops Ctrl and rotates on the same drag",
     motion(5) + button(ecodes.BTN_RIGHT, 1) + motion(9),
     [('KEY','CTRL',1), ('KEY','RIGHT',1), ('KEY','CTRL',0)]))
 
-# 4. Releasing it ends the gesture; the next movement starts a fresh pan.
+# 4. Releasing it ends the gesture — tagged with Ctrl around the lift, since this was
+# a rotate (the button-held gesture here, no Ctrl of its own) — and the next movement
+# starts a fresh pan.
 results.append(run("pan resumes after the right button is released",
     button(ecodes.BTN_RIGHT, 1) + motion(3) + button(ecodes.BTN_RIGHT, 0) + motion(4),
-    [('KEY','RIGHT',1), ('KEY','RIGHT',0), ('KEY','CTRL',1), ('KEY','RIGHT',1)]))
+    [('KEY','RIGHT',1), ('KEY','CTRL',1), ('KEY','RIGHT',0), ('KEY','CTRL',0),
+     ('KEY','CTRL',1), ('KEY','RIGHT',1)]))
 
 # 5. The gate closing mid-stroke must strand neither the button nor the modifier.
 results.append(run("gate close releases the button and Ctrl",
@@ -147,10 +150,11 @@ results.append(run("gate close releases the button and Ctrl",
     [('KEY','CTRL',1), ('KEY','RIGHT',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)],
     post=lambda tr: tr.release_all()))
 
-# 6. Including a button the user is physically holding.
+# 6. Including a button the user is physically holding — a rotate, here, so its
+# release is tagged with Ctrl the same as any other.
 results.append(run("gate close releases a real held button",
     button(ecodes.BTN_RIGHT, 1),
-    [('KEY','RIGHT',1), ('KEY','RIGHT',0)],
+    [('KEY','RIGHT',1), ('KEY','CTRL',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)],
     post=lambda tr: tr.release_all()))
 
 # 7. Wheel is zoom: straight through, and it starts no gesture.
@@ -438,11 +442,14 @@ if not handover:
     print(f"      panning={tr._panning}, right_emitted={tr._right_emitted}, log={log}")
 results.append(handover)
 
-# Releasing it ends the gesture exactly once.
+# Releasing it ends the gesture exactly once. Ctrl was dropped for the hand-off
+# above, so this release tags it back on around the button lift — the same signal
+# pan's own release already gets for free — rather than manufacturing motion.
 log.clear()
 tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0))
-released = ([x for x in log if x[0] == 'KEY'] == [('KEY','RIGHT',0)]
-            and not tr._right_emitted)
+released = ([x for x in log if x[0] == 'KEY']
+            == [('KEY','CTRL',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)]
+            and not tr._right_emitted and not tr._ctrl_down)
 print(f"{'PASS' if released else 'FAIL'}  ctrl_right: releasing right ends the gesture once")
 if not released:
     print(f"      right_emitted={tr._right_emitted}, log={log}")
@@ -476,19 +483,30 @@ if not clean:
 results.append(clean)
 
 # --- every release must be a drag, never a bare click ---------------------------
-# Ctrl + right-click with no movement opens Chrome's context menu mid-pan.
-
+# Ctrl + right-click with no movement opens Chrome's context menu mid-pan. The nudge
+# below is now a fallback (the Ctrl tag in _release_right_button is what actually
+# covers this day to day — see the ctrl_right cases above), but it still needs to
+# work correctly for whoever ends up relying on it, so these exercise it directly
+# with a nonzero min_drag_px; the production default is 0, which turns it off.
+saved_min_drag = ns['MIN_DRAG_PX']
+ns['MIN_DRAG_PX'] = 12
 
 # Press then release with the pointer never moving: a nudge must be emitted first.
 # With zero real motion, the shortfall is the whole MIN_DRAG_PX, plus the +1 margin
-# _nudge_for_drag always adds for the X-only-vs-diagonal mismatch.
+# _nudge_for_drag always adds for the X-only-vs-diagonal mismatch. Split across
+# NUDGE_STEPS separate REL/SYN pairs rather than one lump write — a single jump reads
+# as a click to Onshape's own orbit control regardless of size, confirmed by driving
+# its canvas directly, where real hardware never sends a lump sum for real motion.
 tr, log = ctrl_setup()
 tr._press_pan()
 log.clear()
 tr._release_right_button()
-nudged = ([x[0] for x in log] == ['REL', 'SYN', 'KEY', 'SYN']
-          and log[0][1] == 'X' and abs(log[0][2]) == ns['MIN_DRAG_PX'] + 1
-          and log[2] == ('KEY','RIGHT',0)
+rel_events = [x for x in log if x[0] == 'REL']
+nudged = (len(rel_events) == ns['NUDGE_STEPS']
+          and all(x[1] == 'X' for x in rel_events)
+          and sum(x[2] for x in rel_events) == ns['MIN_DRAG_PX'] + 1
+          and log[-2] == ('KEY','RIGHT',0)
+          and log.index(rel_events[-1]) < log.index(('KEY','RIGHT',0))
           and tr.drag_nudges == 1)
 print(f"{'PASS' if nudged else 'FAIL'}  a motionless release is nudged into a drag first")
 if not nudged:
@@ -504,7 +522,7 @@ ns['POINTER']._pos = (CENTRE[0] + ns['MIN_DRAG_PX'] - 2, CENTRE[1])   # 2px shor
 log.clear()
 tr._release_right_button()
 rel_events = [x for x in log if x[0] == 'REL']
-topped_up = (rel_events and rel_events[0][2] == 3   # shortfall 2px + the 1px margin
+topped_up = (rel_events and sum(x[2] for x in rel_events) == 3   # shortfall 2px + the 1px margin
              and tr.drag_nudges == 1)
 print(f"{'PASS' if topped_up else 'FAIL'}  a near-miss release only tops up the shortfall")
 if not topped_up:
@@ -521,7 +539,8 @@ ns['POINTER']._pos = (CENTRE[0] - (ns['MIN_DRAG_PX'] - 2), CENTRE[1])   # moved 
 log.clear()
 tr._release_right_button()
 rel_events = [x for x in log if x[0] == 'REL']
-follows_direction = (rel_events and rel_events[0][2] == -3
+follows_direction = (rel_events and all(x[2] < 0 for x in rel_events)
+                      and sum(x[2] for x in rel_events) == -3
                       and tr.drag_nudges == 1)
 print(f"{'PASS' if follows_direction else 'FAIL'}  the nudge continues in the drag's own direction")
 if not follows_direction:
@@ -706,6 +725,8 @@ except Exception as exc:
 print(f"{'PASS' if survived else 'FAIL'}  malformed context-menu reports are ignored, not fatal")
 results.append(survived)
 
+ns['MIN_DRAG_PX'] = saved_min_drag
+
 # The point of all this: a cursor comfortably inside the window but at the canvas
 # edge must still be recentred, into the canvas rather than the window.
 ui = StubUI(); tr = Translator(ui)
@@ -814,7 +835,9 @@ if not button_pan_recentres:
 results.append(button_pan_recentres)
 
 # Same for a button-held rotate (the original mapping): the button still cycles, and
-# Ctrl is never involved — it was never raised for this gesture to begin with.
+# the lift is tagged with Ctrl for its own instant, same as any other rotate release —
+# it lands back down before the button re-presses, so the drag Onshape sees is
+# unaffected, and Ctrl is not held once the recentre finishes.
 ns['PAN_REQUIRES_RIGHT_BUTTON'] = False
 tr, log = ctrl_setup()
 for e in button(ecodes.BTN_RIGHT, 1) + motion(5):
@@ -826,9 +849,10 @@ tr._recenter_if_near_edge()
 btn = [x for x in log if x[0] == 'KEY' and x[1] == 'RIGHT']
 ctrl_events = [x for x in log if x[0] == 'KEY' and x[1] == 'CTRL']
 button_rotate_recentres = (btn == [('KEY','RIGHT',0), ('KEY','RIGHT',1)]
-                            and not tr._ctrl_down and ctrl_events == [])
+                            and not tr._ctrl_down
+                            and ctrl_events == [('KEY','CTRL',1), ('KEY','CTRL',0)])
 print(f"{'PASS' if button_rotate_recentres else 'FAIL'}  "
-      f"a button-held rotate also recentres, Ctrl never involved")
+      f"a button-held rotate also recentres, tagging the lift with Ctrl and dropping it")
 if not button_rotate_recentres:
     print(f"      button events={btn}, ctrl_down={tr._ctrl_down}, ctrl events={ctrl_events}")
 results.append(button_rotate_recentres)
@@ -1188,9 +1212,12 @@ results.append(let_go)
 # --- pan_requires_right_button: swapping which gesture the button performs -------
 # Everything above ran with the original mapping (bare motion pans, the button
 # rotates). This flips it: the button should now bracket pan, and bare motion should
-# rotate — with no Ctrl anywhere in the rotate cases. The underlying machinery (dead
-# zone, idle release, recentring, hand-off) is exactly what the cases above already
-# covered, so these only check which gesture gets Ctrl.
+# rotate — with no Ctrl anywhere in the rotate cases. Idle release, recentring and
+# hand-off are exactly what the cases above already covered, so most of these only
+# check which gesture gets Ctrl. The dead zone is the one thing that does NOT carry
+# over unchanged — it applies only to whichever gesture bare motion drives when that
+# is pan, so flipping the mapping flips whether it applies at all, and that gets its
+# own dedicated case below.
 
 ns['PAN_REQUIRES_RIGHT_BUTTON'] = True
 ns['PAN_DEADZONE'] = 0
@@ -1201,6 +1228,16 @@ results.append(run("bare motion rotates instead of panning",
     motion(5) + motion(7),
     [('KEY','RIGHT',1)]))
 
+# Rotate gets no dead zone at all under this mapping — see the PAN_DEADZONE comment.
+# A single, tiny sample must press the button immediately, not wait for 10px to
+# accumulate; otherwise a small deliberate rotate loses exactly the distance Onshape's
+# own click-vs-drag check needs to see it as a drag rather than a click.
+ns['PAN_DEADZONE'] = 10
+results.append(run("rotate ignores the dead zone entirely",
+    motion(1),
+    [('KEY','RIGHT',1)]))
+ns['PAN_DEADZONE'] = 0
+
 results.append(run("holding the right button pans instead of rotating",
     button(ecodes.BTN_RIGHT, 1) + motion(9),
     [('KEY','CTRL',1), ('KEY','RIGHT',1)]))
@@ -1210,10 +1247,13 @@ results.append(run("releasing the button after a button-held pan drops Ctrl, "
     button(ecodes.BTN_RIGHT, 1) + motion(5) + button(ecodes.BTN_RIGHT, 0),
     [('KEY','CTRL',1), ('KEY','RIGHT',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)]))
 
-# Idle release still ends a bare-motion rotate — no Ctrl was ever raised for it.
-results.append(run("idle release ends a bare-motion rotate, no Ctrl involved",
+# Idle release still ends a bare-motion rotate. No Ctrl was ever raised for the drag
+# itself, but the release tags the button-up with one — pan's own release gets this
+# for free, and this is how rotate's gets the same signal without manufacturing any
+# motion for the page to measure.
+results.append(run("idle release ends a bare-motion rotate, tagging the release with Ctrl",
     motion(5),
-    [('KEY','RIGHT',1), ('KEY','RIGHT',0)],
+    [('KEY','RIGHT',1), ('KEY','CTRL',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)],
     post=idle_then_tick))
 
 # The hand-off now runs the other way: a rotate already under way (bare motion, no
