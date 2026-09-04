@@ -212,7 +212,6 @@ class Context:
                 "output, if any, for why.")
         self._ctx = ctypes.c_void_p(handle)
         self._predicate = None
-        self._monitor_predicate = None
 
     # --- lifecycle ----------------------------------------------------------------
 
@@ -302,24 +301,6 @@ class Context:
         self._predicate = PREDICATE(predicate)
         self._lib.interceptor_set_filter(self._ctx, self._predicate,
                                           FILTER_MOUSE_NONE)
-
-    def set_monitor(self, devices, filter_bits=FILTER_MOUSE_ALL):
-        """Passively observe several devices' strokes without withholding them.
-
-        The monitor counterpart of filter_devices(): a stroke matching this still
-        reaches the rest of the system untouched, a copy is only *also* delivered
-        here. Use this instead of a second RegisterRawInputDevices call of your
-        own for devices this context isn't filtering — Windows allows only one
-        raw-input registration per device class per process, and interceptor.dll
-        already holds the one for keyboards and mice.
-        """
-        wanted = set(devices)
-
-        def predicate(candidate):
-            return 1 if candidate in wanted else 0
-
-        self._monitor_predicate = PREDICATE(predicate)
-        self._lib.interceptor_set_monitor(self._ctx, self._monitor_predicate, filter_bits)
 
     # --- i/o -----------------------------------------------------------------------
 

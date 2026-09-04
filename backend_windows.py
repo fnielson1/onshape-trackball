@@ -1,31 +1,16 @@
-"""Windows backend: Interception for capture, Win32 for the cursor and focus.
+"""Windows backend: Interception for exclusive capture, Win32 for focus.
 
 The shapes here mirror `backend_linux` one for one, so `gate.py` cannot tell them
 apart:
 
     exclusive grab   EVIOCGRAB          -> interceptor_set_filter on one device
-    synthetic mouse  uinput clone       -> interceptor_send on the same device
-    synthetic keys   second uinput dev  -> SendInput with scancodes
-    cursor           XQueryPointer      -> GetCursorPos / SetCursorPos
     focus            xprop -root -spy   -> SetWinEventHook(EVENT_SYSTEM_FOREGROUND)
-    other mice       read-only evdev    -> interceptor_set_monitor on the rest
 
-Two of those deserve a note.
-
-Keys go through SendInput rather than an interceptor.dll keyboard device: the
-modifier must work even when no keyboard is enumerated, and SendInput always is.
-It does mean the button and the modifier travel on separate streams, exactly as
-they do on Linux across two uinput devices — which is what MODIFIER_SETTLE already
-exists to absorb.
-
-Other mice are watched with interceptor_set_monitor, not interceptor_set_filter:
-a monitored stroke still reaches the rest of the system untouched, unlike a
-filtered one, so an unrelated mouse can never go dead the way it would if this
-tried to filter it instead. This used to be a second, independent Raw Input
-registration of its own (RegisterRawInputDevices/RIDEV_INPUTSINK) — removed
-because Windows allows only one raw-input registration per device class per
-process, and interceptor.dll's own engine already holds the one for mice; a
-second one silently stole delivery from whichever registered first.
+Translated output is not one of these any more: every gesture the translator
+decides on goes out over gate.py's own WebSocket channel to the extension,
+identically on both platforms, so there is nothing platform-specific left to
+implement here for it. Only the gated device is ever touched — every other mouse
+is left completely alone, untouched by anything in this file.
 """
 
 import ctypes
@@ -43,10 +28,9 @@ import interceptor
 #     driver-backed DLL   HID\VID_04CA&PID_0061&REV_0100
 #     current DLL         \\?\HID#VID_04CA&PID_0061#9&299ea37&0&0000#{378de44c-...}
 #
-# Used below both to recognise the gated device against Raw Input's own reports
-# (watch_other_pointers) and to key the registry's friendly-name lookup
-# (_friendly_names) by the one thing every shape agrees on. interceptor.py owns
-# the regex, so there is one definition instead of two drifting copies.
+# Used below to key the registry's friendly-name lookup (_friendly_names) by the
+# one thing every shape agrees on. interceptor.py owns the regex, so there is one
+# definition instead of two drifting copies.
 _vid_pid = interceptor._vid_pid
 
 NAME = "windows"
@@ -84,14 +68,6 @@ def _bind_win32():
     user32.GetWindowThreadProcessId.restype = wt.DWORD
     user32.GetWindowThreadProcessId.argtypes = [wt.HWND,
                                                 ctypes.POINTER(wt.DWORD)]
-
-    user32.GetCursorPos.restype = wt.BOOL
-    user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
-    user32.SetCursorPos.restype = wt.BOOL
-    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
-
-    user32.SendInput.restype = wt.UINT
-    user32.SendInput.argtypes = [wt.UINT, ctypes.c_void_p, ctypes.c_int]
 
     kernel32.OpenProcess.restype = wt.HANDLE
     kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
@@ -177,19 +153,6 @@ _BUTTON_FLAGS = (
     (interceptor.MOUSE_BUTTON_5_DOWN, codes.BTN_EXTRA, 1),
     (interceptor.MOUSE_BUTTON_5_UP, codes.BTN_EXTRA, 0),
 )
-
-_DOWN_FLAG = {
-    (codes.BTN_LEFT, 1): interceptor.MOUSE_LEFT_BUTTON_DOWN,
-    (codes.BTN_LEFT, 0): interceptor.MOUSE_LEFT_BUTTON_UP,
-    (codes.BTN_RIGHT, 1): interceptor.MOUSE_RIGHT_BUTTON_DOWN,
-    (codes.BTN_RIGHT, 0): interceptor.MOUSE_RIGHT_BUTTON_UP,
-    (codes.BTN_MIDDLE, 1): interceptor.MOUSE_MIDDLE_BUTTON_DOWN,
-    (codes.BTN_MIDDLE, 0): interceptor.MOUSE_MIDDLE_BUTTON_UP,
-    (codes.BTN_SIDE, 1): interceptor.MOUSE_BUTTON_4_DOWN,
-    (codes.BTN_SIDE, 0): interceptor.MOUSE_BUTTON_4_UP,
-    (codes.BTN_EXTRA, 1): interceptor.MOUSE_BUTTON_5_DOWN,
-    (codes.BTN_EXTRA, 0): interceptor.MOUSE_BUTTON_5_UP,
-}
 
 _warned_absolute = False
 
@@ -431,186 +394,6 @@ def open_gated_device(identifier):
     return GatedDevice(identifier)
 
 
-# ------------------------------------------------------------------ output
-
-
-class VirtualOutput:
-    """Accumulates writes into one Interception stroke, flushed on syn().
-
-    uinput works the same way — writes queue until SYN_REPORT — so the translator's
-    existing write/syn pairs need no rethinking. Batching also matters: a press and
-    the motion that follows it belong in one stroke, or Onshape sees a click.
-    """
-
-    def __init__(self, device):
-        self._device = device
-        self._reset()
-
-    def _reset(self):
-        self._state = 0
-        self._flags = interceptor.MOUSE_MOVE_RELATIVE
-        self._rolling = 0
-        self._x = 0
-        self._y = 0
-        self._pending = False
-
-    def write(self, etype, code, value):
-        if etype == codes.EV_KEY:
-            flag = _DOWN_FLAG.get((code, 1 if value else 0))
-            if flag:
-                self._state |= flag
-                self._pending = True
-            return
-        if etype == codes.EV_REL:
-            if code == codes.REL_X:
-                self._x += value
-            elif code == codes.REL_Y:
-                self._y += value
-            elif code == codes.REL_WHEEL:
-                self._state |= interceptor.MOUSE_WHEEL
-                self._rolling += value * interceptor.WHEEL_DELTA
-            elif code == codes.REL_HWHEEL:
-                self._state |= interceptor.MOUSE_HWHEEL
-                self._rolling += value * interceptor.WHEEL_DELTA
-            elif code == codes.REL_WHEEL_HI_RES:
-                self._state |= interceptor.MOUSE_WHEEL
-                self._rolling += value
-            elif code == codes.REL_HWHEEL_HI_RES:
-                self._state |= interceptor.MOUSE_HWHEEL
-                self._rolling += value
-            else:
-                return
-            self._pending = True
-
-    def write_event(self, event):
-        if event.type == codes.EV_SYN:
-            self.syn()
-            return
-        self.write(event.type, event.code, event.value)
-
-    def syn(self):
-        if not self._pending:
-            return
-        stroke = interceptor.MouseStroke(
-            state=self._state, flags=self._flags, rolling=self._rolling,
-            x=self._x, y=self._y, information=0)
-        self._reset()
-        try:
-            self._device.send(stroke)
-        except Exception as exc:
-            log(f"could not send stroke: {exc}")
-
-    def close(self):
-        self._reset()
-
-
-# --- keyboard output ---------------------------------------------------------------
-
-INPUT_KEYBOARD = 1
-KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_SCANCODE = 0x0008
-KEYEVENTF_EXTENDEDKEY = 0x0001
-
-ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else wt.DWORD
-
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wt.WORD), ("wScan", wt.WORD), ("dwFlags", wt.DWORD),
-                ("time", wt.DWORD), ("dwExtraInfo", ULONG_PTR)]
-
-
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [("dx", wt.LONG), ("dy", wt.LONG), ("mouseData", wt.DWORD),
-                ("dwFlags", wt.DWORD), ("time", wt.DWORD),
-                ("dwExtraInfo", ULONG_PTR)]
-
-
-class _INPUTUNION(ctypes.Union):
-    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
-
-
-class INPUT(ctypes.Structure):
-    _anonymous_ = ("u",)
-    _fields_ = [("type", wt.DWORD), ("u", _INPUTUNION)]
-
-
-# The AT set-1 scancodes for these three happen to equal their Linux keycodes, which
-# is why the translator's codes can be used as the map's keys without ceremony. Kept
-# explicit anyway: the coincidence does not hold generally.
-_SCANCODE = {
-    codes.KEY_ESC: 0x01,
-    codes.KEY_LEFTCTRL: 0x1D,
-    codes.KEY_SPACE: 0x39,
-}
-
-
-class KeyOutput:
-    """Ctrl and the left-click key, via SendInput with scancodes.
-
-    Scancodes rather than virtual keys because Onshape reads the browser's key
-    events, and a scancode survives a non-US layout unchanged.
-    """
-
-    def __init__(self):
-        self.ok = True
-
-    def write(self, etype, code, value):
-        if etype != codes.EV_KEY:
-            return
-        scan = _SCANCODE.get(code)
-        if scan is None:
-            return
-        flags = KEYEVENTF_SCANCODE | (0 if value else KEYEVENTF_KEYUP)
-        event = INPUT(type=INPUT_KEYBOARD,
-                      ki=KEYBDINPUT(wVk=0, wScan=scan, dwFlags=flags,
-                                    time=0, dwExtraInfo=0))
-        sent = user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
-        if sent != 1:
-            log(f"SendInput rejected scancode {scan:#x} "
-                f"(error {ctypes.get_last_error()})")
-
-    def write_event(self, event):
-        self.write(event.type, event.code, event.value)
-
-    def syn(self):
-        """SendInput has no batching, so each write has already landed."""
-
-    def close(self):
-        pass
-
-
-def modifier_output():
-    return KeyOutput()
-
-
-# ------------------------------------------------------------------ pointer
-
-
-class Pointer:
-    def __init__(self):
-        self.ok = False
-        try:
-            user32.GetCursorPos
-            user32.SetCursorPos
-        except AttributeError as exc:
-            log(f"cursor API unavailable ({exc}); pan recentring disabled")
-            return
-        self.ok = True
-
-    def position(self):
-        if not self.ok:
-            return None
-        point = wt.POINT()
-        if not user32.GetCursorPos(ctypes.byref(point)):
-            return None
-        return (point.x, point.y)
-
-    def warp(self, x_pos, y_pos):
-        if not self.ok:
-            return
-        user32.SetCursorPos(int(x_pos), int(y_pos))
-
-
 # ------------------------------------------------------------------ focus
 
 CHROME_IMAGES = ("chrome.exe",)
@@ -735,78 +518,6 @@ def watch_focus(callback):
         # Fail closed while there is no watcher, exactly as the X11 path does.
         callback(False, None, None)
         time.sleep(2)
-
-
-# ------------------------------------------------------------------ other mice
-
-
-def watch_other_pointers(gated_identifier, on_activity, enabled):
-    """Passively observe every mouse via interceptor_set_monitor; motion is
-    reported so the translator can apply its own dead zone, and a button or
-    wheel always reports as immediate since neither happens by accident.
-
-    interceptor_set_monitor never withholds a stroke — unlike interceptor_set_
-    filter, a mistake here can never leave one of the user's other mice dead.
-    See the module docstring's "other mice" note for why this runs its own
-    interceptor.Context() rather than a Raw Input registration of its own.
-
-    All mouse device numbers are monitored unconditionally, including
-    whichever one is the gated mouse: excluding it by device number instead,
-    at set_monitor() time, would race a device that has not been resolved to
-    a number yet (this thread starts before gate.py's own device grab does) or
-    go stale across a replug. Comparing the hardware ID fresh on every stroke
-    costs one more interceptor_get_hardware_id call but is immune to both.
-    """
-    gated_vidpid = _vid_pid(gated_identifier)
-    if gated_vidpid is None:
-        # Yielding on everything is exactly the pathology this exclusion exists to
-        # avoid: it would cancel every pan the gated mouse draws. If the gated
-        # device cannot be identified, not yielding at all is the safe failure.
-        log(f"cannot read a VID/PID from {gated_identifier!r}; "
-            f"pan_yield_to_other_mice disabled")
-        while True:
-            time.sleep(60)
-
-    all_mice = list(range(interceptor.FIRST_MOUSE, interceptor.MAX_DEVICE + 1))
-    state = {"last": 0.0}
-
-    while True:
-        try:
-            with interceptor.Context() as ctx:
-                ctx.set_monitor(all_mice, interceptor.FILTER_MOUSE_ALL)
-
-                while True:
-                    if not enabled():
-                        time.sleep(0.05)
-                        continue
-                    device = ctx.wait(200)
-                    if not device:
-                        continue
-                    stroke = ctx.receive_mouse(device)
-                    if stroke is None:
-                        continue
-
-                    dx, dy = stroke.x, stroke.y
-                    # Folded into the same state field as the button bits, so
-                    # this is already exactly the "not passive drift" signal
-                    # the immediate/deadzone split wants.
-                    immediate = bool(stroke.state)
-                    if not (dx or dy or immediate):
-                        continue
-
-                    if _vid_pid(ctx.hardware_id(device)) == gated_vidpid:
-                        continue
-
-                    now = time.monotonic()
-                    if now - state["last"] > 0.01:
-                        state["last"] = now
-                        try:
-                            on_activity(dx, dy, immediate)
-                        except Exception as exc:
-                            log(f"yield callback failed: {exc}")
-        except Exception as exc:
-            log(f"other-pointer watcher restarting after error: {exc}")
-            time.sleep(2)
 
 
 # Declared last: the signatures reference the callback types defined above, and a

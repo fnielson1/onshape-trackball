@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Turn the left-hand mouse into an Onshape navigation device.
 
-The physical device is grabbed exclusively so the desktop never sees it, and its
-events are translated onto a synthetic device only while onshape.com is frontmost.
+The physical device is grabbed exclusively so the desktop never sees it, but its
+events never reach the OS as real input either. While onshape.com is frontmost,
+each translated action is sent as a message over a local WebSocket channel to a
+Chrome extension, which dispatches the matching untrusted DOM event directly on
+Onshape's page — see the Channel class below.
 
 Translation, while the gate is open (default mapping; see PAN_REQUIRES_RIGHT_BUTTON):
-    right button + motion   -> pan    (synthesised as a held Ctrl + right-drag)
-    motion                  -> rotate (plain right-drag, synthesised to bracket it)
-    wheel                   -> zoom   (passed through unchanged)
-    left button             -> clear the selection (taps space; the click is swallowed)
+    right button + motion   -> pan    (a Ctrl-tagged synthetic drag)
+    motion                  -> rotate (a plain synthetic drag)
+    wheel                   -> zoom   (a synthetic wheel event)
+    left button             -> clear the selection (a synthetic Space tap; the
+                                click itself is never sent)
 
 The gate opens when both of these agree:
   * the focused window belongs to Google Chrome
@@ -18,16 +22,19 @@ Either signal alone is insufficient: the window manager cannot see a tab's URL, 
 the extension's MV3 service worker can be suspended while Chrome sits in the
 background.
 
-Everything in this file is platform-neutral. The four things that are not — exclusive
-capture, synthetic output, the cursor, and focus tracking — live behind `backend.py`,
-which picks an implementation from sys.platform. Both test suites exec this file, so
-it must stay importable on a machine with no driver, no display and no hardware.
+Everything in this file is platform-neutral. The two things that are not — exclusive
+capture and focus tracking — live behind `backend.py`, which picks an implementation
+from sys.platform. Both test suites exec this file, so it must stay importable on a
+machine with no driver, no display and no hardware.
 """
 
+import base64
 import hashlib
 import json
 import os
 import signal
+import socket
+import struct
 import sys
 import threading
 import time
@@ -96,20 +103,6 @@ SOURCE_HASH = source_hash()
 # this setting.
 PAN_REQUIRES_RIGHT_BUTTON = True
 
-# Ctrl must land before the button and lift after it. The other order leaves a moment
-# of plain right-drag, which Onshape reads as rotate.
-# The button release and the Ctrl release travel through two independent devices, so
-# nothing but this gap enforces their order — and out of order means a moment of
-# plain right-drag, which Onshape rotates on.
-#
-# Sized by measurement, not guesswork. At 2ms: 26 rotate episodes in 25s of panning.
-# At 8ms: still 18, clustered at 16-20ms, i.e. one per stroke teardown with the gap
-# consistently too short. Set well past that spread.
-#
-# Costs nothing noticeable: it delays only the Ctrl release at the end of a stroke,
-# never the button press or any motion, and a recentre no longer pays it at all.
-MODIFIER_SETTLE = 0.030
-
 # What the gated mouse's left button does. Onshape clears the whole selection on
 # space, which is more useful from a navigation mouse than a left click would be: the
 # cursor is penned in the middle of the view, so a real click would just select
@@ -148,20 +141,6 @@ PAN_IDLE_MAX_MS = 2000
 # How often the idle check runs, so a release lands within PAN_TICK of the deadline.
 PAN_TICK = 0.05
 
-# Panning drags the real cursor, so a long sweep runs out of screen and the pan dies.
-# Recentring warps the pointer back to the middle of the window when it nears an edge,
-# which makes panning effectively unlimited.
-RECENTER = True
-
-# The static part of the edge margin. On its own it can only be right for one pan
-# speed: the edge check is throttled (RECENTER_CHECK_INTERVAL), so the distance the
-# cursor covers between two checks grows with how fast the ball is spun, while a
-# fixed margin does not. A quick flick therefore clears 20px and lands on the feature
-# tree before the next check runs. What actually bounds the overshoot is the travel
-# term added in _recenter_if_near_edge; this stays small so that panning slowly is
-# not penalized with a shrunken view and needless recentres.
-RECENTER_MARGIN = 35
-
 # The usable view rect comes from the extension's content script, which probes the
 # page to find the region that genuinely belongs to the 3D view — the canvas minus
 # whatever Onshape stacks on top of it. Goes stale if the script stops reporting (tab
@@ -171,21 +150,6 @@ CANVAS_STALE_AFTER = 5.0
 # How many contextmenu reports to keep for --status. Enough to cover a session's
 # worth of "it just happened again" without the snapshot becoming a log file.
 CONTEXT_MENU_HISTORY = 20
-
-# The warp must not land while the pan button is down: Onshape would read the jump as
-# one enormous pan. So the button is lifted, the desktop is given a moment to settle,
-# then it is pressed again. Only paid at an edge, not per motion event.
-RECENTER_SETTLE = 0.012
-
-# Reading the cursor is a round-trip; a 1000Hz mouse would make that per-event cost
-# real, so the edge check is throttled.
-RECENTER_CHECK_INTERVAL = 0.02
-
-# Both mice drive one shared pointer, so a held pan gesture applies to whatever the
-# *other* mouse does: its motion pans, and its wheel reaches the page with the button
-# still down rather than as a clean scroll. Watching the other mice read-only and
-# dropping the gesture the moment one of them stirs keeps them independent.
-PAN_YIELD = True
 
 # How far the mouse must travel before a pan actually starts. Measured as net
 # displacement, not distance travelled, so jitter that wanders out and back never
@@ -200,32 +164,9 @@ PAN_YIELD = True
 # Overridden by pan_deadzone_px in the config file; this is the fallback.
 PAN_DEADZONE = 10
 
-# How far the *other* mouse must travel, net, before its motion is treated as
-# deliberate and drops the gated mouse's pan or rotate. Below this, resting a hand on
-# it or bumping it in passing does not interrupt the stroke.
-#
-# Motion only — a button press on the other mouse always yields immediately
-# regardless of this value, since pressing a button is unambiguous. Like
-# pan_deadzone_px, an idle other mouse forgets what it has accumulated rather than
-# banking a stale nudge toward a later one.
-#
-# Does not apply while bare motion is driving rotate (the default mapping) — see
-# yield_stroke's bare_motion_is_rotate. Under that mapping bare motion drives
-# rotate, which gets no dead zone on the way in (see
-# _start_pan's own is_pan check) and, symmetrically, none on the way out either.
-#
-# Matches setup_helper.py's/setup.sh's own DEFAULT_YIELD_DEADZONE_PX: a fresh
-# install and a daemon started with no config file at all should agree.
-PAN_YIELD_DEADZONE = 20
-
 # How often the cached window rect is re-read, to survive a move or resize that
 # happens without any focus change.
 GEOMETRY_REFRESH = 2.0
-
-# Yielding to another mouse releases the pan, but the next twitch of the gated mouse
-# would re-press it immediately — so a burst of wheel-zoom turns into a press/release
-# ping-pong. Staying released briefly after a yield lets a zoom finish in peace.
-YIELD_COOLDOWN = 0.15
 
 # The extension pushes on every real transition and heartbeats every 30s via
 # chrome.alarms. If we go this long with nothing at all, assume it died and fail closed.
@@ -238,8 +179,8 @@ STALE_AFTER = 120.0
 # above 1 speeds it up.
 #
 # Panning is deliberately not scaled here: it already has its own dedicated feel via
-# PAN_DEADZONE and RECENTER_MARGIN, and slowing the cursor down mid-pan would just
-# make the window take longer to cross for no benefit.
+# PAN_DEADZONE, and slowing it down mid-pan would just make a long pan take longer
+# to land for no benefit.
 #
 # Overridden by rotate_scale in the config file; this is the fallback.
 DEFAULT_ROTATE_SCALE = 0.5
@@ -252,6 +193,34 @@ ROTATE_SCALE_MIN = 0.05
 ROTATE_SCALE_MAX = 5.0
 
 MOTION_AXES = (ecodes.REL_X, ecodes.REL_Y)
+
+# Symbolic names for the buttons the translator forwards untranslated — the left
+# button when left_click_key is "none", and any other button the gated mouse
+# happens to have. BTN_RIGHT is deliberately absent: it always goes through the
+# pan/rotate press/motion/release messages instead, never this generic one.
+BUTTON_NAMES = {
+    ecodes.BTN_LEFT: "LEFT",
+    ecodes.BTN_MIDDLE: "MIDDLE",
+    ecodes.BTN_SIDE: "SIDE",
+    ecodes.BTN_EXTRA: "EXTRA",
+}
+
+# Symbolic names for the wheel axes, sent over the channel instead of injected —
+# content.js maps these onto a synthetic WheelEvent's deltaX/deltaY.
+WHEEL_NAMES = dict(zip(WHEEL_CODES, WHEEL_AXES))
+
+# The channel's own port, separate from PORT (the human-readable /status server).
+# Bound to 127.0.0.1 only, same as PORT.
+CHANNEL_PORT = 47654
+
+# Fixed by extension/manifest.json's own "key" field, which pins Chrome's
+# otherwise-random unpacked-extension ID to this value. Lets the channel validate
+# the WebSocket handshake's Origin without a setup-time detection step or a config
+# key to keep in sync — see design.md's "extension's origin is pinned" decision.
+EXTENSION_ID = "oihhifecnmdihmijdhcmlhgilbagdmod"
+EXPECTED_ORIGIN = f"chrome-extension://{EXTENSION_ID}"
+
+WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 def log(msg):
@@ -293,71 +262,252 @@ def _open_log():
     sys.stderr = stream
 
 
-POINTER = backend.Pointer()
+def _read_exact(sock, n):
+    """Read exactly n bytes, or None if the connection closed first."""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _read_http_headers(sock):
+    """Read a request line and headers up to the blank line.
+
+    Small and bounded — this only ever has to parse a handshake from our own
+    extension, not arbitrary HTTP, so it does not need a general parser.
+    """
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ValueError("connection closed during handshake")
+        data += chunk
+        if len(data) > 16384:
+            raise ValueError("handshake too large")
+    head, _, _rest = data.partition(b"\r\n\r\n")
+    headers = {}
+    for line in head.decode("iso-8859-1").split("\r\n")[1:]:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+    return headers
+
+
+def _ws_read_frame(sock):
+    """-> (opcode, payload) or None on a closed connection. Assumes one frame per
+    message (no fragmentation) — true of every control frame by spec, and true of
+    anything this trusted local client sends, since it never has to send much."""
+    header = _read_exact(sock, 2)
+    if header is None:
+        return None
+    b0, b1 = header[0], header[1]
+    opcode = b0 & 0x0F
+    masked = bool(b1 & 0x80)
+    length = b1 & 0x7F
+    if length == 126:
+        ext = _read_exact(sock, 2)
+        if ext is None:
+            return None
+        length = struct.unpack("!H", ext)[0]
+    elif length == 127:
+        ext = _read_exact(sock, 8)
+        if ext is None:
+            return None
+        length = struct.unpack("!Q", ext)[0]
+    mask_key = _read_exact(sock, 4) if masked else None
+    payload = _read_exact(sock, length) if length else b""
+    if payload is None:
+        return None
+    if masked and mask_key:
+        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    return opcode, payload
+
+
+def _ws_send_frame(sock, opcode, payload):
+    """Server-to-client frames are never masked — only client-to-server ones are."""
+    length = len(payload)
+    if length < 126:
+        header = bytes([0x80 | opcode, length])
+    elif length < 65536:
+        header = bytes([0x80 | opcode, 126]) + struct.pack("!H", length)
+    else:
+        header = bytes([0x80 | opcode, 127]) + struct.pack("!Q", length)
+    sock.sendall(header + payload)
+
+
+class Channel:
+    """A minimal WebSocket server for one trusted local client: the extension's
+    background script. Implements just enough of RFC 6455 for that — the HTTP
+    Upgrade handshake, text frames, client-frame unmasking, ping/pong, close —
+    binding to 127.0.0.1 only and checking the handshake's Origin against the
+    extension's own fixed ID, so an arbitrary web page cannot open this and observe
+    the gated mouse's raw motion.
+
+    One-directional in practice: the daemon pushes every translated gesture, and
+    nothing the client sends back is ever acted on beyond keeping the connection
+    alive. A second client connecting simply replaces the first.
+    """
+
+    def __init__(self, port):
+        self._port = port
+        self._lock = threading.Lock()
+        self._sock = None
+        self._last_send_at = 0.0
+        self.on_disconnect = None      # optional callback, called with no args
+        self.on_connect = None         # optional callback, called with no args
+
+    @property
+    def connected(self):
+        with self._lock:
+            return self._sock is not None
+
+    def seconds_since_send(self):
+        """None before the first message this run, so /status can tell "never sent
+        one yet" apart from "sent one a while ago"."""
+        with self._lock:
+            sent_at = self._last_send_at
+        return None if sent_at == 0.0 else round(time.monotonic() - sent_at, 1)
+
+    def send(self, message):
+        """Silently does nothing when no client is connected — every caller relies
+        on this rather than checking `connected` itself first, so a disconnect
+        between the check and the send can never slip through."""
+        with self._lock:
+            sock = self._sock
+        if sock is None:
+            return
+        try:
+            _ws_send_frame(sock, 0x1, json.dumps(message).encode())
+        except OSError:
+            self._drop(sock)
+            return
+        with self._lock:
+            self._last_send_at = time.monotonic()
+
+    def _drop(self, client):
+        """Safe to call more than once, and safe to call with a socket that has
+        already been replaced by a newer connection — in which case this is a
+        no-op, not a disconnect of the current one."""
+        with self._lock:
+            if self._sock is not client:
+                return
+            self._sock = None
+        try:
+            client.close()
+        except OSError:
+            pass
+        log("channel: extension disconnected")
+        callback = self.on_disconnect
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def _handshake(self, client):
+        headers = _read_http_headers(client)
+        origin = headers.get("origin", "")
+        if origin != EXPECTED_ORIGIN:
+            client.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            raise ValueError(f"origin {origin!r} did not match {EXPECTED_ORIGIN!r}")
+        key = headers.get("sec-websocket-key")
+        if not key:
+            client.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            raise ValueError("missing Sec-WebSocket-Key")
+        accept = base64.b64encode(
+            hashlib.sha1((key + WS_MAGIC).encode()).digest()).decode()
+        client.sendall((
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        ).encode())
+
+    def _read_loop(self, client):
+        try:
+            while True:
+                frame = _ws_read_frame(client)
+                if frame is None:
+                    break
+                opcode, payload = frame
+                if opcode == 0x8:          # close
+                    break
+                if opcode == 0x9:          # ping -> pong
+                    _ws_send_frame(client, 0xA, payload)
+                # text/binary/pong: nothing the client sends changes anything here.
+        except OSError:
+            pass
+        finally:
+            self._drop(client)
+
+    def serve_forever(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", self._port))
+        listener.listen(1)
+        while True:
+            client, _addr = listener.accept()
+            try:
+                self._handshake(client)
+            except Exception as exc:
+                log(f"channel handshake failed: {exc}")
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                continue
+            with self._lock:
+                self._sock = client
+            log("channel: extension connected")
+            callback = self.on_connect
+            if callback is not None:
+                try:
+                    callback()
+                except Exception:
+                    pass
+            threading.Thread(target=self._read_loop, args=(client,), daemon=True).start()
+
+
+CHANNEL = Channel(CHANNEL_PORT)
 
 
 class Translator:
-    """Owns the virtual device and the pan state machine.
+    """Runs the gesture state machine and sends the result over the channel.
 
-    Every write to the virtual device goes through this lock, because the idle-release
-    timer and the gate can both end a pan stroke concurrently with the read loop.
+    There is exactly one output sink — CHANNEL — and no OS-level input device is
+    ever written to. Every write used to also have to worry about ordering against
+    a second, independent Ctrl device (MODIFIER_SETTLE) and about surviving
+    Chrome's and Onshape's own click-vs-drag heuristics (the Ctrl-tag-on-release
+    trick, the drag-nudge); none of that applies to untrusted synthetic dispatch,
+    confirmed live, so none of it exists here.
+
+    Every method below still runs under self._lock, because the idle-release timer
+    and the gate can both end a stroke concurrently with the read loop.
     """
 
-    def __init__(self, ui, modifier=None):
-        self._ui = ui
-        self._modifier = modifier
-        self._ctrl_down = False
-        self._right_emitted = False
+    def __init__(self, channel):
+        self._channel = channel
+        self._stroke_open = False   # is a press currently open on the channel?
+        self._gesture = None        # "pan" | "rotate" | None: which gesture, if any
         self._lock = threading.Lock()
-        self._held = set()          # real buttons we have forwarded as pressed
-        self._panning = False       # is the pan gesture currently held?
+        self._held = set()          # other buttons currently forwarded as pressed
+        self._panning = False       # is the bare-motion-driven stroke currently held?
         self._last_motion = 0.0
         self._right_down = False
-        self._last_edge_check = 0.0
-        self._edge_travel = 0.0     # distance sent since the last edge check
-        self.recenters = 0
-        self.yields = 0
         self._travel_x = 0.0
         self._travel_y = 0.0
         self._rotate_remainder_x = 0.0
         self._rotate_remainder_y = 0.0
-        self._other_travel_x = 0.0
-        self._other_travel_y = 0.0
-        self._other_travel_at = 0.0
-        self._yield_until = 0.0
-        self.presses_recentred = 0
         self.left_taps = 0
-        self.last_release = None    # see _release_right_button
+        self._pending_dx = 0
+        self._pending_dy = 0
+        self.last_release = None    # see _close_stroke
 
     # --- callers must hold self._lock -------------------------------------------
-
-    def _ensure_inside_window(self, position):
-        """A pan press must land inside the Chrome window. Pressing outside it clicks
-        whatever else is there, which takes focus away and closes the gate.
-
-        Motion keeps flowing while a stroke is between presses — including through a
-        deferred press, when _panning is false and edge recentring is therefore not
-        running — so by press time the cursor can genuinely be outside the window.
-        """
-        geometry = GATE.view_rect()
-        if geometry is None or position is None or not POINTER.ok:
-            return position
-
-        win_x, win_y, win_w, win_h = geometry
-        edge = 8
-        if (win_x + edge <= position[0] <= win_x + win_w - edge
-                and win_y + edge <= position[1] <= win_y + win_h - edge):
-            return position
-
-        centre = (win_x + win_w // 2, win_y + win_h // 2)
-        POINTER.warp(*centre)
-        self.presses_recentred += 1
-        return centre
-
-    def _press_pan(self):
-        position = POINTER.position() if POINTER.ok else None
-        self._ensure_inside_window(position)
-        self._emit_pan_down()
 
     def _within_deadzone(self):
         return (self._travel_x * self._travel_x + self._travel_y * self._travel_y
@@ -376,21 +526,12 @@ class Translator:
         if self._panning:
             return
 
-        now = time.monotonic()
-        if now < self._yield_until:
-            return          # another mouse is mid-gesture; stay out of its way
-
         # Only the free gesture actually needs protecting from an accidental bump — a
         # pan that fires because a hand rested on the trackball is disruptive in a way
         # a stray twitch of rotate is not, and unlike pan, rotate has no press of its
         # own to bracket it with, so the dead zone was ever only standing in for one.
-        # But every pixel it eats here is a pixel that never reaches Onshape: the
-        # button does not go down until the dead zone clears, so a small deliberate
-        # rotate that stops right after can leave almost nothing for Onshape's own
-        # click-vs-drag check to see, and it reads the release as a click regardless
-        # of what the browser's own contextmenu event does — see the Ctrl tag in
-        # _release_right_button, which cannot reach that decision at all. So this only
-        # ever applies when bare motion is driving pan; rotate is exempt entirely.
+        # So this only ever applies when bare motion is driving pan; rotate is exempt
+        # entirely.
         is_pan = not PAN_REQUIRES_RIGHT_BUTTON
         if is_pan and PAN_DEADZONE > 0 and self._within_deadzone():
             return          # not a deliberate push yet
@@ -402,164 +543,74 @@ class Translator:
         if GATE.view_rect() is None:
             return
 
-        self._press_pan()
+        # Fails closed the same way: with nobody to open a stroke for, there is
+        # nothing to be "panning" toward — _open_stroke itself would just no-op,
+        # but _panning must not go true over a gesture that never actually opened.
+        if not self._channel.connected:
+            return
+
+        self._open_stroke("pan" if is_pan else "rotate")
         self._panning = True
         self._reset_deadzone()
 
     def _handle_right_button(self, event):
         """The motion-driven stroke already holds the right button, so a physical
-        press must not press it twice — it hands off instead, adding or dropping
-        Ctrl to match whichever gesture the button now drives. Caller holds
-        self._lock."""
+        press must not press it twice — it hands off instead: the current drag
+        closes and immediately reopens as whichever gesture the button now drives,
+        at the same virtual position, which reads as one continuous gesture to
+        Onshape as long as no motion lands in between. Caller holds self._lock."""
         pressed = event.value != 0
 
         if pressed:
             self._right_down = True
             if self._panning:
                 self._panning = False
-                if PAN_REQUIRES_RIGHT_BUTTON:
-                    if not self._ctrl_down:
-                        self._ctrl(1)
-                        time.sleep(MODIFIER_SETTLE)
-                elif self._ctrl_down:
-                    time.sleep(MODIFIER_SETTLE)
-                    self._ctrl(0)
+                self._close_stroke()
+                self._open_stroke("pan" if PAN_REQUIRES_RIGHT_BUTTON else "rotate")
                 return              # button is already down; swallow the duplicate
-            if PAN_REQUIRES_RIGHT_BUTTON and not self._ctrl_down:
-                self._ctrl(1)
-                time.sleep(MODIFIER_SETTLE)
-            self._repress_right_button()
+            self._open_stroke("pan" if PAN_REQUIRES_RIGHT_BUTTON else "rotate")
             return
 
         self._right_down = False
-        self._end_pan(syn=False)
-        if self._right_emitted:
-            self._release_right_button()
-            if self._ctrl_down:
-                time.sleep(MODIFIER_SETTLE)
-                self._ctrl(0)
-            self._ui.syn()
+        self._end_pan()
+        self._close_stroke()
 
-    def _tap_key(self, code):
-        """Tap a key on the modifier device. Caller holds self._lock."""
-        if self._modifier is None:
-            return
-        self._modifier.write(ecodes.EV_KEY, code, 1)
-        self._modifier.syn()
-        self._modifier.write(ecodes.EV_KEY, code, 0)
-        self._modifier.syn()
+    def _tap_key(self, key_name):
+        """Caller holds self._lock."""
+        self._channel.send({"type": "tap", "key": key_name})
         self.left_taps += 1
 
-    def _ctrl(self, value):
-        if self._modifier is None:
+    def _open_stroke(self, gesture):
+        """Begin a press/motion/release sequence on the channel, unless one is
+        already open or the channel has nobody to open it for — fail closed here,
+        the same way a pan already refuses to start with no verified view region."""
+        if self._stroke_open:
             return
-        self._modifier.write(ecodes.EV_KEY, ecodes.KEY_LEFTCTRL, value)
-        self._modifier.syn()
-        self._ctrl_down = bool(value)
-
-    def _emit_pan_down(self):
-        # Ctrl only when bare motion is the pan trigger; with PAN_REQUIRES_RIGHT_BUTTON
-        # this motion-driven stroke is rotate instead, which wants plain right-drag.
-        if not PAN_REQUIRES_RIGHT_BUTTON and not self._ctrl_down:
-            self._ctrl(1)
-            time.sleep(MODIFIER_SETTLE)
-        self._repress_right_button()
-
-    def _repress_right_button(self):
-        """Just the button half of a press, with Ctrl left exactly as it is.
-
-        Used for the free gesture's own first press (Ctrl was just settled by
-        _emit_pan_down, above) and for a recentre's re-press on *either* gesture —
-        there, Ctrl (if any) survived the lift untouched, so re-deciding it from
-        PAN_REQUIRES_RIGHT_BUTTON would be wrong for whichever gesture the button
-        itself is currently driving.
-        """
-        if not self._right_emitted:
-            self._ui.write(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1)
-            self._ui.syn()
-            self._right_emitted = True
-
-    def _release_right_button(self):
-        """Every right-button release goes through here, so none of them can ever
-        land as a bare click.
-
-        Pan's release already carries Ctrl for free — it has been down throughout —
-        and extension/content.js checks exactly that, unconditionally and ahead of
-        anything it infers from distance: `event.ctrlKey` is the *first* thing
-        suppressionReason() looks at. Rotate never holds Ctrl during the drag — that
-        is what makes it rotate rather than pan — so its release had nothing to give
-        the page the same certainty.
-
-        So rotate's release borrows pan's own trick instead: Ctrl goes down just for
-        the instant the button lifts, then comes back up. No motion is sent while it
-        is up, so this changes nothing about the drag Onshape already saw — only
-        what the release itself looks like to the page, which is now indistinguishable
-        from pan's — for the browser's own menu.
-
-        The syn is essential, not tidiness: the modifier lives on a second device
-        with its own stream, and an unflushed button release would arrive *after*
-        the Ctrl release that follows it — leaving a moment of plain right-drag,
-        which Onshape rotates on.
-        """
-        if not self._right_emitted:
+        if not self._channel.connected:
             return
+        self._channel.send({"type": "press", "gesture": gesture})
+        self._stroke_open = True
+        self._gesture = gesture
 
-        tag_ctrl = not self._ctrl_down
-        if tag_ctrl:
-            self._ctrl(1)
-            time.sleep(MODIFIER_SETTLE)
+    def _close_stroke(self):
+        """Idempotent — every caller that might be ending a stroke calls this
+        unconditionally rather than checking first, so nothing can race past it."""
+        if not self._stroke_open:
+            return
+        self._channel.send({"type": "release"})
+        self._stroke_open = False
+        self._gesture = None
+        # Kept so a context-menu report arriving from the page can be lined up
+        # against the release that most likely caused it.
+        self.last_release = {"at": time.monotonic()}
 
-        # Kept so a context-menu report arriving from the page can be lined up against
-        # the release that most likely caused it. This is the daemon's half of that
-        # story; the page supplies what the menu actually opened on.
-        position = POINTER.position() if POINTER.ok else None
-        self.last_release = {
-            "at": time.monotonic(),
-            "at_pos": position,
-            "in_view_rect": _inside(GATE.view_rect(), position),
-        }
-
-        self._ui.write(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0)
-        self._ui.syn()
-        self._right_emitted = False
-
-        if tag_ctrl:
-            time.sleep(MODIFIER_SETTLE)
-            self._ctrl(0)
-
-    def _emit_pan_up(self, keep_modifier=False):
-        """keep_modifier is for the recentre, which lifts and re-presses the button
-        mid-stroke. Dropping Ctrl there too was pure cost: it doubled the number of
-        modifier transitions and opened a window where the desktop could see the
-        button still down with Ctrl already gone, which is a plain right-drag and
-        rotates.
-        """
-        # Button first: dropping Ctrl while the button is still down would leave a
-        # plain right-drag, which Onshape rotates on.
-        #
-        # Released unconditionally. This runs only while something owns the button —
-        # _end_pan requires _panning, the recentre requires _right_emitted, which
-        # covers the button-held gesture too — and the hand-off between the two never
-        # comes through here: _handle_right_button settles Ctrl itself and clears
-        # _panning directly, without touching the button. Skipping the release when
-        # _right_down looked true therefore protected nothing, and if that flag ever
-        # went stale it left the button held with the wrong Ctrl state: whichever
-        # gesture that is would run on until something else happened to clear it.
-        self._release_right_button()
-        if self._ctrl_down and not keep_modifier:
-            time.sleep(MODIFIER_SETTLE)
-            self._ctrl(0)
-
-    def _end_pan(self, syn):
-        """Release the pan gesture. syn=False when the source's own SYN_REPORT is
-        about to flush the same packet."""
+    def _end_pan(self):
+        """Release the bare-motion-driven stroke, if one is open."""
         if not self._panning:
             return
-        self._emit_pan_up()
+        self._close_stroke()
         self._panning = False
         self._reset_deadzone()      # the next stroke earns its own dead zone
-        if syn:
-            self._ui.syn()
 
     def _track(self, code, value):
         if value == 1:
@@ -567,15 +618,39 @@ class Translator:
         elif value == 0:
             self._held.discard(code)
 
+    def _send_click(self, code, value):
+        """The left button when left_click_key is "none", or any other button the
+        gated mouse has. Caller holds self._lock."""
+        name = BUTTON_NAMES.get(code)
+        if name is None:
+            return          # nothing sensible to forward
+        self._channel.send({"type": "click", "code": name, "value": value})
+
     def _write_motion(self, code, value, is_rotate):
-        """Write one axis of motion, scaled down for whichever gesture is currently
-        rotate. Pan gets the raw value unconditionally — see ROTATE_SCALE.
+        """Accumulate one axis of motion, scaled down for whichever gesture is
+        currently rotate — pan gets the raw value unconditionally, see
+        ROTATE_SCALE. Flushed as one combined dx/dy message on the next
+        SYN_REPORT, the same way the old OS-level device batched a write/syn pair.
         """
         if is_rotate and ROTATE_SCALE != 1.0:
             value = self._scale_rotate(code, value)
             if value == 0:
                 return
-        self._ui.write(ecodes.EV_REL, code, value)
+        if code == ecodes.REL_X:
+            self._pending_dx += value
+        else:
+            self._pending_dy += value
+
+    def _flush_motion(self):
+        """Send accumulated motion as one message, dropping it instead if no stroke
+        is open — there is no real cursor left to track a hand through the dead
+        zone with, so a fresh stroke simply starts from the page's own seeded
+        position rather than resuming wherever an untracked drift left off."""
+        dx, dy = self._pending_dx, self._pending_dy
+        self._pending_dx = 0
+        self._pending_dy = 0
+        if (dx or dy) and self._stroke_open:
+            self._channel.send({"type": "motion", "dx": dx, "dy": dy})
 
     def _scale_rotate(self, code, value):
         """value * ROTATE_SCALE, without losing sub-pixel motion to rounding: the
@@ -594,16 +669,14 @@ class Translator:
         return scaled
 
     def _resume_button_gesture(self):
-        """The right button is still physically down, but a yield dropped its
-        synthetic press mid-stroke (see yield_stroke) while the hand never let go.
+        """The right button is still physically down, but something else closed
+        its stroke mid-hold while the hand never let go — the view region
+        disappearing and coming back, or the channel dropping and reconnecting.
         Motion resuming means the gesture should resume too, exactly as a fresh
         press would — this mirrors _handle_right_button's own press branch, since a
         real button event is never coming to do it for us.
         """
-        if PAN_REQUIRES_RIGHT_BUTTON and not self._ctrl_down:
-            self._ctrl(1)
-            time.sleep(MODIFIER_SETTLE)
-        self._repress_right_button()
+        self._open_stroke("pan" if PAN_REQUIRES_RIGHT_BUTTON else "rotate")
         self._reset_deadzone()      # a resumed stroke earns its own dead zone too
 
     # --- public ------------------------------------------------------------------
@@ -617,36 +690,35 @@ class Translator:
                     return self._handle_right_button(event)
                 if code == ecodes.BTN_LEFT and LEFT_CLICK_CODE is not None:
                     if value:
-                        # End the pan first: the tap must not land while Ctrl is still
-                        # held, or it is Ctrl+space rather than space.
-                        self._end_pan(syn=True)
-                        self._tap_key(LEFT_CLICK_CODE)
+                        # End the pan first: the tap must not land mid-drag.
+                        self._end_pan()
+                        self._tap_key(LEFT_CLICK_KEY)
                     return                  # swallow press and release alike
                 if value:
                     # Any other button starts a real click; don't leave a pan running
                     # underneath it.
-                    self._end_pan(syn=False)
+                    self._end_pan()
                 self._track(code, value)
-                self._ui.write_event(event)
+                self._send_click(code, value)
                 return
 
             if etype == ecodes.EV_REL and code in WHEEL_CODES:
-                # Ctrl + wheel is browser page zoom, so the modifier must be gone
-                # before a wheel event reaches Chrome.
                 if self._panning:
-                    self._end_pan(syn=True)
-                self._ui.write_event(event)
+                    self._end_pan()
+                name = WHEEL_NAMES.get(code)
+                if name is not None:
+                    self._channel.send({"type": "wheel", "code": name, "value": value})
                 return
 
             if etype == ecodes.EV_REL and code in MOTION_AXES:
-                # Per-axis absolute sum rather than true distance: it overshoots a
-                # diagonal by up to 41%, and a margin erring large is the safe
-                # direction to err in. Tracked for whichever gesture the button is
-                # currently driving too — a long sweep runs the cursor out of screen
-                # the same way regardless of which one it is. Measured on the raw
-                # value, ahead of any rotate scaling below — erring larger only makes
-                # the recentre margin more conservative, never less.
-                self._edge_travel += abs(value)
+                if self._stroke_open and GATE.view_rect() is None:
+                    # The safe region went away mid-stroke — a dialog opened over the
+                    # view, or the extension stopped reporting. There is now nowhere
+                    # known to be harmless, so let go rather than keep dragging across
+                    # whatever appeared.
+                    self._end_pan()
+                    self._close_stroke()
+                    return
                 bare_motion = not self._right_down
                 if bare_motion:
                     if code == ecodes.REL_X:
@@ -655,173 +727,23 @@ class Translator:
                         self._travel_y += value
                     self._start_pan()
                     self._last_motion = time.monotonic()
-                elif (not self._right_emitted and not self._ctrl_down
-                        and time.monotonic() >= self._yield_until
-                        and GATE.view_rect() is not None):
-                    # The button is held but nothing is emitted for it: a yield cut
-                    # this stroke off mid-gesture and the button never came back up
-                    # to give it a real press to resume on. Without this, the only
-                    # way out is releasing the physical button — see
+                elif not self._stroke_open and GATE.view_rect() is not None:
+                    # The button is held but nothing is emitted for it: something
+                    # else closed the stroke mid-gesture and the button never came
+                    # back up to give it a real press to resume on. Without this,
+                    # the only way out is releasing the physical button — see
                     # _resume_button_gesture.
                     self._resume_button_gesture()
                 # See the PAN_REQUIRES_RIGHT_BUTTON comment: bare motion and "button
                 # held" only mean rotate/pan once paired with this setting.
                 self._write_motion(code, value, bare_motion == PAN_REQUIRES_RIGHT_BUTTON)
-                self._recenter_if_near_edge()
                 return
 
-            # Wheel, hi-res wheel, MSC_SCAN, SYN_REPORT: verbatim.
-            self._ui.write_event(event)
-
-    def _recenter_if_near_edge(self):
-        """Keep the cursor inside the window so a sweep cannot run out of screen.
-
-        The pan button is lifted around the warp: a jump with it held would be read
-        as one enormous pan. Caller holds self._lock.
-        """
-        if not RECENTER or not POINTER.ok:
-            return
-
-        now = time.monotonic()
-        if now - self._last_edge_check < RECENTER_CHECK_INTERVAL:
-            return
-        self._last_edge_check = now
-        # Reset on every check, so this only ever describes recent motion: a flick
-        # widens the margin while it lasts and stops counting as soon as it stops.
-        lookahead = self._edge_travel
-        self._edge_travel = 0.0
-
-        geometry = GATE.view_rect()
-        if geometry is None or geometry[2] <= 0 or geometry[3] <= 0:
-            # The safe region went away mid-stroke — a dialog opened over the view, or
-            # the extension stopped reporting. There is now nowhere the cursor is known
-            # to be harmless, so let go of the button rather than keep dragging it
-            # across whatever appeared.
-            if self._panning:
-                self._end_pan(syn=True)
-            return
-        win_x, win_y, win_w, win_h = geometry
-
-        # Widened by the distance covered since the last check, which bounds the
-        # overshoot two ways at once: that much motion has already been sent but may
-        # not have reached the cursor yet, so the reading below is stale by up to
-        # this far, and roughly that much more can land before the next check.
-        #
-        # A small window must not end up with a safe region of zero.
-        margin = min(RECENTER_MARGIN + lookahead, win_w // 3, win_h // 3)
-
-        position = POINTER.position()
-        if position is None:
-            return
-        pointer_x, pointer_y = position
-
-        inside = (win_x + margin <= pointer_x <= win_x + win_w - margin
-                  and win_y + margin <= pointer_y <= win_y + win_h - margin)
-        if inside:
-            return
-
-        centre_x = win_x + win_w // 2
-        centre_y = win_y + win_h // 2
-
-        if not self._right_emitted:
-            # No button is held — by either gesture — so there is nothing to protect
-            # and no press cycle to pay for; just put the cursor back. This case
-            # matters more than it sounds: motion keeps flowing between strokes and
-            # through the yield cooldown, and without recentring here the cursor
-            # wanders clean out of the view and over the feature tree.
-            POINTER.warp(centre_x, centre_y)
-            self.recenters += 1
-            self._last_motion = time.monotonic()
-            return
-
-        self._emit_pan_up(keep_modifier=True)
-        self._ui.syn()
-        time.sleep(RECENTER_SETTLE)
-
-        POINTER.warp(centre_x, centre_y)
-        time.sleep(RECENTER_SETTLE)
-
-        if self._panning:
-            self._press_pan()
-        else:
-            # The button-held gesture. Ctrl (if any) rode through the lift above
-            # untouched — _press_pan would re-decide it from PAN_REQUIRES_RIGHT_BUTTON,
-            # which is only correct for the free gesture — so only the button itself
-            # needs to come back.
-            self._repress_right_button()
-        self._ui.syn()
-        self.recenters += 1
-
-        # A recentre only happens mid-stroke, and it stalls this loop for two
-        # RECENTER_SETTLE naps. Without refreshing the idle deadline, the timer can
-        # fire straight afterwards and tear down the stroke we just restored — which
-        # gets much more likely as PAN_IDLE_RELEASE approaches the stall duration.
-        self._last_motion = time.monotonic()
-
-    def yield_stroke(self, dx=0.0, dy=0.0, immediate=False):
-        """Another pointing device stirred. Drop everything the gated mouse is
-        holding, so the shared pointer is not carrying it into someone else's
-        gesture.
-
-        Deliberately not conditioned on _panning. After the hand-off to rotate that
-        flag is already False while the right button stays held, so keying off it
-        meant the right mouse could cancel a pan but never a rotate — the button then
-        stayed down until the physical button happened to come back up.
-
-        Plain motion is subject to its own dead zone, pan_yield_deadzone_px, measured
-        the same way as the gated mouse's: net displacement since the stroke started
-        yielding to it. A button press or a wheel turn is `immediate` and skips it —
-        there is no such thing as an accidental click or an accidental scroll. So
-        does motion while bare motion is driving rotate rather than pan — see
-        bare_motion_is_rotate below.
-        """
-        with self._lock:
-            if not (self._panning or self._right_emitted or self._ctrl_down):
-                self._other_travel_x = 0.0
-                self._other_travel_y = 0.0
+            if etype == ecodes.EV_SYN:
+                self._flush_motion()
                 return
 
-            # Symmetric with _start_pan's own is_pan check: whichever gesture bare
-            # motion is currently driving gets the same dead-zone treatment leaving
-            # that it gets entering. Under the default mapping bare motion drives
-            # rotate, which _start_pan gives no dead zone at all — so nothing here
-            # should make it wait to leave either. That symmetry also sidesteps a
-            # trap an idle-time check falls into: a trackball's ball keeps rolling a
-            # little after the hand lifts, so _last_motion keeps getting refreshed on
-            # its own and "the gated device has gone quiet" is not something the
-            # other mouse can wait around for.
-            #
-            # Everything else — bare-motion pan (the non-default mapping), and any
-            # gesture already handed off to the physical button, which drops
-            # _panning to False regardless of mapping — keeps the dead zone. A
-            # button-held gesture especially: a pause mid-hold is normal, so it
-            # still needs protecting from a bump.
-            bare_motion_is_rotate = self._panning and PAN_REQUIRES_RIGHT_BUTTON
-            if not immediate and not bare_motion_is_rotate and PAN_YIELD_DEADZONE > 0:
-                now = time.monotonic()
-                if now - self._other_travel_at > PAN_IDLE_RELEASE:
-                    self._other_travel_x = 0.0
-                    self._other_travel_y = 0.0
-                self._other_travel_at = now
-                self._other_travel_x += dx
-                self._other_travel_y += dy
-                if (self._other_travel_x * self._other_travel_x
-                        + self._other_travel_y * self._other_travel_y
-                        < PAN_YIELD_DEADZONE * PAN_YIELD_DEADZONE):
-                    return      # not a deliberate move yet
-
-            self._end_pan(syn=True)          # no-op when not panning
-            self._release_right_button()     # this is what catches the rotate
-            if self._ctrl_down:
-                time.sleep(MODIFIER_SETTLE)  # button before Ctrl, as everywhere else
-                self._ctrl(0)
-            self._ui.syn()
-
-            self._reset_deadzone()
-            self._other_travel_x = 0.0
-            self._other_travel_y = 0.0
-            self.yields += 1
-            self._yield_until = time.monotonic() + YIELD_COOLDOWN
+            # EV_MSC and anything else: no translated meaning, nothing to forward.
 
     def note_while_closed(self, event):
         """Keep physical button state honest even while we're dropping events, so the
@@ -835,44 +757,53 @@ class Translator:
             now = time.monotonic()
 
             if self._panning and now - self._last_motion > PAN_IDLE_RELEASE:
-                self._end_pan(syn=True)
+                self._end_pan()
             elif not self._panning and now - self._last_motion > PAN_IDLE_RELEASE:
                 # Let a stale nudge expire, so movement from a while ago cannot
                 # combine with a fresh one to cross the dead zone.
                 self._reset_deadzone()
 
     def release_all(self):
-        """Gate closed. Lift anything we left down, real or synthetic."""
+        """Gate closed. Lift anything we left down."""
         with self._lock:
             # Cleared before the early return, not after it. Leaving it set here is
             # how it went stale: close the gate while the physical right button is
             # down and the flag survived for the rest of the session.
             self._right_down = False
-            if not self._panning and not self._held and not self._right_emitted \
-                    and not self._ctrl_down:
+            if not self._panning and not self._held and not self._stroke_open:
                 return
-            self._end_pan(syn=False)
-            self._release_right_button()
-            if self._ctrl_down:
-                self._ctrl(0)
+            self._end_pan()
+            self._close_stroke()
             for code in self._held:
-                self._ui.write(ecodes.EV_KEY, code, 0)
+                name = BUTTON_NAMES.get(code)
+                if name is not None:
+                    self._channel.send({"type": "click", "code": name, "value": 0})
             self._held.clear()
             self._right_down = False
             self._reset_deadzone()
-            self._ui.syn()
             log("gate closed mid-gesture; released held buttons")
+
+    def channel_disconnected(self):
+        """The channel dropped mid-gesture. There is nothing left to send a release
+        to, so this just stops believing a stroke is open rather than trying to
+        buffer or retry — see design.md's "fail closed on a missing channel"
+        decision."""
+        with self._lock:
+            self._panning = False
+            self._stroke_open = False
+            self._gesture = None
+            self._pending_dx = 0
+            self._pending_dy = 0
+            self._reset_deadzone()
 
     def snapshot(self):
         with self._lock:
             return {
                 "panning": self._panning,
                 "right_button_down": self._right_down,
-                "recenters": self.recenters,
-                "pan_yields": self.yields,
-                "presses_recentred": self.presses_recentred,
                 "left_taps": self.left_taps,
-                "ctrl_held": self._ctrl_down,
+                "stroke_open": self._stroke_open,
+                "gesture": self._gesture,
             }
 
 
@@ -909,6 +840,10 @@ class Gate:
             translator = self.translator
         if changed:
             log(f"gate {'OPEN' if new else 'closed'}")
+            # Told to the extension explicitly, not inferred from message traffic:
+            # it is what decides whether to show the on-page cursor icons and hide
+            # the real one, and a gap between gestures must not look like "closed".
+            CHANNEL.send({"type": "gate", "open": new})
             if not new and translator is not None:
                 translator.release_all()
 
@@ -977,16 +912,17 @@ class Gate:
         it was doing at the time. Between them the causes separate cleanly:
 
           overlay, inside our region  -> the region was wrong; the probe missed
-                                         something, and the pointer was legitimately
-                                         somewhere we had declared safe
-          overlay, outside our region -> the cursor got somewhere it should not have:
-                                         a recentre that did not keep up, or a press
-                                         that landed before one
-          on the canvas               -> the region was right and the cursor was
-                                         where we meant it to be; Onshape's own
-                                         canvas menu, not a bug here
-          not while panning           -> not ours at all; the other mouse, or a real
-                                         right-click
+                                         something, and the other mouse's real click
+                                         landed somewhere we had declared safe
+          overlay, outside our region -> the other mouse's real click landed on an
+                                         overlay outside the region — expected; only
+                                         the region itself is ever verified safe
+          on the canvas               -> Onshape's own canvas menu, most likely
+                                         reacting to our own synthetic dispatch —
+                                         not a bug here
+          not while panning           -> not ours at all: the other mouse's real
+                                         click, or a real right-click on the gated
+                                         mouse's own hardware before it was captured
         """
         translator = self.translator
         release = getattr(translator, "last_release", None) if translator else None
@@ -1014,19 +950,17 @@ class Gate:
             else:
                 why = "on an overlay, with no region reported at the time"
 
-            suppressed = bool(event.get("suppressed"))
             record = {
                 "at": time.strftime("%H:%M:%S"),
                 "target": str(event.get("target"))[:120],
                 "on_canvas": on_canvas,
                 "at_point": [event.get("x"), event.get("y")],
                 "in_reported_region": in_region,
-                # Whether a menu actually reached the user. `suppressed` is our own
-                # doing; `menu_shown` is the outcome, and stays true if something raised
-                # one anyway — which is the only way to tell suppression is working
-                # rather than merely being attempted.
-                "suppressed": suppressed,
-                "suppressed_why": event.get("suppressedWhy"),
+                # Whether a menu actually reached the user, vs. something on the page
+                # — most likely Onshape's own canvas menu — calling preventDefault.
+                # Nothing here suppresses anything any more: neither mouse ever
+                # produces OS-level input, so there is nothing left to protect
+                # Chrome's own menu from. See extension/content.js's history.
                 "menu_shown": not event.get("prevented", False),
                 "drag_px": event.get("dragPx"),
                 "ctrl_held": event.get("ctrl"),
@@ -1040,8 +974,7 @@ class Gate:
                 self._context_menus.append(record)
                 del self._context_menus[:-CONTEXT_MENU_HISTORY]
 
-            outcome = "SUPPRESSED" if suppressed else (
-                "menu shown" if record["menu_shown"] else "handled by the page")
+            outcome = "menu shown" if record["menu_shown"] else "handled by the page"
             log(f"context menu [{outcome}]: {why} | target={record['target']} "
                 f"at={record['at_point']} drag={record['drag_px']}px")
 
@@ -1079,15 +1012,13 @@ class Gate:
         state["platform"] = backend.name
         state["code"] = SOURCE_HASH
         state["pan_idle_release_ms"] = round(PAN_IDLE_RELEASE * 1000)
-        state["pan_recenter"] = RECENTER and POINTER.ok
-        state["pan_recenter_margin_px"] = RECENTER_MARGIN
-        state["pan_yield_to_other_mice"] = PAN_YIELD
         state["pan_deadzone_px"] = PAN_DEADZONE
-        state["pan_yield_deadzone_px"] = PAN_YIELD_DEADZONE
         state["pan_requires_right_button"] = PAN_REQUIRES_RIGHT_BUTTON
         state["rotate_scale"] = ROTATE_SCALE
         state["left_click_key"] = LEFT_CLICK_KEY
         state["device_attached"] = translator is not None
+        state["channel_connected"] = CHANNEL.connected
+        state["seconds_since_channel_send"] = CHANNEL.seconds_since_send()
         if translator is not None:
             state.update(translator.snapshot())
         return state
@@ -1142,16 +1073,6 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-def _inside(rect, position):
-    """Was `position` within `rect`? None when either is unknown, which is itself worth
-    recording — "we had no idea where the cursor was" is a different diagnosis from
-    "the cursor was outside the view"."""
-    if rect is None or position is None:
-        return None
-    x, y, w, h = rect
-    return x <= position[0] < x + w and y <= position[1] < y + h
-
-
 def parse_rect(raw):
     """-> (x, y, w, h) or None. Comes off the network, so validate rather than trust."""
     if not isinstance(raw, dict):
@@ -1169,6 +1090,10 @@ def serve():
     HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
+def serve_channel():
+    CHANNEL.serve_forever()
+
+
 def pan_timer():
     last_geometry_refresh = 0.0
     while True:
@@ -1184,12 +1109,13 @@ def pan_timer():
 
 
 def install_signal_handlers():
-    """Lift whatever is held before the process goes away.
-
-    The synthetic button and Ctrl outlive us: they are pressed in the real input
-    stream, so nothing releases them on our behalf. The `finally` in main() covers an
-    ordinary exit, and these cover the ways a service gets stopped. A hard kill still
-    cannot be caught anywhere — `clear_stale_holds` is what cleans up after one.
+    """Tell the extension whatever gesture was open is over before the process goes
+    away, on a best-effort basis — an ordinary stop, not the fail-closed path a
+    crash or a dropped channel already covers on its own. The `finally` in main()
+    covers a normal exit; these cover the ways a service gets stopped. A hard kill
+    still cannot be caught anywhere, but there is nothing left for it to strand:
+    with no OS-level device ever written to, there is no button state a kill can
+    leave stuck.
     """
     def bail(signum, _frame):
         translator = GATE.translator
@@ -1211,34 +1137,8 @@ def install_signal_handlers():
             pass            # not the main thread, or not supported here
 
 
-def clear_stale_holds(ui, modifier):
-    """Undo a previous run that was killed outright while holding something.
-
-    A button-up nobody pressed is ignored, so this is safe to do unconditionally —
-    and it turns "my right button is stuck down" into "restart the service".
-    """
-    try:
-        ui.write(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0)
-        ui.syn()
-        if modifier is not None:
-            modifier.write(ecodes.EV_KEY, ecodes.KEY_LEFTCTRL, 0)
-            modifier.syn()
-    except Exception as exc:
-        log(f"could not clear stale holds: {exc}")
-
-
 def watch_focus():
     backend.watch_focus(GATE.set_chrome_focused)
-
-
-def watch_other_pointers(gated_identifier):
-    def on_activity(dx=0.0, dy=0.0, immediate=False):
-        translator = GATE.translator
-        if translator is not None:
-            translator.yield_stroke(dx, dy, immediate)
-
-    backend.watch_other_pointers(gated_identifier, on_activity,
-                                 lambda: PAN_YIELD)
 
 
 DEVICE_PATH = None
@@ -1289,33 +1189,6 @@ def resolve_device(config):
     )
 
 
-def resolve_recenter(config):
-    """-> (enabled, margin_px). A typo in a hand-edited file should not stop the
-    daemon, so bad values warn and fall back."""
-    raw = config.get("pan_recenter")
-    if raw is None:
-        enabled = RECENTER
-    else:
-        enabled = raw.strip().lower() in ("1", "true", "yes", "on")
-
-    margin = RECENTER_MARGIN
-    raw_margin = config.get("pan_recenter_margin_px")
-    if raw_margin is not None:
-        try:
-            margin = int(float(raw_margin))
-        except ValueError:
-            log(f"pan_recenter_margin_px: '{raw_margin}' is not a number; "
-                f"using {RECENTER_MARGIN}")
-            margin = RECENTER_MARGIN
-        else:
-            clamped = max(0, min(600, margin))
-            if clamped != margin:
-                log(f"pan_recenter_margin_px: {margin} is outside 0-600; "
-                    f"using {clamped}")
-                margin = clamped
-    return enabled, margin
-
-
 def resolve_left_click(config):
     """-> (key_name, key_code_or_None)."""
     raw = (config.get("left_click_key") or "").strip().lower()
@@ -1340,28 +1213,6 @@ def resolve_deadzone(config):
     if clamped != value:
         log(f"pan_deadzone_px: {value} is outside 0-500; using {clamped}")
     return clamped
-
-
-def resolve_yield_deadzone(config):
-    raw = config.get("pan_yield_deadzone_px")
-    if raw is None:
-        return PAN_YIELD_DEADZONE
-    try:
-        value = int(float(raw))
-    except ValueError:
-        log(f"pan_yield_deadzone_px: '{raw}' is not a number; using {PAN_YIELD_DEADZONE}")
-        return PAN_YIELD_DEADZONE
-    clamped = max(0, min(500, value))
-    if clamped != value:
-        log(f"pan_yield_deadzone_px: {value} is outside 0-500; using {clamped}")
-    return clamped
-
-
-def resolve_yield(config):
-    raw = config.get("pan_yield_to_other_mice")
-    if raw is None:
-        return PAN_YIELD
-    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def resolve_rotate_scale(config):
@@ -1410,61 +1261,60 @@ def resolve_pan_idle(config):
     return clamped / 1000.0
 
 
+def _on_channel_disconnect():
+    translator = GATE.translator
+    if translator is not None:
+        translator.channel_disconnected()
+
+
+def _on_channel_connect():
+    # A fresh connection — first load, or a reconnect after the service worker was
+    # suspended — has missed every "gate" message sent while it was gone. Without
+    # this, a reconnect while the gate happens to be open would leave the page
+    # showing the real cursor indefinitely, since nothing tells it otherwise until
+    # the next actual transition.
+    CHANNEL.send({"type": "gate", "open": GATE.is_open()})
+
+
 def main():
-    global DEVICE_PATH, PAN_IDLE_RELEASE, RECENTER, RECENTER_MARGIN, PAN_YIELD
-    global PAN_DEADZONE, PAN_YIELD_DEADZONE, PAN_REQUIRES_RIGHT_BUTTON
+    global DEVICE_PATH, PAN_IDLE_RELEASE
+    global PAN_DEADZONE, PAN_REQUIRES_RIGHT_BUTTON
     global LEFT_CLICK_KEY, LEFT_CLICK_CODE, ROTATE_SCALE
     _open_log()
     config = read_config()
     DEVICE_PATH = resolve_device(config)
     PAN_IDLE_RELEASE = resolve_pan_idle(config)
-    RECENTER, RECENTER_MARGIN = resolve_recenter(config)
-    PAN_YIELD = resolve_yield(config)
     PAN_DEADZONE = resolve_deadzone(config)
-    PAN_YIELD_DEADZONE = resolve_yield_deadzone(config)
     PAN_REQUIRES_RIGHT_BUTTON = resolve_pan_button(config)
     LEFT_CLICK_KEY, LEFT_CLICK_CODE = resolve_left_click(config)
     ROTATE_SCALE = resolve_rotate_scale(config)
 
-    # Must happen before any window rect is read: on Windows an un-declared process
-    # gets virtualised coordinates from GetWindowRect while the cursor answers in
-    # physical ones, and recentring then warps somewhere unrelated.
+    # Kept even though recentring is gone: window rects still matter for the pan
+    # press's view-region check, and per-monitor DPI awareness is what keeps that
+    # rect in the same coordinate space as everything else on Windows.
     log(f"coordinate space: {backend.declare_dpi_aware()}")
     install_signal_handlers()
 
+    CHANNEL.on_disconnect = _on_channel_disconnect
+    CHANNEL.on_connect = _on_channel_connect
     threading.Thread(target=serve, daemon=True).start()
+    threading.Thread(target=serve_channel, daemon=True).start()
     threading.Thread(target=watch_focus, daemon=True).start()
     threading.Thread(target=pan_timer, daemon=True).start()
-    threading.Thread(target=watch_other_pointers, args=(DEVICE_PATH,),
-                     daemon=True).start()
-    recentring = (f"recentre at {RECENTER_MARGIN}px"
-                  if RECENTER and POINTER.ok else "recentring off")
     pan_trigger = ("hold the right button to pan, move to rotate"
                    if PAN_REQUIRES_RIGHT_BUTTON else
                    "move to pan, hold the right button to rotate")
-    log(f"listening on 127.0.0.1:{PORT}, gating {DEVICE_PATH} "
+    log(f"listening on 127.0.0.1:{PORT}, channel on 127.0.0.1:{CHANNEL_PORT}, "
+        f"gating {DEVICE_PATH} "
         f"({pan_trigger}, dead zone {PAN_DEADZONE}px, "
-        f"yield dead zone {PAN_YIELD_DEADZONE}px, "
         f"idle release {PAN_IDLE_RELEASE * 1000:.0f}ms, "
-        f"rotate scale {ROTATE_SCALE:g}, "
-        f"{recentring}, backend {backend.name})")
+        f"rotate scale {ROTATE_SCALE:g}, backend {backend.name})")
 
     while True:
         dev = None
-        ui = None
-        modifier = None
         try:
             dev = backend.open_gated_device(DEVICE_PATH)
-            ui = backend.VirtualOutput(dev.template)
-
-            # Ctrl lives on this device, so panning cannot work without it.
-            modifier = backend.modifier_output()
-            if modifier is None:
-                raise SystemExit(
-                    "cannot create the Ctrl device, so Ctrl+right-drag panning is "
-                    "impossible; see the error above")
-            clear_stale_holds(ui, modifier)
-            translator = Translator(ui, modifier)
+            translator = Translator(CHANNEL)
             GATE.translator = translator
             log(f"grabbed {dev.name}")
             for event in dev.events():
@@ -1483,8 +1333,9 @@ def main():
         finally:
             translator = GATE.translator
             GATE.translator = None
-            # Anything still held has to come up before the device is handed back,
-            # or the mouse returns to normal with a button stuck down.
+            # Tell the extension whatever gesture was open is over. Nothing here can
+            # leave a real button held: the device is captured exclusively but never
+            # written to, so handing it back returns the mouse to normal outright.
             if translator is not None:
                 try:
                     translator.release_all()
@@ -1495,12 +1346,6 @@ def main():
                     dev.close()
                 except Exception:
                     pass
-            for handle in (ui, modifier):
-                if handle is not None:
-                    try:
-                        handle.close()
-                    except Exception:
-                        pass
 
 
 if __name__ == "__main__":

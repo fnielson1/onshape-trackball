@@ -21,9 +21,7 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/onshape-trackball"
 CONFIG_FILE="$CONFIG_DIR/config"
 LEGACY_DEVICE_FILE="$CONFIG_DIR/device"
 DEFAULT_PAN_IDLE_MS=150
-DEFAULT_RECENTER_MARGIN=35
 DEFAULT_DEADZONE_PX=20
-DEFAULT_YIELD_DEADZONE_PX=20
 UDEV_RULE="/etc/udev/rules.d/99-onshape-mouse.rules"
 UNIT_NAME="onshape-mouse-gate.service"
 UNIT_PATH="$HOME/.config/systemd/user/$UNIT_NAME"
@@ -226,73 +224,17 @@ EOF
 # dead zone, and a nudge that goes nowhere expires rather than banking toward the
 # next one.
 #
-# Panning only. Rotating, zooming and the left button are unaffected, and the cursor
-# keeps tracking your hand throughout — it just is not panning yet.
+# Panning only. Rotating, zooming and the left button are unaffected.
 #
 # Accepted range 0-500; 0 starts panning on the first movement.
 pan_deadzone_px = $DEFAULT_DEADZONE_PX
-EOF
-      ;;
-    pan_recenter)
-      cat <<EOF
-
-# Panning drags the real cursor, so a long sweep runs out of screen and the pan
-# dies. With recentring on, the cursor is warped back to the middle of the view
-# whenever it comes within pan_recenter_margin_px of an edge, making a pan
-# effectively unlimited. The pan button is briefly lifted around the warp so the
-# jump is not read as one huge pan.
-#
-# The edge is the usable 3D view's edge, not the Chrome window's. The extension
-# probes the page to find the region that genuinely belongs to the view — the canvas
-# minus the controls Onshape stacks on top of it — and the daemon pens the cursor
-# inside that. This is what keeps the cursor off the feature tree and the tool
-# strips, which are ordinary DOM elements and so do not suppress Chrome's context
-# menu the way the canvas does. If the extension stops reporting, it falls back to
-# the whole window after a few seconds.
-#
-# Set pan_recenter to false to get the old behaviour: pan until you hit the edge,
-# then lift and reposition.
-pan_recenter = true
-pan_recenter_margin_px = $DEFAULT_RECENTER_MARGIN
-EOF
-      ;;
-    pan_yield_to_other_mice)
-      cat <<EOF
-
-# Both mice drive one shared X11 pointer, so while a pan stroke is live the held
-# pan button applies to whatever your other mouse does too: its motion pans, and
-# its wheel arrives as wheel-with-button-held instead of a clean scroll.
-#
-# With this on, the other mice are watched read-only (never grabbed, so they keep
-# working normally) and any activity on one drops the pan stroke immediately.
-# Panning resumes shortly after they go quiet.
-#
-# Turn it off if resting your hand on the other mouse interrupts panning too eagerly.
-pan_yield_to_other_mice = true
-EOF
-      ;;
-    pan_yield_deadzone_px)
-      cat <<EOF
-
-# How far the *other* mouse must travel before its motion counts as deliberate and
-# drops the pan or rotate the gated mouse is holding.
-#
-# Net displacement, measured the same way as pan_deadzone_px. Below this, resting a
-# hand on the other mouse or bumping it in passing does not interrupt the stroke. A
-# button press or a wheel turn on it always interrupts immediately, regardless of
-# this setting — neither happens by accident.
-#
-# Accepted range 0-500; 0 yields on the very first movement, which was the only
-# behaviour before this setting existed.
-pan_yield_deadzone_px = $DEFAULT_YIELD_DEADZONE_PX
 EOF
       ;;
   esac
 }
 
 CONFIG_KEYS=(device left_click_key pan_requires_right_button pan_deadzone_px
-             pan_idle_release_ms pan_recenter pan_yield_to_other_mice
-             pan_yield_deadzone_px)
+             pan_idle_release_ms)
 
 # Creates the config on first run, carrying over a device chosen under the older
 # single-purpose "device" file so an existing install is not disturbed.
@@ -347,7 +289,6 @@ configured_device() {
 device_configured() { [[ -n "$(configured_device || true)" ]]; }
 
 configured_pan_ms() { config_get pan_idle_release_ms || printf '%s' "$DEFAULT_PAN_IDLE_MS"; }
-configured_recenter_margin() { config_get pan_recenter_margin_px || printf '%s' "$DEFAULT_RECENTER_MARGIN"; }
 
 mouse_name() {
   "$REPO_DIR/pick-mouse.py" --list 2>/dev/null \
@@ -386,14 +327,11 @@ daemon_settings_current() {
   daemon_up || return 1
   [[ "$(status_field device 2>/dev/null || true)" == "$(configured_device)" ]] || return 1
   [[ "$(status_field pan_idle_release_ms 2>/dev/null || true)" == "$(configured_pan_ms)" ]] || return 1
-  [[ "$(status_field pan_recenter_margin_px 2>/dev/null || true)" == "$(configured_recenter_margin)" ]] || return 1
   [[ "$(status_field left_click_key 2>/dev/null || true)" == "$(config_get left_click_key || printf 'space')" ]] || return 1
   [[ "$(status_field pan_deadzone_px 2>/dev/null || true)" == "$(config_get pan_deadzone_px || printf '%s' "$DEFAULT_DEADZONE_PX")" ]] || return 1
-  [[ "$(status_field pan_yield_deadzone_px 2>/dev/null || true)" == "$(config_get pan_yield_deadzone_px || printf '%s' "$DEFAULT_YIELD_DEADZONE_PX")" ]] || return 1
   # pan_requires_right_button is not checked here: status_field prints a JSON
   # boolean through Python's str(), which renders True/False rather than the
-  # lowercase true/false the config file and setup_helper.py's own drift check use
-  # — the same reason pan_recenter and pan_yield_to_other_mice are absent above.
+  # lowercase true/false the config file and setup_helper.py's own drift check use.
 }
 
 status_field() {
@@ -471,7 +409,7 @@ show_status() {
   fi
 
   if [[ -f $CONFIG_FILE ]]; then
-    ok "config file present (pan idle $(configured_pan_ms) ms, recentre margin $(configured_recenter_margin) px)"
+    ok "config file present (pan idle $(configured_pan_ms) ms)"
     note "$CONFIG_FILE"
   else
     todo "config file not created yet"

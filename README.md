@@ -18,8 +18,16 @@ under [Configuration](#configuration). Rotate's sensitivity is configurable too 
 ## How it works
 
 The daemon grabs the chosen mouse exclusively, so the desktop never sees the real
-device, and replays its events onto a synthetic one — but only while the gate is
-open. The gate needs **two** signals to agree:
+device — but nothing it decides ever reaches the OS as real input. Every translated
+action (rotate, pan, zoom, clear-selection) is instead sent over a small local
+WebSocket channel to a Chrome extension, which dispatches the matching **untrusted**
+DOM event directly on Onshape's canvas or page — a plain `MouseEvent`/`WheelEvent`/
+`KeyboardEvent` built and fired by a content script, not a synthetic hardware
+event. Confirmed live: Chrome never raises its own context menu in response to
+synthetic dispatch, even for a drag well under the size that would trigger one from
+real hardware, so there is no OS-level side effect left to work around.
+
+This runs only while the gate is open. The gate needs **two** signals to agree:
 
 - **The desktop** says the focused window belongs to Chrome, tracked event-driven
   rather than polled.
@@ -32,22 +40,23 @@ extension's MV3 service worker gets suspended while Chrome sits in the backgroun
 Window titles were ruled out early — Onshape's sign-in page is titled just "Sign
 in", and document tabs are named after the document.
 
-Both halves are platform-specific, and everything above them is not. `gate.py` holds
-the translator, the gate and the config; `backend_linux.py` and `backend_windows.py`
-hold the four things that genuinely differ:
+Both halves of the gate are platform-specific, and everything above them is not.
+`gate.py` holds the translator, the channel, the gate and the config; `backend_linux.py`
+and `backend_windows.py` hold only what genuinely differs — capturing the mouse and
+tracking focus. Translated output is identical on both, since it never touches the
+OS at all:
 
 | | Linux | Windows |
 | --- | --- | --- |
 | Exclusive grab | `EVIOCGRAB` | Interception driver |
-| Synthetic output | two `uinput` devices | Interception send, `SendInput` for keys |
-| Cursor | `XQueryPointer` / `XWarpPointer` | `GetCursorPos` / `SetCursorPos` |
 | Focus | `xprop -root -spy` | `SetWinEventHook` |
 | Service | systemd user unit | scheduled task |
 
-Pan is synthesised as Ctrl + right-drag — one of Onshape's two documented pan
-gestures. The other, middle-drag, is deliberately unused: panning presses the same
-button repeatedly, and two presses inside the double-click window are a double
-middle-click, which Onshape reads as Zoom to Fit.
+Pan is synthesised as a Ctrl-tagged right-drag — one of Onshape's two documented pan
+gestures — with `ctrlKey` set directly on the synthetic event rather than coming from
+a real held key. The other pan gesture, middle-drag, is deliberately unused: panning
+presses the same button repeatedly, and two presses inside the double-click window
+are a double middle-click, which Onshape reads as Zoom to Fit.
 
 One of pan and rotate is driven by the right button being physically held —
 bracketed by its own press and release, so it needs no further help — and the other
@@ -58,23 +67,42 @@ A mouse never reports "I stopped moving", so whichever gesture bare motion drive
 ends on a timeout instead of a release — see `pan_idle_release_ms` below.
 
 Because the motion-driven gesture holds the right button down and drags it, whatever
-sits under the pointer receives that press and that release. On the canvas that is
-pan or rotate as configured; on any ordinary DOM element it is a context menu, or a
-toolbar button being clicked. So the content script reports the region that is
-*verified* to be 3D view and nothing else, and the cursor is penned inside it. It
-finds that region by hit-testing a coarse grid to discover which elements overlay the
-canvas, measuring each one exactly, and then solving for the largest overlay-free
-rectangle — which is what catches the things that float over the middle of the view,
-like the view cube and the context toolbar, as well as the chrome anchored to its
-edges.
+the extension dispatches it onto receives that press and that release. On the canvas
+that is pan or rotate as configured; on any ordinary DOM element it would be a
+context menu, or a toolbar button being clicked. So the content script only ever
+dispatches onto the region that is *verified* to be 3D view and nothing else, and the
+gesture simply refuses to start without one. It finds that region by hit-testing a
+coarse grid to discover which elements overlay the canvas, measuring each one
+exactly, and then solving for the largest overlay-free rectangle — which is what
+catches the things that float over the middle of the view, like the view cube and the
+context toolbar, as well as the chrome anchored to its edges.
 
 When no such region can be found — a dialog covering the view, the content script not
-running — the daemon **refuses to pan** and releases the button if a stroke is already
-open. There is deliberately no fallback to the canvas's own rect or to the Chrome
-window: both of those contain the very elements the region exists to stay off.
+running — the daemon **refuses to pan** and ends the stroke if one is already open.
+There is deliberately no fallback to the canvas's own rect or to the Chrome window:
+both of those contain the very elements the region exists to stay off.
 
-It **fails closed**: if the daemon or extension stops, the mouse goes dead rather
-than becoming unrestricted.
+It **fails closed**: if the daemon, the extension, or the channel between them stops,
+the mouse goes dead rather than becoming unrestricted. There is no fallback path any
+more — the earlier design behind this project fell back to real OS-level injection
+when the channel was unavailable, but that is exactly the failure class the channel
+exists to remove, so losing the channel now means losing rotate/pan/zoom/clear-selection
+entirely until it reconnects, not a degraded version of them. `curl -s
+localhost:47653/status` reports `channel_connected` and
+`seconds_since_channel_send` for exactly this.
+
+### Two cursors
+
+Neither mouse ever moves the real, system cursor: the gated mouse never did (its
+motion only ever became rotate/pan on the canvas, or a key tap, or a wheel event),
+and now the channel means it does not even move it as a side effect. So both mice
+get a cursor of their own on the page, drawn by the extension while the gate is
+open: a small dot for the gated mouse's own virtual position, and another,
+differently-coloured one for whatever the real system cursor is currently doing —
+the extension tells the two apart by `event.isTrusted`, since everything it
+dispatches itself is untrusted by construction. The real cursor glyph is hidden
+(`cursor: none`) for the same window, so there is only ever one visible pointer
+where you are actually looking.
 
 ## Requirements
 
@@ -214,7 +242,8 @@ interprets it for you.
 | Mouse completely dead | `gate_open` — needs `chrome_focused` **and** `onshape_tab` |
 | Gate never opens | `seconds_since_extension_push` is `null` → extension not loaded |
 | Mouse works everywhere | Daemon not running, so nothing is grabbing it |
-| Cursor strays onto the feature tree while navigating | `canvas_diag.v` is below 7 → Chrome is running a stale content script. **Reload the extension** at `chrome://extensions`, then **reload the Onshape tab** — Chrome does not inject content scripts into pages that were already open when the extension was loaded |
+| Gate is open but nothing happens — no rotate, pan, zoom or clear-selection | `channel_connected` is `false` → the extension's WebSocket to the daemon is down. Most often the extension's service worker was suspended by Chrome; it should reconnect within a second or two of any activity (switching tabs, moving the mouse over an Onshape tab). If it does not, reload the extension |
+| Cursor strays onto the feature tree while navigating, or a gesture opens on a toolbar | `canvas_diag.v` is below 8 → Chrome is running a stale content script. **Reload the extension** at `chrome://extensions`, then **reload the Onshape tab** — Chrome does not inject content scripts into pages that were already open when the extension was loaded |
 | Motion does not pan or rotate, everything else works | `canvas_rect` is `null` → no verified view region, so the motion-driven gesture is refused on purpose. Either the content script is not running (see above) or something is covering the view |
 | Motion does not pan | Onshape's `View manipulation` preference must accept Ctrl + right-drag |
 | A context menu opened while panning or rotating | `context_menus` — see below |
@@ -222,53 +251,55 @@ interprets it for you.
 
 ### A context menu opened while panning or rotating
 
-This one leaves no trace on its own: the menu is browser UI rather than anything in the
-page, and by the time you have seen it the state that caused it is gone. So the content
-script reports every `contextmenu` event as it fires, and the daemon records it next to
-what it was doing at that instant. Newest first:
+Nothing here suppresses a menu any more — see below — so this is diagnostic only,
+for tracking down *why* one appeared. It leaves no trace on its own: the menu is
+browser UI rather than anything in the page, and by the time you have seen it the
+state that caused it is gone. So the content script reports every `contextmenu`
+event as it fires, and the daemon records it next to what it was doing at that
+instant. Newest first:
 
 ```bash
 curl -s localhost:47653/status | python3 -c "import sys,json;[print(e['at'],'|',e['why'],'|',e['target']) for e in json.load(sys.stdin)['context_menus']]"
 ```
 
-Each entry carries a `why`, and the four causes need different fixes:
+Each entry carries a `why`:
 
-| `why` says | Meaning | What to do |
-| --- | --- | --- |
-| on an overlay **INSIDE** the region we reported safe | The probe missed something. `target` names the element it missed | Raise `DISCOVERY_COLS`/`DISCOVERY_ROWS` in `content.js` — the overlay was smaller than the sample spacing |
-| on an overlay **outside** the region | The cursor got somewhere it should not have been: a recentre that did not keep up with a fast flick, or a press that landed before one | Raise `RECENTER_MARGIN`, or lower `RECENTER_CHECK_INTERVAL` |
-| **on the canvas** | Chrome's own menu is already covered — rotate's release tags itself with Ctrl, checked before this. This `why` is about *Onshape's own* canvas menu instead: it opens straight out of Onshape's mouseup handling, ignores Ctrl, and just wants real on-screen distance | Nothing here; it is Onshape's behaviour |
-| **not during a pan** | Not this mouse at all — the other mouse, or a real right-click | Nothing |
+| `why` says | Meaning |
+| --- | --- |
+| on an overlay **INSIDE** the region we reported safe | The probe missed something — `target` names the element it missed. Raise `DISCOVERY_COLS`/`DISCOVERY_ROWS` in `content.js`; the overlay was smaller than the sample spacing |
+| on an overlay **outside** the region | The *other* mouse's own real right-click landed on an overlay — expected, not a bug: only the reported region is ever verified safe |
+| **on the canvas** | Most likely Onshape's own canvas menu, reacting to our synthetic dispatch — it opens straight out of Onshape's own mouseup handling and is not suppressed by anything here |
+| **not during a pan** | Not this mouse at all — the other mouse's real right-click, or Menu-key/Shift+F10 |
 
-`menu_shown` separates the menu you actually saw from one that was suppressed or that
-Onshape handled itself, and `in_reported_region` plus `at_point` say exactly where it
-landed relative to the region the daemon had been given.
+`menu_shown` says whether a menu actually reached the user, vs. something on the
+page (most likely Onshape's own canvas menu) calling `preventDefault`, and
+`in_reported_region` plus `at_point` say exactly where it landed relative to the
+region the daemon had been given.
 
 ### Stopping them
 
-The content script also suppresses these outright, and `suppressed` on each report says
-whether it did. It cannot key on *which* mouse — both drive one cursor, and the page
-cannot tell their events apart — so it keys on the shape of the gesture instead. Two
-marks give a pan away, and neither is true of a hand opening a menu:
+Nothing does, deliberately, and that is new: an earlier version of this project
+suppressed `contextmenu` outright, keyed on the shape of the gesture (`ctrlKey`
+still set, or the button dragged past a few pixels) to tell the gated mouse's own
+pan/rotate apart from a genuine right-click — because the gated mouse's gestures
+used to be injected as *real*, OS-trusted input, indistinguishable from hardware,
+and Chrome would raise its own menu for them the same as it would for a real
+right-drag.
 
-- **Ctrl is still down.** The daemon releases the button first and drops Ctrl a
-  `MODIFIER_SETTLE` later, so a menu raised by a pan always arrives with `ctrlKey` set.
-  This holds even when the drag was too short to look like one — the case distance
-  alone cannot catch.
-- **The button was dragged**, by at least `SUPPRESS_DRAG_PX` (5). This covers the
-  rotate half of the gesture, where Ctrl has deliberately been dropped.
-
-A right-click that is genuinely a click — no Ctrl, no travel — matches neither and is
-left completely alone, as are the keyboard routes (Menu key, Shift+F10), which raise a
-`contextmenu` with no mousedown before it. Set `SUPPRESS_CONTEXT_MENU = false` in
-`content.js` to go back to reporting without suppressing.
-
-The one gesture this does take away is a deliberate **Ctrl + right-click**, which in
-Onshape is the pan gesture rather than anything you would want a menu from.
+That is no longer true of anything here. Every translated action goes out as an
+**untrusted** synthetic DOM event — confirmed live, Chrome never raises its own
+context menu in response to one, even for a drag well under the size that would
+trigger it from real hardware. The gated mouse cannot produce a real Chrome context
+menu any more, on purpose or by accident, so there is nothing left for suppression
+to protect against — and keeping the old heuristic around would only risk
+swallowing the *other* mouse's own genuine right-clicks, which is a worse bug than
+the one it used to fix. `content.js`'s `mousedown`/`mouseup`/`mousemove` tracking
+now explicitly excludes this extension's own synthetic dispatch via
+`event.isTrusted`, so what little of the old tracking remains (`dragPx`, `ctrl` in
+the table above) describes only the other mouse's real activity.
 
 You cannot click *into* Onshape with the gated mouse — it is inert until Onshape is
-already frontmost, so focus the window with your other mouse first. Both mice also
-share one cursor; the gated one simply stops contributing motion outside Onshape.
+already frontmost, so focus the window with your other mouse first.
 
 ## Uninstall
 
@@ -291,15 +322,15 @@ extension yourself at `chrome://extensions`.
 | `setup.sh` | Linux installer, status board, reconfigure, uninstall |
 | `setup.cmd` | The same on Windows |
 | `setup_helper.py` | What `setup.cmd` delegates JSON, HTTP and enumeration to |
-| `gate.py` | The daemon: translator, gate, config, status server |
+| `gate.py` | The daemon: translator, the WebSocket channel, gate, config, status server |
 | `backend.py` | Picks a platform backend and defines the interface |
-| `backend_linux.py` | evdev/uinput capture, libX11 cursor, `xprop` focus |
-| `backend_windows.py` | Interception capture, Win32 cursor, focus and Raw Input |
+| `backend_linux.py` | evdev exclusive capture, `xprop` focus |
+| `backend_windows.py` | Interception exclusive capture, focus and Raw Input |
 | `interceptor.py` | ctypes binding for `interceptor.dll` |
 | `codes.py` | Input event constants, so the core needs no evdev |
 | `pick-mouse.py` | Lists mice, or detects one by movement (Linux) |
-| `extension/` | Chrome MV3 extension reporting the active tab |
-| `test_translator.py` | Pan/rotate state machine, recentring, view-region fail-closed |
+| `extension/` | Chrome MV3 extension: reports the active tab, relays the channel, and dispatches every synthetic gesture |
+| `test_translator.py` | Pan/rotate state machine, channel messages, view-region fail-closed |
 | `test_config.py` | Config parsing, clamping, fallbacks |
 | `test_probe.js` | The content script's view-region probe, against simulated layouts |
 

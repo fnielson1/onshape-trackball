@@ -94,18 +94,6 @@ const POINTER_CHECK_INTERVAL = 30;
 // Bounded, because it is keyed on live elements and this page runs for hours.
 const MAX_POINTER_HITS = 32;
 
-// Suppress the menu outright rather than only reporting it. Set false to go back to
-// diagnosis alone; reports carry `suppressed` either way, so nothing goes dark.
-const SUPPRESS_CONTEXT_MENU = true;
-
-// What separates a gesture from a click, for a release with no Ctrl on it. Ctrl is
-// the primary signal now — see suppressionReason() below — because the daemon tags
-// every one of its own releases with it, rotate included, rather than manufacturing
-// travel for us to measure. This stays as the fallback for a release that arrives
-// with neither: a hand opening a menu moves a pixel or two at most, so anything past
-// this came from a drag rather than a click.
-const SUPPRESS_DRAG_PX = 5;
-
 let offset = null;
 let pointerHits = new Set();
 // The last region we reported, in viewport coordinates. The daemon gets it in
@@ -113,38 +101,40 @@ let pointerHits = new Set();
 let lastSafeViewport = null;
 let lastPointerCheck = 0;
 
-// Where the right button went down, and the furthest the cursor has been from it since.
-// Measured from the press rather than accumulated along the path, so a stroke that
-// wanders out and back still counts as the drag it was.
-//
-// The button state cannot simply be cleared on mouseup: Windows dispatches contextmenu
-// *after* the release, so clearing there would erase the evidence a moment before it is
-// needed. It is kept, with the time of the last transition, and only counted as current
-// while the button is down or just after — long enough for the menu that follows a
-// release, short enough that a Menu-key press minutes later is not blamed on it.
-const RIGHT_BUTTON_GRACE = 500;
-
+// Where the right button went down, and the furthest the cursor has been from it since
+// — purely diagnostic now (the `dragPx` field on a contextmenu report below), so a
+// human reading --status can tell a real drag from a real click. Measured from the
+// press rather than accumulated along the path, so a stroke that wanders out and back
+// still counts as the drag it was.
 let rightDownAt = null;
 let rightDragMax = 0;
-let rightDown = false;
-let lastRightActivity = 0;
+
+// isTrusted excludes this extension's own synthetic dispatch (see the gesture
+// synthesis section near the end of this file) from all three listeners below. This
+// used to matter for suppression too — Chrome could raise its own context menu from
+// the gated mouse's real, OS-injected Ctrl+right-drag, and untangling "our gesture"
+// from "a genuine right-click" needed exactly this kind of tracking. Nothing here is
+// OS-level input any more, on either mouse, so that whole mechanism (and the
+// suppression it drove) is gone — see README's "Stopping them" section for why. What
+// is left is diagnostic only.
 
 addEventListener("mousedown", event => {
-  if (event.button !== 2) return;
+  if (!event.isTrusted || event.button !== 2) return;
   rightDownAt = { x: event.clientX, y: event.clientY };
   rightDragMax = 0;
-  rightDown = true;
-  lastRightActivity = Date.now();
-}, { capture: true, passive: true });
-
-addEventListener("mouseup", event => {
-  if (event.button !== 2) return;
-  rightDown = false;
-  lastRightActivity = Date.now();
 }, { capture: true, passive: true });
 
 addEventListener("mousemove", event => {
+  if (!event.isTrusted) {
+    // Not nothing, though: this is the gated mouse's own virtual position, and
+    // it is what the other mouse's on-page icon needs telling apart from — see
+    // gcOtherIcon below.
+    return;
+  }
+
   offset = { x: event.screenX - event.clientX, y: event.screenY - event.clientY };
+
+  if (gcActive && gcOtherIcon) gcPositionIcon(gcOtherIcon, event.clientX, event.clientY);
 
   // Before the throttle below: the drag has to be measured on every move, not on the
   // one-in-thirty that the region probe cares about.
@@ -173,9 +163,9 @@ addEventListener("mousemove", event => {
 
 // A context menu is browser UI, not DOM, so there is nothing to find after the fact —
 // by the time you see it, what caused it is gone. But the page gets the `contextmenu`
-// event first, and that event knows everything worth knowing: where it fired, what it
-// fired on, and whether anyone suppressed it. Reported so the daemon can line it up
-// against what it was doing at that instant.
+// event first, and that event knows everything worth knowing: where it fired and what
+// it fired on. Reported so the daemon can line it up against what it was doing at
+// that instant — purely diagnostic now, see the note above the mousedown listener.
 function describe(element) {
   if (!element) return "(none)";
   if (element.nodeType !== 1) return String(element.nodeName || "(node)");
@@ -191,47 +181,9 @@ function describe(element) {
   return out.slice(0, 120);
 }
 
-// Why this can be decided here, with no word from the daemon: the two things that mark
-// a menu as ours are both on the event itself.
-//
-//   Ctrl is still down. The daemon releases the button first and only drops Ctrl a
-//   MODIFIER_SETTLE later, so every menu raised by a pan arrives with ctrlKey set. That
-//   holds even when the drag was too short to look like a drag, which is the one case
-//   distance alone cannot catch.
-//
-//   The button was dragged. Covers the rotate half of the gesture, where Ctrl has
-//   deliberately been dropped, and anything else that releases the button on the move.
-//
-// A right-click that is genuinely a click — no Ctrl, no travel — matches neither and is
-// left completely alone, which matters because both mice share one cursor and the page
-// has no way to tell them apart. Suppression keys on the shape of the gesture instead,
-// and a human clicking for a menu does not make that shape.
-//
-// Requiring a right-button press first also leaves the keyboard routes (Menu key,
-// Shift+F10) untouched: they raise a contextmenu with no mousedown before it.
-function suppressionReason(event) {
-  if (!SUPPRESS_CONTEXT_MENU) return null;
-  if (!rightDownAt) return null;
-  if (!rightDown && Date.now() - lastRightActivity > RIGHT_BUTTON_GRACE) return null;
-  if (event.ctrlKey) return "ctrl held — the pan gesture still had its modifier down";
-  if (rightDragMax >= SUPPRESS_DRAG_PX) {
-    return `right button dragged ${Math.round(rightDragMax)}px — a gesture, not a click`;
-  }
-  return null;
-}
-
 addEventListener("contextmenu", event => {
   const canvas = biggestCanvas();
   const region = lastSafeViewport;
-  const reason = suppressionReason(event);
-
-  if (reason) {
-    // preventDefault stops Chrome's own menu whatever else runs afterwards, since it
-    // cannot be undone. stopPropagation is what stops Onshape's: its listeners sit on
-    // elements below this one, so cutting the event off here means they never see it.
-    event.preventDefault();
-    event.stopPropagation();
-  }
 
   const info = {
     at: Date.now(),
@@ -241,8 +193,6 @@ addEventListener("contextmenu", event => {
     target: describe(event.target),
     dragPx: Math.round(rightDragMax),
     ctrl: Boolean(event.ctrlKey),
-    suppressed: Boolean(reason),
-    suppressedWhy: reason,
     // Whether the point was inside the region we had told the daemon was safe. This is
     // what separates "our region was wrong" from "the cursor was somewhere it should
     // not have been" — two very different bugs with the same symptom.
@@ -460,9 +410,12 @@ function probe() {
   // the content script not running at all.
   const diag = {
     // Bumped whenever this file changes, so it is obvious from outside the browser
-    // whether Chrome is running the current script or a stale one. 6 added contextmenu
-    // reporting; 7 started suppressing them. Below 7 and the menus still get through.
-    v: 7,
+    // whether Chrome is running the current script or a stale one. 6 added
+    // contextmenu reporting; 7 started suppressing them; 8 dropped that suppression
+    // again — nothing here is OS-level input any more, on either mouse, so there was
+    // nothing left for it to protect against, and it risked eating the other mouse's
+    // genuine right-clicks instead. See README's "Stopping them" section.
+    v: 8,
     canvases: document.querySelectorAll("canvas").length,
     offset: Boolean(offset),
     usable: usable ? [Math.round(usable.width), Math.round(usable.height)] : null,
@@ -526,3 +479,227 @@ addEventListener("resize", markDirty);
 addEventListener("scroll", markDirty, { capture: true, passive: true });
 probe();
 send();
+
+// ===================================================================================
+// Gesture synthesis: every translated action the daemon decides on — rotate, pan,
+// zoom, clear-selection — arrives here as a channel message relayed through
+// background.js, and is dispatched as an untrusted DOM event directly on Onshape's
+// canvas or document. Nothing here is real OS-level input, and nothing here ever
+// touches the real system cursor.
+//
+// Confirmed live: Chrome never raises its own context menu in response to synthetic
+// `dispatchEvent`, even for a drag well under the old click threshold, so none of
+// the ordering/settle/nudge machinery a real synthetic release used to need applies
+// here — see the module docstring's history in gate.py for what that used to cost.
+//
+// Wheel is the one piece of this that is NOT yet confirmed against a live Onshape
+// document (see design.md's Open Questions) — the delta sign and scale below are a
+// reasonable guess, not a validated one.
+// ===================================================================================
+
+const GC_CURSOR_SIZE = 14;
+const GC_GATED_COLOR = "#2f8fff";
+const GC_OTHER_COLOR = "#ff5757";
+
+let gcActive = false;        // is the gate open?
+let gcGesture = null;        // "pan" | "rotate" | null: the currently open drag
+// The gated mouse's own position, in the same viewport coordinates lastSafeViewport
+// uses. Deliberately never clamped: dispatchEvent targets the canvas directly
+// regardless of whether these coordinates nominally fall inside its on-screen rect,
+// so unlike a real cursor there is no edge to run out of. Only the on-page *icon* is
+// clamped, below, for cosmetic reasons.
+let gcVirtual = null;
+let gcGatedIcon = null;
+let gcOtherIcon = null;
+let gcCursorNoneStyle = null;
+
+function gcMakeIcon(color) {
+  const el = document.createElement("div");
+  el.style.cssText = (
+    "position: fixed; left: 0; top: 0; width: " + GC_CURSOR_SIZE + "px; height: "
+    + GC_CURSOR_SIZE + "px; margin-left: " + (-GC_CURSOR_SIZE / 2) + "px; margin-top: "
+    + (-GC_CURSOR_SIZE / 2) + "px; border-radius: 50%; background: " + color + "; "
+    + "border: 2px solid #fff; box-shadow: 0 0 2px rgba(0,0,0,0.6); "
+    + "pointer-events: none; z-index: 2147483647; display: none;"
+  );
+  document.documentElement.appendChild(el);
+  return el;
+}
+
+function gcEnsureIcons() {
+  if (gcGatedIcon) return;
+  gcGatedIcon = gcMakeIcon(GC_GATED_COLOR);
+  gcOtherIcon = gcMakeIcon(GC_OTHER_COLOR);
+}
+
+function gcPositionIcon(el, x, y) {
+  el.style.left = x + "px";
+  el.style.top = y + "px";
+}
+
+function gcClampToSafeRect(x, y) {
+  const region = lastSafeViewport;
+  if (!region) return { x, y };
+  return {
+    x: Math.max(region.left, Math.min(region.right, x)),
+    y: Math.max(region.top, Math.min(region.bottom, y)),
+  };
+}
+
+function gcSeedPosition() {
+  const region = lastSafeViewport;
+  if (region) {
+    return { x: region.left + region.width / 2, y: region.top + region.height / 2 };
+  }
+  const canvas = biggestCanvas();
+  if (canvas) {
+    const r = canvas.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
+  return { x: innerWidth / 2, y: innerHeight / 2 };
+}
+
+// While the gate is open, the real cursor glyph is hidden and these two on-page
+// icons stand in for it: one for the gated mouse's virtual position, one for the
+// other mouse's real one. Neither mouse has ever had a real, visible cursor of its
+// own before this — both shared one — so this is what lets you see both at once.
+//
+// Not gated on document.hasFocus() the way a gesture itself is: with more than one
+// onshape.com tab open, every one of them shows the icons while the gate is open
+// anywhere, not just the frontmost tab. Cosmetic only — gcBeginGesture's own check
+// is what actually keeps a background tab from acting on a stroke.
+function gcSetActive(active) {
+  gcActive = active;
+  if (active) {
+    gcEnsureIcons();
+    if (!gcCursorNoneStyle) {
+      gcCursorNoneStyle = document.createElement("style");
+      gcCursorNoneStyle.textContent = "*{cursor:none!important}";
+    }
+    if (!gcCursorNoneStyle.parentNode) document.documentElement.appendChild(gcCursorNoneStyle);
+    if (!gcVirtual) gcVirtual = gcSeedPosition();
+    const shown = gcClampToSafeRect(gcVirtual.x, gcVirtual.y);
+    gcPositionIcon(gcGatedIcon, shown.x, shown.y);
+    gcGatedIcon.style.display = "block";
+    gcOtherIcon.style.display = "block";
+  } else {
+    // A clean release, not a direct reset: if a stroke was still open (the gate
+    // closing mid-gesture — alt-tab, focus loss), Onshape's own drag state would
+    // otherwise stay stuck open forever, with no matching mouseup ever coming.
+    gcEndGesture();
+    gcVirtual = null;
+    if (gcCursorNoneStyle && gcCursorNoneStyle.parentNode) {
+      gcCursorNoneStyle.parentNode.removeChild(gcCursorNoneStyle);
+    }
+    if (gcGatedIcon) gcGatedIcon.style.display = "none";
+    if (gcOtherIcon) gcOtherIcon.style.display = "none";
+  }
+}
+
+function gcFireMouse(canvas, type, x, y, ctrlKey) {
+  canvas.dispatchEvent(new MouseEvent(type, {
+    bubbles: true, cancelable: true, view: window,
+    clientX: x, clientY: y, screenX: x, screenY: y,
+    button: 2, buttons: type === "mouseup" ? 0 : 2, ctrlKey,
+  }));
+}
+
+function gcBeginGesture(gesture) {
+  // Guards against more than one onshape.com tab: background.js relays to every
+  // one of them, and only the tab actually in front should act on it.
+  if (!document.hasFocus()) return;
+  const canvas = biggestCanvas();
+  if (!canvas) return;
+  if (!gcVirtual) gcVirtual = gcSeedPosition();
+  gcGesture = gesture;
+  gcFireMouse(canvas, "mousedown", gcVirtual.x, gcVirtual.y, gesture === "pan");
+}
+
+function gcApplyMotion(dx, dy) {
+  if (!gcGesture || !gcVirtual) return;
+  const canvas = biggestCanvas();
+  if (!canvas) return;
+  gcVirtual = { x: gcVirtual.x + (dx || 0), y: gcVirtual.y + (dy || 0) };
+  gcFireMouse(canvas, "mousemove", gcVirtual.x, gcVirtual.y, gcGesture === "pan");
+  if (gcGatedIcon) {
+    const shown = gcClampToSafeRect(gcVirtual.x, gcVirtual.y);
+    gcPositionIcon(gcGatedIcon, shown.x, shown.y);
+  }
+}
+
+function gcEndGesture() {
+  if (!gcGesture) return;
+  const canvas = biggestCanvas();
+  if (canvas && gcVirtual) {
+    gcFireMouse(canvas, "mouseup", gcVirtual.x, gcVirtual.y, gcGesture === "pan");
+  }
+  gcGesture = null;
+}
+
+// button indices follow the DOM's own MouseEvent.button convention: 0 left, 1
+// middle, 2 right (never reached here — right always goes through gcBeginGesture/
+// gcApplyMotion/gcEndGesture instead), 3 back, 4 forward.
+const GC_BUTTON_INDEX = { LEFT: 0, MIDDLE: 1, SIDE: 3, EXTRA: 4 };
+
+function gcClick(code, value) {
+  if (!document.hasFocus()) return;
+  const canvas = biggestCanvas();
+  if (!canvas || !gcVirtual) return;
+  const button = GC_BUTTON_INDEX[code];
+  if (button === undefined) return;
+  canvas.dispatchEvent(new MouseEvent(value ? "mousedown" : "mouseup", {
+    bubbles: true, cancelable: true, view: window,
+    clientX: gcVirtual.x, clientY: gcVirtual.y,
+    screenX: gcVirtual.x, screenY: gcVirtual.y,
+    button, buttons: value ? (1 << button) : 0,
+  }));
+}
+
+const GC_KEY_INFO = {
+  space: { key: " ", code: "Space", keyCode: 32 },
+  esc: { key: "Escape", code: "Escape", keyCode: 27 },
+};
+
+function gcTapKey(name) {
+  if (!document.hasFocus()) return;
+  const info = GC_KEY_INFO[name];
+  if (!info) return;
+  const opts = Object.assign({ bubbles: true, cancelable: true }, info);
+  document.dispatchEvent(new KeyboardEvent("keydown", opts));
+  document.dispatchEvent(new KeyboardEvent("keyup", opts));
+}
+
+// UNVALIDATED — see design.md's Open Questions. REL_WHEEL/REL_HWHEEL count whole
+// notches; a notch is conventionally 120 units of deltaY/deltaX, which is what the
+// hi-res axes already report directly. The sign below assumes the same "up/left is
+// negative" convention a real wheel event uses; if zoom comes out backwards during
+// manual verification (tasks.md 10.2), flip it here.
+function gcWheel(code, value) {
+  if (!document.hasFocus()) return;
+  const canvas = biggestCanvas();
+  if (!canvas || !gcVirtual) return;
+  const horizontal = code === "REL_HWHEEL" || code === "REL_HWHEEL_HI_RES";
+  const hiRes = code === "REL_WHEEL_HI_RES" || code === "REL_HWHEEL_HI_RES";
+  const delta = hiRes ? -value : -value * 120;
+  const opts = {
+    bubbles: true, cancelable: true, view: window,
+    clientX: gcVirtual.x, clientY: gcVirtual.y,
+    screenX: gcVirtual.x, screenY: gcVirtual.y,
+    deltaMode: 0,
+  };
+  opts[horizontal ? "deltaX" : "deltaY"] = delta;
+  canvas.dispatchEvent(new WheelEvent("wheel", opts));
+}
+
+chrome.runtime.onMessage.addListener(message => {
+  if (!message || !message.gate) return;
+  const m = message.gate;
+  if (m.type !== "motion") console.log("[gate]", m);
+  if (m.type === "gate") gcSetActive(Boolean(m.open));
+  else if (m.type === "press") gcBeginGesture(m.gesture);
+  else if (m.type === "motion") gcApplyMotion(m.dx, m.dy);
+  else if (m.type === "release") gcEndGesture();
+  else if (m.type === "tap") gcTapKey(m.key);
+  else if (m.type === "click") gcClick(m.code, m.value);
+  else if (m.type === "wheel") gcWheel(m.code, m.value);
+});

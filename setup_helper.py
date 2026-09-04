@@ -53,14 +53,10 @@ def _gate_namespace():
 # ------------------------------------------------------------------ config
 
 CONFIG_KEYS = ("device", "left_click_key", "pan_requires_right_button",
-               "pan_deadzone_px", "pan_idle_release_ms",
-               "pan_recenter", "pan_recenter_margin_px", "pan_yield_to_other_mice",
-               "pan_yield_deadzone_px", "rotate_scale")
+               "pan_deadzone_px", "pan_idle_release_ms", "rotate_scale")
 
 DEFAULT_PAN_IDLE_MS = 150
-DEFAULT_RECENTER_MARGIN = 35
 DEFAULT_DEADZONE_PX = 10
-DEFAULT_YIELD_DEADZONE_PX = 20
 DEFAULT_ROTATE_SCALE = 0.5
 
 RESTART = 'schtasks /Run /TN "Onshape trackball gate"'
@@ -150,79 +146,10 @@ def _block(key, device=""):
             "toward the\n"
             "# next one.\n"
             "#\n"
-            "# Panning only. Rotating, zooming and the left button are unaffected, and "
-            "the cursor\n"
-            "# keeps tracking your hand throughout — it just is not panning yet.\n"
+            "# Panning only. Rotating, zooming and the left button are unaffected.\n"
             "#\n"
             "# Accepted range 0-500; 0 starts panning on the first movement.\n"
             f"pan_deadzone_px = {DEFAULT_DEADZONE_PX}\n")
-
-    if key in ("pan_recenter", "pan_recenter_margin_px"):
-        if key == "pan_recenter_margin_px":
-            return ""       # written together with pan_recenter
-        return (
-            "\n# Panning drags the real cursor, so a long sweep runs out of screen and "
-            "the pan\n"
-            "# dies. With recentring on, the cursor is warped back to the middle of "
-            "the view\n"
-            "# whenever it comes within pan_recenter_margin_px of an edge, making a "
-            "pan\n"
-            "# effectively unlimited. The pan button is briefly lifted around the warp "
-            "so the\n"
-            "# jump is not read as one huge pan.\n"
-            "#\n"
-            "# The edge is the usable 3D view's edge, not the Chrome window's. The "
-            "extension\n"
-            "# probes the page to find the region that genuinely belongs to the view — "
-            "the canvas\n"
-            "# minus the controls Onshape stacks on top of it — and the daemon pens "
-            "the cursor\n"
-            "# inside that. If the extension stops reporting, it falls back to the "
-            "whole window\n"
-            "# after a few seconds.\n"
-            "#\n"
-            "# Set pan_recenter to false to get the old behaviour: pan until you hit "
-            "the edge,\n"
-            "# then lift and reposition.\n"
-            "pan_recenter = true\n"
-            f"pan_recenter_margin_px = {DEFAULT_RECENTER_MARGIN}\n")
-
-    if key == "pan_yield_to_other_mice":
-        return (
-            "\n# Both mice drive one shared cursor, so while a pan stroke is live the "
-            "held\n"
-            "# pan button applies to whatever your other mouse does too: its motion "
-            "pans, and\n"
-            "# its wheel arrives as wheel-with-button-held instead of a clean scroll.\n"
-            "#\n"
-            "# With this on, the other mice are watched read-only (never captured, so "
-            "they keep\n"
-            "# working normally) and any activity on one drops the pan stroke "
-            "immediately.\n"
-            "# Panning resumes shortly after they go quiet.\n"
-            "#\n"
-            "# Turn it off if resting your hand on the other mouse interrupts panning "
-            "too eagerly.\n"
-            "pan_yield_to_other_mice = true\n")
-
-    if key == "pan_yield_deadzone_px":
-        return (
-            "\n# How far the *other* mouse must travel before its motion counts as "
-            "deliberate\n"
-            "# and drops the pan or rotate the gated mouse is holding.\n"
-            "#\n"
-            "# Net displacement, measured the same way as pan_deadzone_px. Below "
-            "this, resting\n"
-            "# a hand on the other mouse or bumping it in passing does not interrupt "
-            "the stroke.\n"
-            "# A button press or a wheel turn on it always interrupts immediately, "
-            "regardless of\n"
-            "# this setting — neither happens by accident.\n"
-            "#\n"
-            "# Accepted range 0-500; 0 yields on the very first movement, which was "
-            "the only\n"
-            "# behaviour before this setting existed.\n"
-            f"pan_yield_deadzone_px = {DEFAULT_YIELD_DEADZONE_PX}\n")
 
     if key == "rotate_scale":
         return (
@@ -244,8 +171,7 @@ def _block(key, device=""):
             "#   above 1   a given push rotates the model more\n"
             "#\n"
             "# Panning is unaffected — it already has its own feel via "
-            "pan_deadzone_px and\n"
-            "# pan_recenter_margin_px.\n"
+            "pan_deadzone_px.\n"
             "#\n"
             "# Accepted range 0.05-5.0; anything outside is clamped.\n"
             f"rotate_scale = {DEFAULT_ROTATE_SCALE}\n")
@@ -364,13 +290,9 @@ def cmd_drift():
     ns["CONFIG_PATH"] = config_path()
     config = ns["read_config"]()
 
-    _recenter, margin = ns["resolve_recenter"](config)
     wanted = {
         "pan_idle_release_ms": round(ns["resolve_pan_idle"](config) * 1000),
-        "pan_recenter_margin_px": margin,
-        "pan_yield_to_other_mice": ns["resolve_yield"](config),
         "pan_deadzone_px": ns["resolve_deadzone"](config),
-        "pan_yield_deadzone_px": ns["resolve_yield_deadzone"](config),
         "pan_requires_right_button": ns["resolve_pan_button"](config),
         "left_click_key": ns["resolve_left_click"](config)[0],
         "rotate_scale": ns["resolve_rotate_scale"](config),
@@ -390,10 +312,6 @@ def cmd_drift():
     if running and on_disk:
         wanted["code"] = on_disk
 
-    # pan_recenter is deliberately not compared: the daemon reports it as "enabled in
-    # the config AND the cursor API answered", so a machine where recentring is off
-    # for lack of a cursor would look like permanent, unfixable drift. The margin is
-    # compared, which is what catches an actual edit to this setting.
     differing = [k for k, v in wanted.items() if state.get(k) != v]
     if differing:
         print(",".join(sorted(differing)))

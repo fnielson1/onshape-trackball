@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Onshape Mouse Gate",
   "version": "1.0.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvDiOXeqI9Ev+hBCYJBG2x7HD+CGQBuhyMpi0ahi7l/FuBWF9Fmad/JyRJ7BDSgR3PNTSRz8cIoECS/kA/C5OD8/STFZTkstO492uM+QI8kfb0B1Q7/hqQKIXvlLtPR/4mBUE/zmaQjENT2tVvPxfCskK8gnu9GiwoQpTlRk5xI5Jmm+pHosKQdmWZSbf3tPsIg3/97ntHwaCN6Qcacgq6lHK1eGoOjN9WQrmuXSgOKD/bst0l3rKSCrW7T18nN2vlUPr/gP/kETJDhxMuTmR5RobnBNG4eGwXvthZ9qa/fJMKVMxSo9sfg2rwU1KapMryLHdEbwQdjViJiB2BQR1kwIDAQAB",
   "description": "Tells the local mouse-gating daemon whether the frontmost tab is on onshape.com.",
   "permissions": [
     "tabs",

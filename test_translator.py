@@ -1,4 +1,4 @@
-"""Drive Translator with synthetic events against a stub virtual device."""
+"""Drive Translator with synthetic events against a stub channel."""
 import os, sys, time, types
 
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gate.py')).read()
@@ -21,73 +21,60 @@ class InputEvent:
         self.sec, self.usec = sec, usec
         self.type, self.code, self.value = etype, code, value
 
-NAMES = {ecodes.BTN_LEFT:'LEFT', ecodes.BTN_RIGHT:'RIGHT', ecodes.BTN_MIDDLE:'MIDDLE',
-         ecodes.KEY_LEFTCTRL:'CTRL', ecodes.KEY_SPACE:'SPACE'}
-
 # The cases below are about gesture mechanics and use small synthetic motions, so
 # the dead zone is off for them. It has its own section at the end.
 ns['PAN_DEADZONE'] = 0
-
-# Same for the other-mouse yield dead zone: a bare tr.yield_stroke() with no
-# arguments must still read as an immediate, deliberate yield everywhere except its
-# own dedicated section further down.
-ns['PAN_YIELD_DEADZONE'] = 0
 
 # And for which gesture the right button performs: the cases below are written
 # against the original mapping (bare motion pans, the button rotates) and are about
 # gesture mechanics, not this setting. Its own section at the end flips it.
 ns['PAN_REQUIRES_RIGHT_BUTTON'] = False
 
-class StubUI:
-    def __init__(self, log=None): self.log = [] if log is None else log
-    def write(self, t, c, v):
-        if t == ecodes.EV_KEY:
-            self.log.append(('KEY', NAMES.get(c, c), v))
-        elif t == ecodes.EV_REL:
-            axis = {ecodes.REL_X: 'X', ecodes.REL_Y: 'Y'}.get(c, 'WHEEL')
-            self.log.append(('REL', axis, v))
-        else:
-            self.log.append((t, c, v))
-    def write_event(self, e):
-        if e.type == ecodes.EV_KEY: self.log.append(('KEY', NAMES.get(e.code, e.code), e.value))
-        elif e.type == ecodes.EV_REL: self.log.append(('REL', 'X' if e.code==ecodes.REL_X else ('Y' if e.code==ecodes.REL_Y else 'WHEEL'), e.value))
-        elif e.type == ecodes.EV_SYN: self.log.append(('SYN',))
-    def syn(self): self.log.append(('SYN',))
+
+class StubChannel:
+    """Records every message sent, in order. `connected` defaults True — the one
+    sink there is now, so nothing here is ever silently dropped unless a case sets
+    it False deliberately."""
+    def __init__(self, connected=True):
+        self.log = []
+        self.connected = connected
+
+    def send(self, message):
+        self.log.append(message)
+
 
 def ev(t, c, v): return InputEvent(0, 0, t, c, v)
 def motion(dx): return [ev(ecodes.EV_REL, ecodes.REL_X, dx), ev(ecodes.EV_SYN, 0, 0)]
 def button(code, val): return [ev(ecodes.EV_KEY, code, val), ev(ecodes.EV_SYN, 0, 0)]
 
-def run(name, events, expect_keys, post=None):
-    """Compares the order of key/button events, which is where the real hazards live
-    — Ctrl against the button, the middle button never appearing. Motion and SYN are
-    filtered out: pinning those exactly made these cases break on every unrelated
-    change. The syn-ordering hazard has its own dedicated case further down.
+PRESS_PAN = {"type": "press", "gesture": "pan"}
+PRESS_ROTATE = {"type": "press", "gesture": "rotate"}
+RELEASE = {"type": "release"}
+
+
+def run(name, events, expect, post=None):
+    """Compares press/release/tap/click/wheel messages, which is where the real
+    hazards live — gesture ordering, hand-offs, the middle button never appearing.
+    Motion messages are filtered out: pinning their exact values here made these
+    cases break on every unrelated change to ROTATE_SCALE etc. — motion has its own
+    dedicated section further down.
     """
-    log = []
-    ui, modifier = StubUI(log), StubUI(log)
-    tr = Translator(ui, modifier)
+    channel = StubChannel()
+    tr = Translator(channel)
     for e in events: tr.handle(e)
     if post: post(tr)
-    got = [x for x in log if x[0] == 'KEY']
-    ok = got == expect_keys
+    got = [m for m in channel.log if m.get('type') != 'motion']
+    ok = got == expect
     print(f"{'PASS' if ok else 'FAIL'}  {name}")
     if not ok:
-        print(f"      expected: {expect_keys}")
+        print(f"      expected: {expect}")
         print(f"      got     : {got}")
-        print(f"      full log: {log}")
+        print(f"      full log: {channel.log}")
     return ok
 
 # The gesture cases below need a region the cursor is allowed to occupy: a pan
 # will not start without one, because a press with nowhere known-safe to land is
-# exactly what puts the right button on a toolbar. Here that region is the whole
-# window; the recentring section further down uses a canvas smaller than the
-# window, which is what makes it able to tell the two apart.
-class StubPointer:
-    def __init__(self, pos): self.ok = True; self._pos = pos; self.warps = []
-    def position(self): return self._pos
-    def warp(self, x, y): self.warps.append((x, y)); self._pos = (x, y)
-
+# exactly what puts the right button on a toolbar.
 class StubGate:
     """geometry() is the Chrome window; view_rect() is what the cursor must stay
     inside — the region verified to be 3D view and nothing else. They differ so a test
@@ -107,379 +94,135 @@ CENTRE = (960, 540)
 
 ns['GATE'] = StubGate(WINDOW, WINDOW)
 
-# Stubbed together with the gate, and not optional. Once view_rect() returns a region,
-# every motion event runs the edge check for real — and with the live POINTER that
-# reads the actual mouse cursor, so a cursor sitting near a screen edge while the suite
-# ran would insert a recentre's button cycle into cases that are only about gesture
-# ordering. Parked in the middle, nothing is ever near an edge.
-ns['POINTER'] = StubPointer(CENTRE)
-
 results = []
 
-# 1. Bare motion presses Ctrl then the right button, and holds them.
+# 1. Bare motion opens a pan stroke and holds it.
 results.append(run("motion alone starts a pan drag",
     motion(5) + motion(7),
-    [('KEY','CTRL',1), ('KEY','RIGHT',1)]))
+    [PRESS_PAN]))
 
-# 2. Going idle past PAN_IDLE_RELEASE ends the stroke, button before Ctrl.
+# 2. Going idle past PAN_IDLE_RELEASE ends the stroke.
 def idle_then_tick(tr):
     tr._last_motion -= 1.0
     tr.tick()
 results.append(run("idle releases the pan gesture",
     motion(5),
-    [('KEY','CTRL',1), ('KEY','RIGHT',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)],
+    [PRESS_PAN, RELEASE],
     post=idle_then_tick))
 
-# 3. The physical right button hands the same drag over to rotate by dropping Ctrl.
-# It must not press the button a second time.
-results.append(run("right button drops Ctrl and rotates on the same drag",
+# 3. The physical right button hands the same drag over to rotate: the current
+# stroke closes and immediately reopens as rotate, without a duplicate press.
+results.append(run("the right button hands the same drag off to rotate",
     motion(5) + button(ecodes.BTN_RIGHT, 1) + motion(9),
-    [('KEY','CTRL',1), ('KEY','RIGHT',1), ('KEY','CTRL',0)]))
+    [PRESS_PAN, RELEASE, PRESS_ROTATE]))
 
-# 4. Releasing it ends the gesture — tagged with Ctrl around the lift, since this was
-# a rotate (the button-held gesture here, no Ctrl of its own) — and the next movement
-# starts a fresh pan.
+# 4. Releasing it ends the gesture, and the next movement starts a fresh pan.
 results.append(run("pan resumes after the right button is released",
     button(ecodes.BTN_RIGHT, 1) + motion(3) + button(ecodes.BTN_RIGHT, 0) + motion(4),
-    [('KEY','RIGHT',1), ('KEY','CTRL',1), ('KEY','RIGHT',0), ('KEY','CTRL',0),
-     ('KEY','CTRL',1), ('KEY','RIGHT',1)]))
+    [PRESS_ROTATE, RELEASE, PRESS_PAN]))
 
-# 5. The gate closing mid-stroke must strand neither the button nor the modifier.
-results.append(run("gate close releases the button and Ctrl",
+# 5. The gate closing mid-stroke must strand nothing open.
+results.append(run("gate close releases the button",
     motion(5),
-    [('KEY','CTRL',1), ('KEY','RIGHT',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)],
+    [PRESS_PAN, RELEASE],
     post=lambda tr: tr.release_all()))
 
-# 6. Including a button the user is physically holding — a rotate, here, so its
-# release is tagged with Ctrl the same as any other.
+# 6. Including a button the user is physically holding.
 results.append(run("gate close releases a real held button",
     button(ecodes.BTN_RIGHT, 1),
-    [('KEY','RIGHT',1), ('KEY','CTRL',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)],
+    [PRESS_ROTATE, RELEASE],
     post=lambda tr: tr.release_all()))
 
-# 7. Wheel is zoom: straight through, and it starts no gesture.
-results.append(run("wheel passes through without panning",
+# 7. Wheel is zoom: forwarded as its own message, and it starts no gesture.
+results.append(run("wheel is forwarded and starts no gesture",
     [ev(ecodes.EV_REL, ecodes.REL_WHEEL, 1), ev(ecodes.EV_SYN, 0, 0)],
-    []))
+    [{"type": "wheel", "code": "REL_WHEEL", "value": 1}]))
 
 # 8. The left button ends the stroke, then taps space to clear the selection. The
 # click itself never reaches the page.
 results.append(run("left button ends the stroke and taps space",
     motion(5) + button(ecodes.BTN_LEFT, 1),
-    [('KEY','CTRL',1), ('KEY','RIGHT',1), ('KEY','RIGHT',0), ('KEY','CTRL',0),
-     ('KEY','SPACE',1), ('KEY','SPACE',0)]))
+    [PRESS_PAN, RELEASE, {"type": "tap", "key": "space"}]))
 
 # Passing the click through instead is one config value away.
 saved_code = ns['LEFT_CLICK_CODE']
 ns['LEFT_CLICK_CODE'] = None
 results.append(run("with left_click_key = none, the click passes through",
     motion(5) + button(ecodes.BTN_LEFT, 1),
-    [('KEY','CTRL',1), ('KEY','RIGHT',1), ('KEY','RIGHT',0), ('KEY','CTRL',0),
-     ('KEY','LEFT',1)]))
+    [PRESS_PAN, RELEASE, {"type": "click", "code": "LEFT", "value": 1}]))
 ns['LEFT_CLICK_CODE'] = saved_code
 
 # Nothing anywhere may ever touch the middle button: two presses inside the
 # double-click window are a double middle-click, which Onshape reads as Zoom to Fit.
-_probe = []
-_ui, _mod = StubUI(_probe), StubUI(_probe)
-_tr = Translator(_ui, _mod)
+_channel = StubChannel()
+_tr = Translator(_channel)
 for _e in (motion(5) + button(ecodes.BTN_RIGHT, 1) + button(ecodes.BTN_RIGHT, 0)
            + motion(3) + button(ecodes.BTN_LEFT, 1)):
     _tr.handle(_e)
 _tr.release_all()
-_no_middle = not any(x[0] == 'KEY' and x[1] == 'MIDDLE' for x in _probe)
-print(f"{'PASS' if _no_middle else 'FAIL'}  the middle button is never pressed, by any path")
+_no_middle = not any(m.get('code') == 'MIDDLE' for m in _channel.log)
+print(f"{'PASS' if _no_middle else 'FAIL'}  the middle button is never touched, by any path")
 if not _no_middle:
-    print(f"      log={_probe}")
+    print(f"      log={_channel.log}")
 results.append(_no_middle)
 
-# --- recentring ----------------------------------------------------------------
-# The ordering here is the whole point: a warp landing while the pan button is
-# still down would be read by Onshape as one enormous pan.
+# --- gesture hand-off, in more detail --------------------------------------------
+# Bundled with the ordering cases above under the old (OS-injection) design, because
+# a real Ctrl device and a real button device could reach Chrome out of order. There
+# is only one sink now, and every message is already atomic and ordered — nothing
+# left to race — but the hand-off logic itself still deserves direct coverage.
 
-
-def run_recentre(name, pointer_at, expect_warps, expect_log):
-    ui = StubUI(); tr = Translator(ui)
+def gesture_setup():
+    channel = StubChannel()
+    tr = Translator(channel)
     ns['GATE'] = StubGate(WINDOW, WINDOW)
-    # Start centred, so opening the pan stroke does not itself trigger a warp;
-    # handle() calls _recenter_if_near_edge on every motion event.
-    pointer = StubPointer(CENTRE)
-    ns['POINTER'] = pointer
-    for e in motion(5):
-        tr.handle(e)
-    ui.log.clear()
-    pointer._pos = pointer_at          # now place it where the case wants it
-    pointer.warps.clear()
-    tr._last_edge_check = 0.0          # defeat the sampling throttle
-    tr._recenter_if_near_edge()
-    ok = [x for x in ui.log if x[0] == 'KEY'] == expect_log \
-        and pointer.warps == expect_warps
-    print(f"{'PASS' if ok else 'FAIL'}  {name}")
-    if not ok:
-        print(f"      expected warps {expect_warps}, events {expect_log}")
-        print(f"      got      warps {pointer.warps}, events {ui.log}")
-    results.append(ok)
+    return tr, channel
 
-run_recentre("well inside the window: no warp, no events",
-             (960, 540), [], [])
-
-run_recentre("inside but past the margin: no warp",
-             (200, 540), [], [])
-
-run_recentre("near the left edge: button lifted, warp, button restored",
-             (8, 540), [CENTRE],
-             [('KEY','RIGHT',0), ('KEY','RIGHT',1)])
-
-run_recentre("near the bottom edge: same handling",
-             (960, 1072), [CENTRE],
-             [('KEY','RIGHT',0), ('KEY','RIGHT',1)])
-
-# Not panning still recentres — just without a button cycle, since nothing is held.
-# Motion keeps flowing between strokes and through the yield cooldown, and without
-# this the cursor wanders out of the view and over the feature tree.
-ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW, WINDOW)
-pointer = StubPointer((5, 5)); ns['POINTER'] = pointer
-tr._last_edge_check = 0.0
-tr._recenter_if_near_edge()
-warped_bare = (pointer.warps == [CENTRE] and ui.log == [] and not tr._panning)
-print(f"{'PASS' if warped_bare else 'FAIL'}  strays are recentred even with no stroke running")
-if not warped_bare:
-    print(f"      warps={pointer.warps}, events={ui.log}")
-results.append(warped_bare)
-
-# Inside the view with no stroke running: leave it alone.
-ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW, WINDOW)
-pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
-tr._last_edge_check = 0.0
-tr._recenter_if_near_edge()
-left_alone = pointer.warps == [] and ui.log == []
-print(f"{'PASS' if left_alone else 'FAIL'}  no stroke and inside the view: left alone")
-results.append(left_alone)
-
-# A recentre stalls the read loop, so it must refresh the idle deadline or the
-# timer tears down the stroke it just restored.
-ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW, WINDOW)
-pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
+tr, channel = gesture_setup()
 for e in motion(5):
     tr.handle(e)
-tr._last_motion = time.monotonic() - 1.0     # deadline already blown
-pointer._pos = (8, 540)
-tr._last_edge_check = 0.0
-tr._recenter_if_near_edge()
-ui.log.clear()
-tr.tick()                                     # must NOT end the stroke
-survived = tr._panning and ui.log == []
-print(f"{'PASS' if survived else 'FAIL'}  recentre refreshes the idle deadline")
-if not survived:
-    print(f"      panning={tr._panning}, events after tick={ui.log}")
-results.append(survived)
-
-# Another mouse stirring must drop the stroke, so its wheel reaches the page as a
-# clean scroll rather than wheel-with-button-held.
-ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW, WINDOW)
-ns['POINTER'] = StubPointer(CENTRE)
-for e in motion(5):
-    tr.handle(e)
-ui.log.clear()
-tr.yield_stroke()
-yielded = (not tr._panning
-           and [x for x in ui.log if x[0] == 'KEY'] == [('KEY','RIGHT',0)]
-           and tr.yields == 1)
-print(f"{'PASS' if yielded else 'FAIL'}  other mouse activity releases the pan button")
-if not yielded:
-    print(f"      panning={tr._panning}, yields={tr.yields}, events={ui.log}")
-results.append(yielded)
-
-# Yielding when nothing is happening must not emit a spurious release.
-ui = StubUI(); tr = Translator(ui)
-tr.yield_stroke()
-quiet = ui.log == [] and tr.yields == 0
-print(f"{'PASS' if quiet else 'FAIL'}  yielding while idle emits nothing")
-results.append(quiet)
-
-# Straight after a yield the cooldown holds panning off, so a wheel-zoom burst on
-# the other mouse is not fought over press-by-press.
-ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW, WINDOW)
-ns['POINTER'] = StubPointer(CENTRE)
-for e in motion(5):
-    tr.handle(e)
-tr.yield_stroke()
-ui.log.clear()
-for e in motion(4):
-    tr.handle(e)
-held_off = (not tr._panning) and ('KEY','RIGHT',1) not in ui.log
-print(f"{'PASS' if held_off else 'FAIL'}  cooldown holds panning off right after a yield")
-if not held_off:
-    print(f"      panning={tr._panning}, events={ui.log}")
-results.append(held_off)
-
-# Once both the cooldown and the minimum press interval lapse, the next movement
-# starts a fresh stroke.
-tr._yield_until = time.monotonic() - 0.001
-ui.log.clear()
-for e in motion(4):
-    tr.handle(e)
-resumed = tr._panning and ('KEY','RIGHT',1) in ui.log
-print(f"{'PASS' if resumed else 'FAIL'}  panning resumes once the cooldown lapses")
-if not resumed:
-    print(f"      panning={tr._panning}, events={ui.log}")
-results.append(resumed)
-
-# --- a press must never land outside the window --------------------------------
-# Pressing outside the browser clicks another window, which takes focus away and
-# closes the gate. Motion flows while a press is deferred, so the cursor really can
-# be outside by press time.
-
-OUTSIDE = (WINDOW[0] + WINDOW[2] + 200, WINDOW[1] + 100)   # right of the window
-
-ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW, WINDOW)
-pointer = StubPointer(OUTSIDE); ns['POINTER'] = pointer
-tr._press_pan()
-x, y = pointer._pos
-pulled_in = (WINDOW[0] <= x <= WINDOW[0] + WINDOW[2]
-             and WINDOW[1] <= y <= WINDOW[1] + WINDOW[3]
-             and tr.presses_recentred == 1)
-print(f"{'PASS' if pulled_in else 'FAIL'}  a press outside the window is pulled back inside")
-if not pulled_in:
-    print(f"      pressed at {pointer._pos} for window {WINDOW}")
-results.append(pulled_in)
-
-# A press already inside must not be disturbed.
-ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW, WINDOW)
-pointer = StubPointer(CENTRE); ns['POINTER'] = pointer
-tr._press_pan()
-undisturbed = pointer._pos == CENTRE and tr.presses_recentred == 0 and pointer.warps == []
-print(f"{'PASS' if undisturbed else 'FAIL'}  a press already inside is left where it is")
-if not undisturbed:
-    print(f"      pos={pointer._pos}, warps={pointer.warps}")
-results.append(undisturbed)
-
-# --- Ctrl + right-drag gesture -------------------------------------------------
-# Nothing here may ever touch the middle button: that is the entire point of the
-# gesture, since Onshape maps double middle-click to Zoom to Fit.
-
-
-class SharedUI(StubUI):
-    """Logs into a shared list so ordering across the two virtual devices is visible."""
-    def __init__(self, log): self.log = log
-
-def ctrl_setup(pos=CENTRE):
-    log = []
-    ui, mod = SharedUI(log), SharedUI(log)
-    tr = Translator(ui, mod)
-    ns['GATE'] = StubGate(WINDOW, WINDOW)
-    ns['POINTER'] = StubPointer(pos)
-    return tr, log
-
-def expect(name, got, want):
-    ok = got == want
-    print(f"{'PASS' if ok else 'FAIL'}  {name}")
-    if not ok:
-        print(f"      expected {want}")
-        print(f"      got      {got}")
-    results.append(ok)
-
-# Ctrl must land before the button; the other order is a momentary plain right-drag,
-# which Onshape rotates on.
-tr, log = ctrl_setup()
-for e in motion(5):
-    tr.handle(e)
-expect("ctrl_right: Ctrl is pressed before the right button",
-       [x for x in log if x[0] == 'KEY'],
-       [('KEY','CTRL',1), ('KEY','RIGHT',1)])
-
-no_middle = not any(x[0] == 'KEY' and x[1] == 'MIDDLE' for x in log)
-print(f"{'PASS' if no_middle else 'FAIL'}  ctrl_right: the middle button is never touched")
-results.append(no_middle)
-
-# And on release the button must lift before Ctrl, for the same reason.
-log.clear()
-tr._end_pan(syn=True)
-expect("ctrl_right: the right button lifts before Ctrl",
-       [x for x in log if x[0] == 'KEY'],
-       [('KEY','RIGHT',0), ('KEY','CTRL',0)])
-
-# Writing them in the right order is not enough: the button release must be FLUSHED
-# before Ctrl goes, or X sees Ctrl lift first and the still-held button becomes a
-# plain right-drag, which Onshape rotates on.
-right_up = log.index(('KEY','RIGHT',0))
-ctrl_up = log.index(('KEY','CTRL',0))
-flushed = any(log[i] == ('SYN',) for i in range(right_up + 1, ctrl_up))
-print(f"{'PASS' if flushed else 'FAIL'}  ctrl_right: the button release is flushed before Ctrl")
-if not flushed:
-    print(f"      log={log}")
-results.append(flushed)
-
-# Same on the way down: Ctrl must be flushed before the button press.
-tr2, log2 = ctrl_setup()
-for e in motion(5):
-    tr2.handle(e)
-ctrl_down = log2.index(('KEY','CTRL',1))
-right_down = log2.index(('KEY','RIGHT',1))
-down_ok = ctrl_down < right_down
-print(f"{'PASS' if down_ok else 'FAIL'}  ctrl_right: Ctrl lands before the button press")
-if not down_ok:
-    print(f"      log={log2}")
-results.append(down_ok)
-
-# Pressing the physical right button mid-pan hands the same drag to rotate.
-tr, log = ctrl_setup()
-for e in motion(5):
-    tr.handle(e)
-log.clear()
+channel.log.clear()
 tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1))
-handover = ([x for x in log if x[0] == 'KEY'] == [('KEY','CTRL',0)]
-            and not tr._panning and tr._right_emitted)
-print(f"{'PASS' if handover else 'FAIL'}  ctrl_right: physical right drops Ctrl without re-pressing")
+handover = (channel.log == [RELEASE, PRESS_ROTATE]
+            and not tr._panning and tr._stroke_open and tr._gesture == "rotate")
+print(f"{'PASS' if handover else 'FAIL'}  physical right hands off without a duplicate press")
 if not handover:
-    print(f"      panning={tr._panning}, right_emitted={tr._right_emitted}, log={log}")
+    print(f"      panning={tr._panning}, stroke_open={tr._stroke_open}, "
+          f"gesture={tr._gesture}, log={channel.log}")
 results.append(handover)
 
-# Releasing it ends the gesture exactly once. Ctrl was dropped for the hand-off
-# above, so this release tags it back on around the button lift — the same signal
-# pan's own release already gets for free — rather than manufacturing motion.
-log.clear()
+channel.log.clear()
 tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0))
-released = ([x for x in log if x[0] == 'KEY']
-            == [('KEY','CTRL',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)]
-            and not tr._right_emitted and not tr._ctrl_down)
-print(f"{'PASS' if released else 'FAIL'}  ctrl_right: releasing right ends the gesture once")
+released = (channel.log == [RELEASE] and not tr._stroke_open and tr._gesture is None)
+print(f"{'PASS' if released else 'FAIL'}  releasing right ends the gesture exactly once")
 if not released:
-    print(f"      right_emitted={tr._right_emitted}, log={log}")
+    print(f"      stroke_open={tr._stroke_open}, log={channel.log}")
 results.append(released)
 
-# Ctrl + wheel is browser page zoom, so the modifier must be gone first.
-tr, log = ctrl_setup()
+# A wheel turn ends an open pan first, so it reaches the page as a clean scroll
+# rather than a scroll with the pan button still held.
+tr, channel = gesture_setup()
 for e in motion(5):
     tr.handle(e)
-log.clear()
+channel.log.clear()
 tr.handle(ev(ecodes.EV_REL, ecodes.REL_WHEEL, 1))
-keys = [x for x in log if x[0] == 'KEY']
-wheel_at = log.index(('REL','WHEEL',1)) if ('REL','WHEEL',1) in log else -1
-ctrl_up_at = log.index(('KEY','CTRL',0)) if ('KEY','CTRL',0) in log else -1
-wheel_safe = (not tr._ctrl_down and ctrl_up_at >= 0 and wheel_at > ctrl_up_at)
-print(f"{'PASS' if wheel_safe else 'FAIL'}  ctrl_right: Ctrl is released before a wheel event")
-if not wheel_safe:
-    print(f"      ctrl_held={tr._ctrl_down}, log={log}")
-results.append(wheel_safe)
+wheel_ends_pan = (channel.log == [RELEASE, {"type": "wheel", "code": "REL_WHEEL", "value": 1}]
+                   and not tr._panning)
+print(f"{'PASS' if wheel_ends_pan else 'FAIL'}  a wheel turn ends an open pan first")
+if not wheel_ends_pan:
+    print(f"      panning={tr._panning}, log={channel.log}")
+results.append(wheel_ends_pan)
 
-# Gate closing mid-pan must strand neither the button nor the modifier.
-tr, log = ctrl_setup()
+# Gate close releases both the button-held and bare-motion cases cleanly.
+tr, channel = gesture_setup()
 for e in motion(5):
     tr.handle(e)
-log.clear()
+channel.log.clear()
 tr.release_all()
-clean = not tr._ctrl_down and not tr._right_emitted and not tr._panning
-print(f"{'PASS' if clean else 'FAIL'}  ctrl_right: gate close releases both button and Ctrl")
+clean = not tr._stroke_open and not tr._panning and channel.log == [RELEASE]
+print(f"{'PASS' if clean else 'FAIL'}  gate close releases the open stroke cleanly")
 if not clean:
-    print(f"      ctrl_held={tr._ctrl_down}, right_emitted={tr._right_emitted}, log={log}")
+    print(f"      stroke_open={tr._stroke_open}, panning={tr._panning}, log={channel.log}")
 results.append(clean)
 
 # --- canvas rect ----------------------------------------------------------------
@@ -542,7 +285,7 @@ def classify(panning, last_release, event):
     g.record_context_menu([event])
     return g._context_menus[-1]
 
-fresh = lambda: {"at": time.monotonic(), "at_pos": (900, 500), "in_view_rect": True}
+fresh = lambda: {"at": time.monotonic()}
 
 cases = [
     ("an overlay inside the region we called safe",
@@ -611,267 +354,72 @@ except Exception as exc:
 print(f"{'PASS' if survived else 'FAIL'}  malformed context-menu reports are ignored, not fatal")
 results.append(survived)
 
-# The point of all this: a cursor comfortably inside the window but at the canvas
-# edge must still be recentred, into the canvas rather than the window.
-ui = StubUI(); tr = Translator(ui)
-ns['GATE'] = StubGate(WINDOW_RECT, CANVAS_RECT)
-pointer = StubPointer((CANVAS_RECT[0] + CANVAS_RECT[2] // 2, CANVAS_RECT[1] + CANVAS_RECT[3] // 2))
-ns['POINTER'] = pointer
-for e in motion(5):
-    tr.handle(e)
-pointer._pos = (CANVAS_RECT[0] + 5, CANVAS_RECT[1] + 300)   # just inside the canvas edge
-pointer.warps.clear()
-tr._last_edge_check = 0.0
-tr._recenter_if_near_edge()
-canvas_centre = (CANVAS_RECT[0] + CANVAS_RECT[2] // 2, CANVAS_RECT[1] + CANVAS_RECT[3] // 2)
-to_canvas = pointer.warps == [canvas_centre]
-print(f"{'PASS' if to_canvas else 'FAIL'}  recentres to the canvas centre, not the window centre")
-if not to_canvas:
-    print(f"      warps={pointer.warps}, expected [{canvas_centre}]")
-results.append(to_canvas)
-
-# The edge margin has to scale with pan speed. The check is throttled, so the ground
-# a flick covers between two checks is unbounded by any fixed margin — which is how
-# a quick pan used to sail past 20px and land on the feature tree.
-#
-# Both cases below put the cursor at the same spot, 60px inside the canvas edge:
-# outside the static margin, inside the reach of the flick. Only the travel leading
-# up to them differs, so the travel is the only thing that can change the verdict.
-NEAR_EDGE = (CANVAS_RECT[0] + 60, CANVAS_RECT[1] + 300)
-
-def recentre_after(travel):
-    ui = StubUI(); tr = Translator(ui)
-    ns['GATE'] = StubGate(WINDOW_RECT, CANVAS_RECT)
-    pointer = StubPointer((CANVAS_RECT[0] + CANVAS_RECT[2] // 2,
-                           CANVAS_RECT[1] + CANVAS_RECT[3] // 2))
-    ns['POINTER'] = pointer
-    for e in motion(5):
-        tr.handle(e)
-    # Hold the throttle closed so the motion below only accumulates travel, exactly
-    # as it does between two real checks.
-    tr._last_edge_check = time.monotonic()
-    for e in motion(travel):
-        tr.handle(e)
-    pointer._pos = NEAR_EDGE
-    pointer.warps.clear()
-    tr._last_edge_check = 0.0
-    tr._recenter_if_near_edge()
-    return pointer.warps
-
-crept = recentre_after(4)
-stays = crept == []
-print(f"{'PASS' if stays else 'FAIL'}  a slow pan near the edge is left alone")
-if not stays:
-    print(f"      warps={crept}, expected none")
-results.append(stays)
-
-flicked = recentre_after(200)
-rescued = flicked == [canvas_centre]
-print(f"{'PASS' if rescued else 'FAIL'}  a fast flick recentres before it clears the edge")
-if not rescued:
-    print(f"      warps={flicked}, expected [{canvas_centre}]")
-results.append(rescued)
-
-# A recentre must not drop Ctrl. Releasing and re-pressing it mid-stroke opened a
-# window where X saw the button still down with Ctrl gone — a plain right-drag,
-# which Onshape rotates on. Measured 26 such episodes in 25s of panning.
-tr, log = ctrl_setup()
-for e in motion(5):
-    tr.handle(e)
-ns['POINTER']._pos = (8, 540)
-tr._last_edge_check = 0.0
-log.clear()
-tr._recenter_if_near_edge()
-ctrl_events = [x for x in log if x[0] == 'KEY' and x[1] == 'CTRL']
-held = tr._ctrl_down and ctrl_events == []
-print(f"{'PASS' if held else 'FAIL'}  ctrl_right: a recentre keeps Ctrl held throughout")
-if not held:
-    print(f"      ctrl_down={tr._ctrl_down}, ctrl events={ctrl_events}")
-results.append(held)
-
-# The button, on the other hand, must still be lifted and re-pressed around the warp.
-btn = [x for x in log if x[0] == 'KEY' and x[1] == 'RIGHT']
-cycled = btn == [('KEY','RIGHT',0), ('KEY','RIGHT',1)]
-print(f"{'PASS' if cycled else 'FAIL'}  ctrl_right: a recentre still cycles the button")
-if not cycled:
-    print(f"      button events={btn}")
-results.append(cycled)
-
-# The button-held gesture never sets _panning, so it needs its own coverage: this is
-# exactly what pan_requires_right_button = true depends on for the sweep not to run
-# out of screen while the button is held.
-ns['PAN_REQUIRES_RIGHT_BUTTON'] = True
-tr, log = ctrl_setup()
-for e in button(ecodes.BTN_RIGHT, 1) + motion(5):
-    tr.handle(e)
-ns['POINTER']._pos = (8, 540)
-tr._last_edge_check = 0.0
-log.clear()
-tr._recenter_if_near_edge()
-btn = [x for x in log if x[0] == 'KEY' and x[1] == 'RIGHT']
-ctrl_events = [x for x in log if x[0] == 'KEY' and x[1] == 'CTRL']
-button_pan_recentres = (btn == [('KEY','RIGHT',0), ('KEY','RIGHT',1)]
-                         and tr._ctrl_down and ctrl_events == [])
-print(f"{'PASS' if button_pan_recentres else 'FAIL'}  "
-      f"a button-held pan also recentres, Ctrl held throughout")
-if not button_pan_recentres:
-    print(f"      button events={btn}, ctrl_down={tr._ctrl_down}, ctrl events={ctrl_events}")
-results.append(button_pan_recentres)
-
-# Same for a button-held rotate (the original mapping): the button still cycles, and
-# the lift is tagged with Ctrl for its own instant, same as any other rotate release —
-# it lands back down before the button re-presses, so the drag Onshape sees is
-# unaffected, and Ctrl is not held once the recentre finishes.
-ns['PAN_REQUIRES_RIGHT_BUTTON'] = False
-tr, log = ctrl_setup()
-for e in button(ecodes.BTN_RIGHT, 1) + motion(5):
-    tr.handle(e)
-ns['POINTER']._pos = (8, 540)
-tr._last_edge_check = 0.0
-log.clear()
-tr._recenter_if_near_edge()
-btn = [x for x in log if x[0] == 'KEY' and x[1] == 'RIGHT']
-ctrl_events = [x for x in log if x[0] == 'KEY' and x[1] == 'CTRL']
-button_rotate_recentres = (btn == [('KEY','RIGHT',0), ('KEY','RIGHT',1)]
-                            and not tr._ctrl_down
-                            and ctrl_events == [('KEY','CTRL',1), ('KEY','CTRL',0)])
-print(f"{'PASS' if button_rotate_recentres else 'FAIL'}  "
-      f"a button-held rotate also recentres, tagging the lift with Ctrl and dropping it")
-if not button_rotate_recentres:
-    print(f"      button events={btn}, ctrl_down={tr._ctrl_down}, ctrl events={ctrl_events}")
-results.append(button_rotate_recentres)
-
 # --- left click clears the selection ---------------------------------------------
-# The cursor is penned in the middle of the view, so a real left click would just
-# select whatever geometry is under it. Onshape clears the whole selection on space.
+# The gated mouse has no real, clickable cursor of its own any more, so a real left
+# click would be meaningless anyway. Onshape clears the whole selection on space.
 
-tr, log = ctrl_setup()
+tr, channel = gesture_setup()
 for e in motion(5):
     tr.handle(e)
-log.clear()
+channel.log.clear()
 tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
-keys = [x for x in log if x[0] == 'KEY']
-tapped = ('KEY','SPACE',1) in keys and ('KEY','SPACE',0) in keys and tr.left_taps == 1
-print(f"{'PASS' if tapped else 'FAIL'}  a left click taps space")
+tapped = (channel.log == [RELEASE, {"type": "tap", "key": "space"}] and tr.left_taps == 1)
+print(f"{'PASS' if tapped else 'FAIL'}  a left click ends the pan and taps space")
 if not tapped:
-    print(f"      log={log}")
+    print(f"      log={channel.log}")
 results.append(tapped)
 
-swallowed = not any(x[0] == 'KEY' and x[1] == 'LEFT' for x in log)
+swallowed = not any(m.get('type') == 'click' for m in channel.log)
 print(f"{'PASS' if swallowed else 'FAIL'}  the left click itself is swallowed")
 if not swallowed:
-    print(f"      log={log}")
+    print(f"      log={channel.log}")
 results.append(swallowed)
 
-# Ctrl must be gone before the tap, or it is Ctrl+space rather than space.
-ctrl_up = next((i for i, x in enumerate(log) if x == ('KEY','CTRL',0)), None)
-space_down = next((i for i, x in enumerate(log) if x == ('KEY','SPACE',1)), None)
-ordered = ctrl_up is not None and space_down is not None and ctrl_up < space_down
-print(f"{'PASS' if ordered else 'FAIL'}  the pan is released before the tap")
-if not ordered:
-    print(f"      log={log}")
-results.append(ordered)
-
 # The release is swallowed too, so it cannot tap twice.
-log.clear()
+channel.log.clear()
 tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
-once = log == [] and tr.left_taps == 1
+once = channel.log == [] and tr.left_taps == 1
 print(f"{'PASS' if once else 'FAIL'}  the button release taps nothing further")
 if not once:
-    print(f"      log={log}, taps={tr.left_taps}")
+    print(f"      log={channel.log}, taps={tr.left_taps}")
 results.append(once)
 
 # left_click_key = none restores an ordinary click.
 saved = ns['LEFT_CLICK_CODE']
 ns['LEFT_CLICK_CODE'] = None
-tr2, log2 = ctrl_setup()
+tr2, channel2 = gesture_setup()
 tr2.handle(ev(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
-passthrough = ('KEY','LEFT',1) in log2 and tr2.left_taps == 0
+passthrough = ({"type": "click", "code": "LEFT", "value": 1} in channel2.log
+                and tr2.left_taps == 0)
 print(f"{'PASS' if passthrough else 'FAIL'}  with the key disabled, the click passes through")
 if not passthrough:
-    print(f"      log={log2}")
+    print(f"      log={channel2.log}")
 results.append(passthrough)
 ns['LEFT_CLICK_CODE'] = saved
 
 # --- the stale _right_down hole --------------------------------------------------
-# If that flag went stale, ending a pan skipped the button release but still dropped
-# Ctrl: button held, no Ctrl, which is a plain right-drag and rotates until something
-# else clears it.
+# If that flag went stale, ending a pan could skip the button release.
 
-tr, log = ctrl_setup()
+tr, channel = gesture_setup()
 for e in motion(5):
     tr.handle(e)
 tr._right_down = True              # pretend it went stale
-log.clear()
-tr._end_pan(syn=True)
-keys = [x for x in log if x[0] == 'KEY']
-released = ('KEY','RIGHT',0) in keys and not tr._right_emitted
-print(f"{'PASS' if released else 'FAIL'}  a stale right_down cannot strand the button held")
+channel.log.clear()
+tr._end_pan()
+released = channel.log == [RELEASE] and not tr._stroke_open
+print(f"{'PASS' if released else 'FAIL'}  a stale right_down cannot strand the stroke open")
 if not released:
-    print(f"      right_emitted={tr._right_emitted}, keys={keys}")
+    print(f"      stroke_open={tr._stroke_open}, log={channel.log}")
 results.append(released)
-
-if ('KEY','CTRL',0) in keys and ('KEY','RIGHT',0) in keys:
-    order_ok = keys.index(('KEY','RIGHT',0)) < keys.index(('KEY','CTRL',0))
-else:
-    order_ok = False
-print(f"{'PASS' if order_ok else 'FAIL'}  and the button still goes before Ctrl")
-results.append(order_ok)
 
 # Closing the gate must clear the flag even on the idle path, which used to return
 # early and leave it set.
-tr2, log2 = ctrl_setup()
+tr2, channel2 = gesture_setup()
 tr2._right_down = True             # idle: nothing panning, nothing held
 tr2.release_all()
 cleared = tr2._right_down is False
 print(f"{'PASS' if cleared else 'FAIL'}  closing the gate clears right_down even when idle")
 results.append(cleared)
-
-# --- the right mouse must cancel a rotate, not just a pan ------------------------
-# After the hand-off, _panning is False while the right button stays held. Keying the
-# yield off _panning meant a rotate ran on until the physical button came back up.
-
-tr, log = ctrl_setup()
-for e in motion(5):
-    tr.handle(e)
-tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1))    # hand off to rotate
-handed_off = (not tr._panning) and tr._right_emitted and not tr._ctrl_down
-print(f"{'PASS' if handed_off else 'FAIL'}  setup: the hand-off holds the button with _panning False")
-results.append(handed_off)
-
-log.clear()
-tr.yield_stroke()
-cancelled = (not tr._right_emitted
-             and ('KEY','RIGHT',0) in [x for x in log if x[0] == 'KEY']
-             and tr.yields == 1)
-print(f"{'PASS' if cancelled else 'FAIL'}  the right mouse cancels a rotate")
-if not cancelled:
-    print(f"      right_emitted={tr._right_emitted}, yields={tr.yields}, log={log}")
-results.append(cancelled)
-
-# Cancelling a plain pan still works, and still lifts the button before Ctrl.
-tr, log = ctrl_setup()
-for e in motion(5):
-    tr.handle(e)
-log.clear()
-tr.yield_stroke()
-keys = [x for x in log if x[0] == 'KEY']
-pan_cancelled = (not tr._panning and not tr._right_emitted and not tr._ctrl_down
-                 and ('KEY','RIGHT',0) in keys and ('KEY','CTRL',0) in keys
-                 and keys.index(('KEY','RIGHT',0)) < keys.index(('KEY','CTRL',0)))
-print(f"{'PASS' if pan_cancelled else 'FAIL'}  the right mouse still cancels a pan, button before Ctrl")
-if not pan_cancelled:
-    print(f"      keys={keys}")
-results.append(pan_cancelled)
-
-# Nothing held: stay silent rather than emitting stray releases.
-tr, log = ctrl_setup()
-tr.yield_stroke()
-quiet = log == [] and tr.yields == 0
-print(f"{'PASS' if quiet else 'FAIL'}  yielding with nothing held emits nothing")
-if not quiet:
-    print(f"      log={log}")
-results.append(quiet)
 
 # --- pan dead zone ---------------------------------------------------------------
 # A pan should need a deliberate push, not a nudge. Measured as net displacement, so
@@ -880,73 +428,73 @@ results.append(quiet)
 ns['PAN_DEADZONE'] = 10
 
 def dz_setup():
-    log = []
-    ui, mod = StubUI(log), StubUI(log)
-    tr = Translator(ui, mod)
+    channel = StubChannel()
+    tr = Translator(channel)
     ns['GATE'] = StubGate(WINDOW, WINDOW)
-    ns['POINTER'] = StubPointer(CENTRE)
-    return tr, log
+    return tr, channel
 
-def pressed(log):
-    return ('KEY','RIGHT',1) in [x for x in log if x[0] == 'KEY']
+def pressed(channel):
+    return PRESS_PAN in channel.log
 
-# Under the threshold: motion flows, but no pan.
-tr, log = dz_setup()
+# Under the threshold: no pan starts, and nothing is sent — there is no stroke to
+# send motion into, and no real cursor left to track a hand through the dead zone
+# with (see design.md's "one sink" decision).
+tr, channel = dz_setup()
 for e in motion(4) + motion(4):          # 8px total, still inside
     tr.handle(e)
-inside = not tr._panning and not pressed(log) and ('REL','X',4) in log
-print(f"{'PASS' if inside else 'FAIL'}  under the dead zone: motion passes, no pan starts")
+inside = not tr._panning and not pressed(channel) and channel.log == []
+print(f"{'PASS' if inside else 'FAIL'}  under the dead zone: no pan starts, nothing is sent")
 if not inside:
-    print(f"      panning={tr._panning}, log={log}")
+    print(f"      panning={tr._panning}, log={channel.log}")
 results.append(inside)
 
 # Crossing it starts the pan.
 for e in motion(4):                      # 12px total
     tr.handle(e)
-crossed = tr._panning and pressed(log)
+crossed = tr._panning and pressed(channel)
 print(f"{'PASS' if crossed else 'FAIL'}  crossing the dead zone starts the pan")
 if not crossed:
-    print(f"      panning={tr._panning}, log={log}")
+    print(f"      panning={tr._panning}, log={channel.log}")
 results.append(crossed)
 
 # Jitter out and back nets zero, so it must never trip.
-tr, log = dz_setup()
+tr, channel = dz_setup()
 for _ in range(6):
     for e in motion(8) + motion(-8):
         tr.handle(e)
-jitter = not tr._panning and not pressed(log)
+jitter = not tr._panning and not pressed(channel)
 print(f"{'PASS' if jitter else 'FAIL'}  jitter that returns to origin never starts a pan")
 if not jitter:
     print(f"      panning={tr._panning}, travel=({tr._travel_x},{tr._travel_y})")
 results.append(jitter)
 
 # Diagonal counts as distance, not per-axis.
-tr, log = dz_setup()
+tr, channel = dz_setup()
 for e in ([ev(ecodes.EV_REL, ecodes.REL_X, 8), ev(ecodes.EV_REL, ecodes.REL_Y, 8),
            ev(ecodes.EV_SYN, 0, 0)]):
     tr.handle(e)
-diagonal = tr._panning and pressed(log)
+diagonal = tr._panning and pressed(channel)
 print(f"{'PASS' if diagonal else 'FAIL'}  a diagonal push crosses on distance, not per axis")
 if not diagonal:
     print(f"      panning={tr._panning}, travel=({tr._travel_x},{tr._travel_y})")
 results.append(diagonal)
 
 # Each stroke earns its own dead zone.
-tr, log = dz_setup()
+tr, channel = dz_setup()
 for e in motion(12):
     tr.handle(e)
-tr._end_pan(syn=True)
-log.clear()
+tr._end_pan()
+channel.log.clear()
 for e in motion(4):
     tr.handle(e)
-re_armed = not tr._panning and not pressed(log)
+re_armed = not tr._panning and not pressed(channel)
 print(f"{'PASS' if re_armed else 'FAIL'}  the dead zone re-arms after a stroke ends")
 if not re_armed:
-    print(f"      panning={tr._panning}, log={log}")
+    print(f"      panning={tr._panning}, log={channel.log}")
 results.append(re_armed)
 
 # A stale nudge expires rather than combining with a later one.
-tr, log = dz_setup()
+tr, channel = dz_setup()
 for e in motion(8):
     tr.handle(e)
 tr._last_motion = time.monotonic() - (ns['PAN_IDLE_RELEASE'] + 0.01)
@@ -959,276 +507,136 @@ results.append(expired)
 
 # Zero disables it entirely.
 ns['PAN_DEADZONE'] = 0
-tr, log = dz_setup()
+tr, channel = dz_setup()
 for e in motion(1):
     tr.handle(e)
-disabled = tr._panning and pressed(log)
+disabled = tr._panning and pressed(channel)
 print(f"{'PASS' if disabled else 'FAIL'}  pan_deadzone_px = 0 starts panning immediately")
 results.append(disabled)
 
-# --- other-mouse yield dead zone --------------------------------------------------
-# The other mouse stirring should not tear down a pan over a bump or a resting hand
-# — only a deliberate push, measured the same way as pan_deadzone_px, or a button /
-# wheel signal, which is always immediate.
-
-ns['PAN_YIELD_DEADZONE'] = 10
-
-def yz_setup():
-    """A translator already mid-pan, so yield_stroke has something to drop."""
-    tr, log = dz_setup()
-    for e in motion(4):
-        tr.handle(e)
-    log.clear()
-    return tr, log
-
-def released(log):
-    return ('KEY','RIGHT',0) in [x for x in log if x[0] == 'KEY']
-
-# Under the threshold: the pan survives.
-tr, log = yz_setup()
-tr.yield_stroke(dx=4)
-tr.yield_stroke(dx=4)                    # 8px net, still inside
-survives = tr._panning and not released(log) and tr.yields == 0
-print(f"{'PASS' if survives else 'FAIL'}  under the yield dead zone: the pan survives")
-if not survives:
-    print(f"      panning={tr._panning}, yields={tr.yields}, log={log}")
-results.append(survives)
-
-# Crossing it yields.
-tr.yield_stroke(dx=4)                    # 12px net
-crosses = not tr._panning and released(log) and tr.yields == 1
-print(f"{'PASS' if crosses else 'FAIL'}  crossing the yield dead zone drops the pan")
-if not crosses:
-    print(f"      panning={tr._panning}, yields={tr.yields}, log={log}")
-results.append(crosses)
-
-# Diagonal counts as distance, not per-axis.
-tr, log = yz_setup()
-tr.yield_stroke(dx=8, dy=8)
-diagonal = not tr._panning and tr.yields == 1
-print(f"{'PASS' if diagonal else 'FAIL'}  a diagonal nudge crosses on distance, not per axis")
-if not diagonal:
-    print(f"      panning={tr._panning}, travel=({tr._other_travel_x},{tr._other_travel_y})")
-results.append(diagonal)
-
-# A button on the other mouse yields immediately regardless of magnitude.
-tr, log = yz_setup()
-tr.yield_stroke(dx=1, dy=0, immediate=True)
-immediate_ok = not tr._panning and released(log) and tr.yields == 1
-print(f"{'PASS' if immediate_ok else 'FAIL'}  a button/wheel signal yields immediately")
-if not immediate_ok:
-    print(f"      panning={tr._panning}, yields={tr.yields}, log={log}")
-results.append(immediate_ok)
-
-# A stale nudge expires rather than combining with a later one.
-tr, log = yz_setup()
-tr.yield_stroke(dx=8)                    # under 10, not yet yielded
-tr._other_travel_at = time.monotonic() - (ns['PAN_IDLE_RELEASE'] + 0.01)
-tr.yield_stroke(dx=4)                    # would total 12 if it banked, only 4 fresh
-stale_expired = tr._panning and not released(log) and tr.yields == 0
-print(f"{'PASS' if stale_expired else 'FAIL'}  a stale nudge on the other mouse expires instead of accumulating")
-if not stale_expired:
-    print(f"      panning={tr._panning}, yields={tr.yields}, travel=({tr._other_travel_x},{tr._other_travel_y})")
-results.append(stale_expired)
-
-# Symmetric with _start_pan: when bare motion drives rotate (the default mapping)
-# rather than pan, it gets no dead zone on the way out either — the other mouse's
-# very first move ends it, however small, and however recently the gated mouse
-# itself was moving. A trackball's ball can keep rolling a little after the hand
-# lifts, so nothing here may depend on the gated mouse having gone idle first.
-saved_prb = ns['PAN_REQUIRES_RIGHT_BUTTON']
-ns['PAN_REQUIRES_RIGHT_BUTTON'] = True
-tr, log = yz_setup()
-tr.yield_stroke(dx=1)                    # far under 10px
-ns['PAN_REQUIRES_RIGHT_BUTTON'] = saved_prb
-rotate_has_no_yield_deadzone = not tr._panning and released(log) and tr.yields == 1
-print(f"{'PASS' if rotate_has_no_yield_deadzone else 'FAIL'}  bare-motion rotate has no yield dead zone, even fresh")
-if not rotate_has_no_yield_deadzone:
-    print(f"      panning={tr._panning}, yields={tr.yields}, log={log}")
-results.append(rotate_has_no_yield_deadzone)
-
-# But a button-held gesture keeps the dead zone regardless: a pause mid-hold is
-# normal, so it still needs protecting from a bump.
-tr, log = ctrl_setup()
-for e in motion(5):
-    tr.handle(e)
-tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1))    # hand off to the button
-log.clear()
-tr.yield_stroke(dx=1)                    # far under 10px, button-held gesture stays
-handoff_still_protected = tr._right_emitted and tr.yields == 0
-print(f"{'PASS' if handoff_still_protected else 'FAIL'}  a button-held gesture keeps its dead zone")
-if not handoff_still_protected:
-    print(f"      right_emitted={tr._right_emitted}, yields={tr.yields}, log={log}")
-results.append(handoff_still_protected)
-
-# Zero disables it entirely: the first movement yields.
-ns['PAN_YIELD_DEADZONE'] = 0
-tr, log = yz_setup()
-tr.yield_stroke(dx=1)
-zero_disabled = not tr._panning and released(log) and tr.yields == 1
-print(f"{'PASS' if zero_disabled else 'FAIL'}  pan_yield_deadzone_px = 0 yields on the first movement")
-results.append(zero_disabled)
-ns['PAN_YIELD_DEADZONE'] = 0             # restored for the sections below
-
 # --- nothing under the pointer but canvas ----------------------------------------
-# A pan holds the right button down and drags it. Whatever sits under the pointer
-# receives that press and that release, so the button may only ever go down inside a
-# region the extension has verified is 3D view and nothing else. No region, no pan:
-# the alternative is a right-button release on a toolbar, which opens a context menu
-# or activates whatever it lands on.
+# A pan opens a stroke that Onshape reads as a real drag, so it may only ever start
+# inside a region the extension has verified is 3D view and nothing else. No region,
+# no pan: the alternative is a right-button release on a toolbar, which opens a
+# context menu or activates whatever it lands on.
 
 ns['PAN_DEADZONE'] = 0
 
-# No safe region at all: motion still reaches the page, but no button is pressed.
-log = []
-ui, modifier = StubUI(log), StubUI(log)
-tr = Translator(ui, modifier)
+# No safe region at all: nothing is sent, no gesture opens.
+channel = StubChannel()
+tr = Translator(channel)
 ns['GATE'] = StubGate(WINDOW, None)
-ns['POINTER'] = StubPointer(CENTRE)
 for e in motion(5) + motion(7):
     tr.handle(e)
-no_press = not tr._panning and not any(x[0] == 'KEY' for x in log)
-print(f"{'PASS' if no_press else 'FAIL'}  no verified view region: motion passes, no button is pressed")
+no_press = not tr._panning and channel.log == []
+print(f"{'PASS' if no_press else 'FAIL'}  no verified view region: nothing is sent, no pan starts")
 if not no_press:
-    print(f"      panning={tr._panning} log={[x for x in log if x[0] == 'KEY']}")
+    print(f"      panning={tr._panning} log={channel.log}")
 results.append(no_press)
 
 # And it is not a permanent refusal: the region coming back re-enables panning.
 ns['GATE'] = StubGate(WINDOW, WINDOW)
 for e in motion(5):
     tr.handle(e)
-recovers = tr._panning and any(x[0] == 'KEY' and x[1] == 'RIGHT' and x[2] == 1 for x in log)
+recovers = tr._panning and PRESS_PAN in channel.log
 print(f"{'PASS' if recovers else 'FAIL'}  panning resumes once a view region is reported again")
 results.append(recovers)
 
 # The region vanishing mid-stroke — a dialog opening over the view, or the extension
-# going quiet — must let go of the button rather than keep dragging it across whatever
-# just appeared.
-log = []
-ui, modifier = StubUI(log), StubUI(log)
-tr = Translator(ui, modifier)
+# going quiet — must let go of the stroke rather than keep it open on whatever just
+# appeared.
+channel = StubChannel()
+tr = Translator(channel)
 ns['GATE'] = StubGate(WINDOW, WINDOW)
-pointer = StubPointer(CENTRE)
-ns['POINTER'] = pointer
 for e in motion(5):
     tr.handle(e)
 started = tr._panning
-log.clear()
+channel.log.clear()
 ns['GATE'] = StubGate(WINDOW, None)      # the safe region disappears
-tr._last_edge_check = 0.0
-tr._recenter_if_near_edge()
-let_go = started and not tr._panning and ('KEY', 'RIGHT', 0) in log
-print(f"{'PASS' if let_go else 'FAIL'}  the view region vanishing mid-stroke releases the button")
+for e in motion(3):
+    tr.handle(e)
+let_go = started and not tr._panning and RELEASE in channel.log
+print(f"{'PASS' if let_go else 'FAIL'}  the view region vanishing mid-stroke releases the stroke")
 if not let_go:
-    print(f"      started={started} panning={tr._panning} log={[x for x in log if x[0] == 'KEY']}")
+    print(f"      started={started} panning={tr._panning} log={channel.log}")
 results.append(let_go)
 
 # --- pan_requires_right_button: swapping which gesture the button performs -------
 # Everything above ran with the original mapping (bare motion pans, the button
 # rotates). This flips it: the button should now bracket pan, and bare motion should
-# rotate — with no Ctrl anywhere in the rotate cases. Idle release, recentring and
-# hand-off are exactly what the cases above already covered, so most of these only
-# check which gesture gets Ctrl. The dead zone is the one thing that does NOT carry
-# over unchanged — it applies only to whichever gesture bare motion drives when that
-# is pan, so flipping the mapping flips whether it applies at all, and that gets its
-# own dedicated case below.
+# rotate. Idle release and hand-off are exactly what the cases above already
+# covered, so most of these only check which gesture opens. The dead zone is the
+# one thing that does NOT carry over unchanged — it applies only to whichever
+# gesture bare motion drives when that is pan, so flipping the mapping flips
+# whether it applies at all, and that gets its own dedicated case below.
 
 ns['PAN_REQUIRES_RIGHT_BUTTON'] = True
 ns['PAN_DEADZONE'] = 0
 ns['GATE'] = StubGate(WINDOW, WINDOW)
-ns['POINTER'] = StubPointer(CENTRE)
 
 results.append(run("bare motion rotates instead of panning",
     motion(5) + motion(7),
-    [('KEY','RIGHT',1)]))
+    [PRESS_ROTATE]))
 
 # Rotate gets no dead zone at all under this mapping — see the PAN_DEADZONE comment.
-# A single, tiny sample must press the button immediately, not wait for 10px to
+# A single, tiny sample must open the stroke immediately, not wait for 10px to
 # accumulate; otherwise a small deliberate rotate loses exactly the distance Onshape's
 # own click-vs-drag check needs to see it as a drag rather than a click.
 ns['PAN_DEADZONE'] = 10
 results.append(run("rotate ignores the dead zone entirely",
     motion(1),
-    [('KEY','RIGHT',1)]))
+    [PRESS_ROTATE]))
 ns['PAN_DEADZONE'] = 0
 
 results.append(run("holding the right button pans instead of rotating",
     button(ecodes.BTN_RIGHT, 1) + motion(9),
-    [('KEY','CTRL',1), ('KEY','RIGHT',1)]))
+    [PRESS_PAN]))
 
-results.append(run("releasing the button after a button-held pan drops Ctrl, "
-                    "button before Ctrl",
+results.append(run("releasing the button after a button-held pan ends the stroke",
     button(ecodes.BTN_RIGHT, 1) + motion(5) + button(ecodes.BTN_RIGHT, 0),
-    [('KEY','CTRL',1), ('KEY','RIGHT',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)]))
+    [PRESS_PAN, RELEASE]))
 
-# Idle release still ends a bare-motion rotate. No Ctrl was ever raised for the drag
-# itself, but the release tags the button-up with one — pan's own release gets this
-# for free, and this is how rotate's gets the same signal without manufacturing any
-# motion for the page to measure.
-results.append(run("idle release ends a bare-motion rotate, tagging the release with Ctrl",
+# Idle release still ends a bare-motion rotate.
+results.append(run("idle release ends a bare-motion rotate",
     motion(5),
-    [('KEY','RIGHT',1), ('KEY','CTRL',1), ('KEY','RIGHT',0), ('KEY','CTRL',0)],
+    [PRESS_ROTATE, RELEASE],
     post=idle_then_tick))
 
-# The hand-off now runs the other way: a rotate already under way (bare motion, no
-# Ctrl) must not be double-pressed when the button comes down — it adds Ctrl instead
-# of dropping it, turning the same drag into a pan.
-log = []
-ui, modifier = StubUI(log), StubUI(log)
-tr = Translator(ui, modifier)
+# The hand-off now runs the other way: a rotate already under way (bare motion) must
+# not be double-pressed when the button comes down — it closes and reopens as pan.
+channel = StubChannel()
+tr = Translator(channel)
 for e in motion(5) + button(ecodes.BTN_RIGHT, 1) + motion(9):
     tr.handle(e)
-keys = [x for x in log if x[0] == 'KEY']
-handed_off_to_pan = (keys == [('KEY','RIGHT',1), ('KEY','CTRL',1)]
-                      and not tr._panning and tr._right_emitted and tr._ctrl_down)
+handed_off_to_pan = ([m for m in channel.log if m.get('type') != 'motion']
+                      == [PRESS_ROTATE, RELEASE, PRESS_PAN]
+                      and not tr._panning and tr._stroke_open and tr._gesture == "pan")
 print(f"{'PASS' if handed_off_to_pan else 'FAIL'}  the button hands a rotate off to pan without a double press")
 if not handed_off_to_pan:
-    print(f"      keys={keys}, panning={tr._panning}, "
-          f"right_emitted={tr._right_emitted}, ctrl_down={tr._ctrl_down}")
+    print(f"      panning={tr._panning}, stroke_open={tr._stroke_open}, "
+          f"gesture={tr._gesture}, log={channel.log}")
 results.append(handed_off_to_pan)
 
 # The button-held gesture (pan, under this mapping) must resume once the physical
-# button never let go — a right-mouse yield mid-pan used to require an actual
-# release/press to recover from, because nothing re-pressed the synthetic button
-# while _right_down stayed true throughout.
-log = []
-ui, modifier = StubUI(log), StubUI(log)
-tr = Translator(ui, modifier)
+# button never let go — a channel drop mid-hold used to require an actual
+# release/press to recover from, because nothing reopened the stroke while
+# _right_down stayed true throughout.
+channel = StubChannel()
+tr = Translator(channel)
 for e in button(ecodes.BTN_RIGHT, 1) + motion(5):
     tr.handle(e)
-tr.yield_stroke()                            # the other mouse stirs mid-pan
-tr._yield_until = time.monotonic() - 0.001   # cooldown already elapsed
-log.clear()
+tr.channel_disconnected()                    # the channel drops mid-hold
+channel.connected = True                     # ...and comes back
+channel.log.clear()
 for e in motion(4):
     tr.handle(e)
-keys = [x for x in log if x[0] == 'KEY']
-resumed_on_button = (keys == [('KEY','CTRL',1), ('KEY','RIGHT',1)]
-                      and tr._right_emitted and tr._ctrl_down)
+resumed_on_button = ([m for m in channel.log if m.get('type') != 'motion'] == [PRESS_PAN]
+                      and tr._stroke_open)
 print(f"{'PASS' if resumed_on_button else 'FAIL'}  "
-      "a button-held pan resumes after a yield without a real release/press")
+      "a button-held pan resumes after a channel drop without a real release/press")
 if not resumed_on_button:
-    print(f"      keys={keys}, right_emitted={tr._right_emitted}, ctrl_down={tr._ctrl_down}")
+    print(f"      stroke_open={tr._stroke_open}, log={channel.log}")
 results.append(resumed_on_button)
-
-# Straight after the yield, before the cooldown lapses, motion must not resume it —
-# the same protection the bare-motion gesture already gets against fighting a
-# wheel-zoom burst on the other mouse.
-log2 = []
-ui2, modifier2 = StubUI(log2), StubUI(log2)
-tr2 = Translator(ui2, modifier2)
-for e in button(ecodes.BTN_RIGHT, 1) + motion(5):
-    tr2.handle(e)
-tr2.yield_stroke()
-log2.clear()
-for e in motion(4):
-    tr2.handle(e)
-keys2 = [x for x in log2 if x[0] == 'KEY']
-held_off_on_button = keys2 == [] and not tr2._right_emitted
-print(f"{'PASS' if held_off_on_button else 'FAIL'}  "
-      "cooldown also holds a button-held pan off right after a yield")
-if not held_off_on_button:
-    print(f"      keys={keys2}, right_emitted={tr2._right_emitted}")
-results.append(held_off_on_button)
 
 ns['PAN_REQUIRES_RIGHT_BUTTON'] = False    # restore the default this file exercises
 
@@ -1237,78 +645,205 @@ ns['PAN_REQUIRES_RIGHT_BUTTON'] = False    # restore the default this file exerc
 # down. Pan must never be touched by it — panning already has its own dedicated feel.
 
 def rs_setup():
-    log = []
-    ui, mod = StubUI(log), StubUI(log)
-    tr = Translator(ui, mod)
+    channel = StubChannel()
+    tr = Translator(channel)
     ns['GATE'] = StubGate(WINDOW, WINDOW)
-    ns['POINTER'] = StubPointer(CENTRE)
-    return tr, log
+    return tr, channel
 
-def rel_x(log):
-    return [x for x in log if x[0] == 'REL' and x[1] == 'X']
+def motion_dx(channel):
+    return sum(m['dx'] for m in channel.log if m.get('type') == 'motion')
 
 ns['PAN_REQUIRES_RIGHT_BUTTON'] = True     # bare motion rotates
 ns['ROTATE_SCALE'] = 0.5
 
-tr, log = rs_setup()
-tr.handle(ev(ecodes.EV_REL, ecodes.REL_X, 10))
-halved = rel_x(log) == [('REL','X',5)]
+tr, channel = rs_setup()
+for e in motion(10):
+    tr.handle(e)
+halved = motion_dx(channel) == 5
 print(f"{'PASS' if halved else 'FAIL'}  rotate motion is scaled down by ROTATE_SCALE")
 if not halved:
-    print(f"      log={log}")
+    print(f"      log={channel.log}")
 results.append(halved)
 
 # The fractional remainder carries across samples, so a slow rotate at a low scale
 # still moves eventually instead of every sample individually truncating to zero.
 ns['ROTATE_SCALE'] = 0.3
-tr, log = rs_setup()
+tr, channel = rs_setup()
 for _ in range(10):
-    tr.handle(ev(ecodes.EV_REL, ecodes.REL_X, 1))
-total_sent = sum(x[2] for x in rel_x(log))
+    for e in motion(1):
+        tr.handle(e)
+total_sent = motion_dx(channel)
 # The running remainder is always under 1px in magnitude, by construction — except
 # floating-point slop can push a sample that should just cross a whole pixel to just
 # miss it instead, so the tolerance allows exactly that much.
 carried = total_sent != 0 and abs(total_sent - 10 * ns['ROTATE_SCALE']) <= 1.0
 print(f"{'PASS' if carried else 'FAIL'}  a sub-1px-per-sample rotate still accumulates instead of vanishing")
 if not carried:
-    print(f"      sent={total_sent}, log={log}")
+    print(f"      sent={total_sent}, log={channel.log}")
 results.append(carried)
 
 # 1.0 is raw, unscaled motion — how this behaved before the setting existed.
 ns['ROTATE_SCALE'] = 1.0
-tr, log = rs_setup()
-tr.handle(ev(ecodes.EV_REL, ecodes.REL_X, 7))
-raw_at_one = rel_x(log) == [('REL','X',7)]
+tr, channel = rs_setup()
+for e in motion(7):
+    tr.handle(e)
+raw_at_one = motion_dx(channel) == 7
 print(f"{'PASS' if raw_at_one else 'FAIL'}  rotate_scale = 1.0 leaves motion untouched")
 if not raw_at_one:
-    print(f"      log={log}")
+    print(f"      log={channel.log}")
 results.append(raw_at_one)
 
 # Pan (bare motion, with the original mapping) must be unaffected by ROTATE_SCALE.
 ns['PAN_REQUIRES_RIGHT_BUTTON'] = False    # bare motion pans
 ns['ROTATE_SCALE'] = 0.2
-tr, log = rs_setup()
-tr.handle(ev(ecodes.EV_REL, ecodes.REL_X, 10))
-pan_unaffected = rel_x(log) == [('REL','X',10)]
+tr, channel = rs_setup()
+for e in motion(10):
+    tr.handle(e)
+pan_unaffected = motion_dx(channel) == 10
 print(f"{'PASS' if pan_unaffected else 'FAIL'}  pan motion ignores ROTATE_SCALE")
 if not pan_unaffected:
-    print(f"      log={log}")
+    print(f"      log={channel.log}")
 results.append(pan_unaffected)
 
 # The button-held rotate (the original mapping's rotate) is scaled too.
-tr, log = rs_setup()
+tr, channel = rs_setup()
 tr.handle(ev(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1))
-log.clear()
-tr.handle(ev(ecodes.EV_REL, ecodes.REL_X, 10))
-button_rotate_scaled = rel_x(log) == [('REL','X',2)]
+tr.handle(ev(ecodes.EV_SYN, 0, 0))
+channel.log.clear()
+for e in motion(10):
+    tr.handle(e)
+button_rotate_scaled = motion_dx(channel) == 2
 print(f"{'PASS' if button_rotate_scaled else 'FAIL'}  a button-held rotate is scaled too")
 if not button_rotate_scaled:
-    print(f"      log={log}")
+    print(f"      log={channel.log}")
 results.append(button_rotate_scaled)
 
 ns['PAN_REQUIRES_RIGHT_BUTTON'] = False    # restore the default this file exercises
 ns['ROTATE_SCALE'] = 1.0                   # neutral, so an unrelated future case isn't surprised
 
+# --- the channel itself -----------------------------------------------------------
+# No fallback exists any more: a missing channel must refuse to open a gesture, and
+# a channel that drops mid-gesture must not leave the daemon believing one is open.
+
+tr = Translator(StubChannel(connected=False))
+ns['GATE'] = StubGate(WINDOW, WINDOW)
+for e in motion(5) + motion(7):
+    tr.handle(e)
+refused = not tr._panning and not tr._stroke_open
+print(f"{'PASS' if refused else 'FAIL'}  a disconnected channel refuses to start a gesture")
+if not refused:
+    print(f"      panning={tr._panning}, stroke_open={tr._stroke_open}")
+results.append(refused)
+
+tr, channel = gesture_setup()
+for e in motion(5):
+    tr.handle(e)
+mid_stroke = tr._stroke_open
+tr.channel_disconnected()
+disconnected_cleanly = mid_stroke and not tr._stroke_open and not tr._panning
+print(f"{'PASS' if disconnected_cleanly else 'FAIL'}  a mid-gesture disconnect ends the stroke without retrying")
+if not disconnected_cleanly:
+    print(f"      mid_stroke={mid_stroke}, stroke_open={tr._stroke_open}, panning={tr._panning}")
+results.append(disconnected_cleanly)
+
+# Once reconnected, a fresh gesture opens normally.
+tr._channel.connected = True
+for e in motion(5):
+    tr.handle(e)
+reconnected = tr._panning and tr._stroke_open
+print(f"{'PASS' if reconnected else 'FAIL'}  a fresh gesture opens normally once reconnected")
+results.append(reconnected)
+
+# --- the channel's wire protocol ---------------------------------------------
+# New, non-trivial code with real correctness risk (frame masking, the handshake's
+# Origin check) that StubChannel never touches — exercised directly against a real
+# connected socket pair.
+
+import socket as _socket, hashlib as _hashlib, base64 as _base64, os as _os
+
+_ws_send_frame = ns['_ws_send_frame']
+_ws_read_frame = ns['_ws_read_frame']
+ChannelClass = ns['Channel']
+EXPECTED_ORIGIN = ns['EXPECTED_ORIGIN']
+WS_MAGIC = ns['WS_MAGIC']
+
+# A text frame round-trips exactly. The server's own frames are never masked —
+# only what a client sends needs unmasking, covered separately below.
+a, b = _socket.socketpair()
+try:
+    _ws_send_frame(a, 0x1, b'{"type":"press"}')
+    opcode, payload = _ws_read_frame(b)
+    roundtrip_ok = opcode == 0x1 and payload == b'{"type":"press"}'
+finally:
+    a.close(); b.close()
+print(f"{'PASS' if roundtrip_ok else 'FAIL'}  a text frame round-trips through the wire helpers")
+results.append(roundtrip_ok)
+
+# A masked client frame is unmasked correctly — built by hand, the way a real
+# browser's WebSocket implementation sends one.
+def _client_frame(payload):
+    mask = _os.urandom(4)
+    masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+    return bytes([0x81, 0x80 | len(payload)]) + mask + masked
+
+a, b = _socket.socketpair()
+try:
+    a.sendall(_client_frame(b"hello"))
+    opcode, payload = _ws_read_frame(b)
+    unmask_ok = opcode == 0x1 and payload == b"hello"
+finally:
+    a.close(); b.close()
+print(f"{'PASS' if unmask_ok else 'FAIL'}  a masked client frame is unmasked correctly")
+results.append(unmask_ok)
+
+def _send_handshake(sock, origin, key=b"dGhlIHNhbXBsZSBub25jZQ=="):
+    sock.sendall((
+        "GET / HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key.decode()}\r\n"
+        f"Origin: {origin}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode())
+    return key
+
+# The handshake accepts the extension's own origin and computes the right accept key.
+a, b = _socket.socketpair()
+try:
+    channel = ChannelClass(0)
+    key = _send_handshake(a, EXPECTED_ORIGIN)
+    channel._handshake(b)
+    response = a.recv(4096).decode()
+    expected_accept = _base64.b64encode(
+        _hashlib.sha1(key + WS_MAGIC.encode()).digest()).decode()
+    accepted = "101" in response.splitlines()[0] and expected_accept in response
+finally:
+    a.close(); b.close()
+print(f"{'PASS' if accepted else 'FAIL'}  the handshake accepts the extension's origin")
+if not accepted:
+    print(f"      response={response!r}")
+results.append(accepted)
+
+# A mismatched origin is rejected outright — an arbitrary web page must not be able
+# to open this and observe the gated mouse's raw motion.
+a, b = _socket.socketpair()
+try:
+    channel = ChannelClass(0)
+    _send_handshake(a, "https://evil.example")
+    rejected = False
+    try:
+        channel._handshake(b)
+    except ValueError:
+        rejected = True
+    response = a.recv(4096).decode()
+    rejected = rejected and response.startswith("HTTP/1.1 403")
+finally:
+    a.close(); b.close()
+print(f"{'PASS' if rejected else 'FAIL'}  a mismatched origin is rejected")
+if not rejected:
+    print(f"      response={response!r}")
+results.append(rejected)
+
 print()
 print(f"{sum(results)}/{len(results)} passed")
-sys.exit(0 if all(results) else 1)

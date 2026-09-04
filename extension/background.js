@@ -1,5 +1,9 @@
 // Reports to the local daemon whether the frontmost Chrome window's active tab is
-// on onshape.com.
+// on onshape.com, and relays the daemon's own channel — every translated gesture,
+// pushed to us over a local WebSocket — to content.js, which is what actually
+// dispatches the synthetic DOM events. A content script cannot open this connection
+// itself: the page's own CSP would block a request to localhost. The service worker
+// is not subject to that.
 //
 // Deliberately says NOTHING about whether Chrome itself is focused. The daemon
 // tracks that from X11, event-driven and race-free. An earlier version also tested
@@ -11,6 +15,7 @@
 // daemon can fail closed if this extension stops running.
 
 const ENDPOINT = "http://127.0.0.1:47653/state";
+const CHANNEL_URL = "ws://127.0.0.1:47654/";
 const ONSHAPE_HOST = /(^|\.)onshape\.com$/i;
 
 async function activeTabIsOnshape(windowId) {
@@ -98,17 +103,84 @@ async function push(windowId) {
   }
 }
 
-chrome.tabs.onActivated.addListener(info => push(info.windowId));
+chrome.tabs.onActivated.addListener(info => { push(info.windowId); ensureChannel(); });
 chrome.tabs.onUpdated.addListener((_id, changeInfo, tab) => {
   // Only the URL settling actually changes our answer.
   if (changeInfo.url || changeInfo.status === "complete") push(tab && tab.windowId);
+  ensureChannel();
 });
 chrome.tabs.onRemoved.addListener(() => push());
-chrome.windows.onFocusChanged.addListener(windowId => push(windowId));
-chrome.runtime.onStartup.addListener(() => push());
-chrome.runtime.onInstalled.addListener(() => push());
+chrome.windows.onFocusChanged.addListener(windowId => { push(windowId); ensureChannel(); });
+chrome.runtime.onStartup.addListener(() => { push(); ensureChannel(); });
+chrome.runtime.onInstalled.addListener(() => { push(); ensureChannel(); });
 
 chrome.alarms.create("heartbeat", { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener(() => push());
+chrome.alarms.onAlarm.addListener(() => { push(); ensureChannel(); });
 
 push();
+
+// --- the channel: every translated gesture, relayed to content.js ----------------
+//
+// There is no OS-level fallback left for rotate, pan, zoom or clear-selection — see
+// README's "How it works" — so a slow reconnect here means a fully inert mouse, not
+// just a degraded one. Reconnecting is therefore opportunistic on every event above
+// that already wakes this service worker, not just the 30s alarm: in practice the
+// tightest of these is content.js's own once-a-second canvas-rect report, which
+// reaches onMessage below and piggybacks a reconnect attempt on its way through.
+
+let channelSocket = null;
+let channelConnecting = false;
+
+function ensureChannel() {
+  if (channelConnecting) return;
+  if (channelSocket && channelSocket.readyState <= WebSocket.OPEN) return;
+  channelConnecting = true;
+  let ws;
+  try {
+    ws = new WebSocket(CHANNEL_URL);
+  } catch {
+    channelConnecting = false;
+    return;
+  }
+  ws.onopen = () => {
+    channelConnecting = false;
+    channelSocket = ws;
+  };
+  ws.onmessage = event => {
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    relayToOnshapeTabs(message);
+  };
+  ws.onclose = () => {
+    channelConnecting = false;
+    if (channelSocket === ws) channelSocket = null;
+  };
+  ws.onerror = () => {
+    // onclose always follows an error on a WebSocket; nothing extra to do here.
+  };
+}
+
+// Relayed to every onshape.com tab rather than computed down to the one active tab,
+// matching the extension's existing pattern for canvas-rect reports: content.js's
+// own document.hasFocus() check is what decides which single tab actually acts on
+// it, so a background tab safely ignores a gesture message that reaches it too.
+async function relayToOnshapeTabs(message) {
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({ url: "*://*.onshape.com/*" });
+  } catch {
+    return;
+  }
+  for (const tab of tabs) {
+    if (tab.id === undefined) continue;
+    chrome.tabs.sendMessage(tab.id, { gate: message }).catch(() => {});
+  }
+}
+
+chrome.runtime.onMessage.addListener(() => { ensureChannel(); });
+
+ensureChannel();

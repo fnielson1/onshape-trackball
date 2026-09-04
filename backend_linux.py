@@ -1,11 +1,11 @@
-"""Linux/X11 backend: evdev + uinput for input, libX11 for the cursor, xprop for focus.
+"""Linux/X11 backend: evdev for exclusive capture, xprop for focus.
 
-This is the original `gate.py` platform code, moved out behind the interface in
-`backend.py` and otherwise unchanged. Anything that looked like a behaviour change
-while moving it is a bug, not a cleanup.
+Translated output is not part of this interface: every gesture the translator
+decides on goes out over gate.py's own WebSocket channel to the extension,
+identically on both platforms, so there is nothing platform-specific left to do
+here for it — no uinput clone device, no libX11 cursor query/warp.
 """
 
-import ctypes
 import glob
 import os
 import re
@@ -15,7 +15,7 @@ import sys
 import time
 
 import evdev
-from evdev import UInput, ecodes
+from evdev import ecodes
 
 import codes
 
@@ -25,17 +25,6 @@ codes.assert_matches_evdev(ecodes)
 
 NAME = "linux"
 
-VIRTUAL_NAME = "Onshape-gated Mouse"
-MODIFIER_NAME = "Onshape-gated Modifier"
-
-# python-evdev stamps every uinput device with the same vendor/product/phys, so
-# libinput lumps them into one LIBINPUT_DEVICE_GROUP and X exposes only the first —
-# the keyboard half then silently never arrives. Distinct ids keep them separate.
-VIRTUAL_VENDOR = 0x6F73
-VIRTUAL_PRODUCT_MOUSE = 0x0001
-VIRTUAL_PRODUCT_MODIFIER = 0x0002
-
-MOUSE_GLOB = "/dev/input/by-id/*-event-mouse"
 BY_ID = "/dev/input/by-id"
 CHROME_WM_CLASSES = ("google-chrome", "chromium")
 MOTION_THRESHOLD = 30  # accumulated |REL| units, enough to ignore sensor jitter
@@ -146,7 +135,6 @@ class GatedDevice:
         self._dev = _wait_for_device(path)
         self._dev.grab()
         self.name = self._dev.name
-        self.template = self._dev
 
     def events(self):
         return self._dev.read_loop()
@@ -171,139 +159,6 @@ def _wait_for_device(path):
 
 def open_gated_device(identifier):
     return GatedDevice(identifier)
-
-
-# ------------------------------------------------------------------ output
-
-
-class VirtualOutput:
-    """A uinput clone of the grabbed mouse. Same surface the stub in the tests has."""
-
-    def __init__(self, template):
-        self._ui = UInput.from_device(
-            template, name=VIRTUAL_NAME, vendor=VIRTUAL_VENDOR,
-            product=VIRTUAL_PRODUCT_MOUSE, phys="onshape-gate/mouse")
-
-    def write(self, etype, code, value):
-        self._ui.write(etype, code, value)
-
-    def write_event(self, event):
-        self._ui.write_event(event)
-
-    def syn(self):
-        self._ui.syn()
-
-    def close(self):
-        self._ui.close()
-
-
-class _KeyOutput:
-    def __init__(self, ui):
-        self._ui = ui
-
-    def write(self, etype, code, value):
-        self._ui.write(etype, code, value)
-
-    def write_event(self, event):
-        self._ui.write_event(event)
-
-    def syn(self):
-        self._ui.syn()
-
-    def close(self):
-        self._ui.close()
-
-
-def modifier_output():
-    """A separate keyboard-only virtual device for Ctrl.
-
-    Kept apart from the mouse clone so X classifies each cleanly rather than getting
-    one hybrid device.
-    """
-    # Advertise a normal keyboard key block, not just KEY_LEFTCTRL. libinput refuses
-    # to classify a single-key device as a keyboard, so X silently never adds it and
-    # the modifier goes nowhere. Only KEY_LEFTCTRL is ever emitted.
-    keys = list(range(ecodes.KEY_ESC, ecodes.KEY_F12 + 1))
-    assert ecodes.KEY_LEFTCTRL in keys
-    try:
-        return _KeyOutput(UInput({ecodes.EV_KEY: keys}, name=MODIFIER_NAME,
-                                 vendor=VIRTUAL_VENDOR,
-                                 product=VIRTUAL_PRODUCT_MODIFIER,
-                                 phys="onshape-gate/modifier"))
-    except OSError as exc:
-        log(f"cannot create the Ctrl device ({exc})")
-        return None
-
-
-# ------------------------------------------------------------------ pointer
-
-
-class Pointer:
-    """XQueryPointer / XWarpPointer via ctypes, so recentring needs no python-xlib.
-
-    Only the device read loop touches this, so the unsynchronised Xlib connection is
-    safe: no XInitThreads needed.
-    """
-
-    def __init__(self):
-        self.ok = False
-        self._dpy = None
-        try:
-            self._x = ctypes.CDLL("libX11.so.6")
-        except OSError as exc:
-            log(f"libX11 unavailable ({exc}); pan recentring disabled")
-            return
-
-        x = self._x
-        x.XOpenDisplay.restype = ctypes.c_void_p
-        x.XOpenDisplay.argtypes = [ctypes.c_char_p]
-        x.XDefaultRootWindow.restype = ctypes.c_ulong
-        x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
-        x.XQueryPointer.restype = ctypes.c_int
-        x.XQueryPointer.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulong,
-            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
-            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_uint),
-        ]
-        x.XWarpPointer.restype = ctypes.c_int
-        x.XWarpPointer.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
-            ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
-            ctypes.c_int, ctypes.c_int,
-        ]
-        x.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
-
-        display = os.environ.get("DISPLAY")
-        self._dpy = x.XOpenDisplay(display.encode() if display else None)
-        if not self._dpy:
-            log(f"cannot open X display {display!r}; pan recentring disabled")
-            return
-        self._root = x.XDefaultRootWindow(self._dpy)
-        self.ok = True
-
-    def position(self):
-        if not self.ok:
-            return None
-        root_ret = ctypes.c_ulong(); child_ret = ctypes.c_ulong()
-        rx = ctypes.c_int(); ry = ctypes.c_int()
-        wx = ctypes.c_int(); wy = ctypes.c_int()
-        mask = ctypes.c_uint()
-        got = self._x.XQueryPointer(
-            self._dpy, self._root,
-            ctypes.byref(root_ret), ctypes.byref(child_ret),
-            ctypes.byref(rx), ctypes.byref(ry),
-            ctypes.byref(wx), ctypes.byref(wy), ctypes.byref(mask),
-        )
-        return (rx.value, ry.value) if got else None
-
-    def warp(self, x_pos, y_pos):
-        if not self.ok:
-            return
-        self._x.XWarpPointer(self._dpy, 0, self._root, 0, 0, 0, 0,
-                             int(x_pos), int(y_pos))
-        self._x.XSync(self._dpy, 0)
 
 
 # ------------------------------------------------------------------ focus
@@ -385,73 +240,3 @@ def watch_focus(callback):
         time.sleep(2)
 
 
-# ------------------------------------------------------------------ other mice
-
-
-def _other_mice(gated_path):
-    """Every pointing device except the one we grabbed (and our own virtual clone)."""
-    gated = os.path.realpath(gated_path)
-    return [p for p in sorted(glob.glob(MOUSE_GLOB))
-            if os.path.realpath(p) != gated]
-
-
-def watch_other_pointers(gated_path, on_activity, enabled):
-    """Read-only watch on the other mice; motion is reported so the translator can
-    apply its own dead zone, and a button or wheel always reports as immediate since
-    neither happens by accident.
-
-    Opened without EVIOCGRAB, so those mice keep working completely normally.
-    """
-    opened = {}
-    while True:
-        if not enabled():
-            time.sleep(5)
-            continue
-
-        for path in _other_mice(gated_path):
-            if path in opened:
-                continue
-            try:
-                dev = evdev.InputDevice(path)
-            except OSError:
-                continue
-            if dev.name == VIRTUAL_NAME:      # never react to our own output
-                dev.close()
-                continue
-            opened[path] = dev
-            log(f"watching '{dev.name}' so it can interrupt a pan stroke")
-
-        if not opened:
-            time.sleep(2)
-            continue
-
-        fdmap = {dev.fd: (path, dev) for path, dev in opened.items()}
-        try:
-            ready, _, _ = select.select(list(fdmap), [], [], 2.0)
-        except OSError:
-            ready = []
-
-        for fd in ready:
-            path, dev = fdmap[fd]
-            try:
-                dx = dy = 0
-                immediate = False
-                for event in dev.read():
-                    if event.type == ecodes.EV_REL:
-                        if event.code == ecodes.REL_X:
-                            dx += event.value
-                        elif event.code == ecodes.REL_Y:
-                            dy += event.value
-                        else:                    # wheel: as deliberate as a click
-                            immediate = True
-                    elif event.type == ecodes.EV_KEY:
-                        immediate = True
-                if dx or dy or immediate:
-                    on_activity(dx, dy, immediate)
-            except OSError:
-                # Unplugged: drop it and let the next scan pick it back up.
-                try:
-                    dev.close()
-                except Exception:
-                    pass
-                opened.pop(path, None)

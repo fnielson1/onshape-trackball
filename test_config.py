@@ -50,28 +50,6 @@ check("whitespace and comments are ignored",
       ns["resolve_pan_idle"](with_config(
           "# a comment\n\n   pan_idle_release_ms   =   150   \n")), 0.15)
 
-# --- recentring ---------------------------------------------------------------
-check("recentring defaults to on at 35px",
-      ns["resolve_recenter"](with_config(None)), (True, 35))
-
-check("recentring can be switched off",
-      ns["resolve_recenter"](with_config("pan_recenter = false\n")), (False, 35))
-
-check("'yes' also enables it",
-      ns["resolve_recenter"](with_config("pan_recenter = yes\n")), (True, 35))
-
-check("a custom margin is honoured",
-      ns["resolve_recenter"](with_config("pan_recenter_margin_px = 220\n")), (True, 220))
-
-check("a junk margin falls back",
-      ns["resolve_recenter"](with_config("pan_recenter_margin_px = wide\n")), (True, 35))
-
-check("an oversized margin is clamped",
-      ns["resolve_recenter"](with_config("pan_recenter_margin_px = 5000\n")), (True, 600))
-
-check("a negative margin is clamped to zero",
-      ns["resolve_recenter"](with_config("pan_recenter_margin_px = -40\n")), (True, 0))
-
 # --- pan dead zone --------------------------------------------------------------
 check("dead zone defaults to 10px",
       ns["resolve_deadzone"](with_config(None)), 10)
@@ -87,22 +65,6 @@ check("a junk dead zone falls back",
 
 check("an oversized dead zone is clamped",
       ns["resolve_deadzone"](with_config("pan_deadzone_px = 9000\n")), 500)
-
-# --- other-mouse yield dead zone -------------------------------------------------
-check("yield dead zone defaults to 20px",
-      ns["resolve_yield_deadzone"](with_config(None)), 20)
-
-check("a custom yield dead zone is honoured",
-      ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = 8\n")), 8)
-
-check("zero disables the yield dead zone",
-      ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = 0\n")), 0)
-
-check("a junk yield dead zone falls back",
-      ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = far\n")), 20)
-
-check("an oversized yield dead zone is clamped",
-      ns["resolve_yield_deadzone"](with_config("pan_yield_deadzone_px = 9000\n")), 500)
 
 # --- rotate scale ---------------------------------------------------------------
 check("rotate scale defaults to 0.5",
@@ -133,7 +95,7 @@ check("can be switched to the original mapping",
 check("'no' also disables it",
       ns["resolve_pan_button"](with_config("pan_requires_right_button = no\n")), False)
 
-check("an unrecognised value reads as false, same as pan_yield_to_other_mice",
+check("an unrecognised value reads as false",
       ns["resolve_pan_button"](with_config("pan_requires_right_button = sideways\n")), False)
 
 # --- device -------------------------------------------------------------------

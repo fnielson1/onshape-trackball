@@ -97,15 +97,14 @@ function loadProbe(layout, listeners = {}, clock = null) {
     // without the suite sleeping through it.
     Date: clock ? { now: () => clock.t } : Date,
     MutationObserver: class { observe() {} disconnect() {} },
-    chrome: { runtime: { sendMessage() {} } },
+    chrome: { runtime: { sendMessage() {}, onMessage: { addListener() {} } } },
     console,
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
 
   const source = fs.readFileSync(CONTENT, "utf8")
-    + "\n;globalThis.__probe = { safeRect, largestClearRect, biggestCanvas,"
-    + " suppressionReason };";
+    + "\n;globalThis.__probe = { safeRect, largestClearRect, biggestCanvas };";
   vm.runInContext(source, sandbox);
   return sandbox.__probe;
 }
@@ -245,7 +244,7 @@ for (const c of CASES) {
   // only matter for the offset, so any consistent pair will do.
   const move = listeners.mousemove && listeners.mousemove[0];
   if (move) {
-    move({ clientX: WIDGET.left + 10, clientY: WIDGET.top + 10,
+    move({ isTrusted: true, clientX: WIDGET.left + 10, clientY: WIDGET.top + 10,
            screenX: WIDGET.left + 10, screenY: WIDGET.top + 70 });
   }
 
@@ -265,79 +264,6 @@ for (const c of CASES) {
       ? "grid missed it, the pointer check caught it"
       : "grid happened to sample it";
     console.log(`PASS  a widget under the pointer is excluded (${note})`);
-  }
-}
-
-// --- suppressing the menu ---------------------------------------------------------
-// Both mice drive one cursor, and the page cannot tell their events apart, so
-// suppression cannot key on "which mouse". It keys on the shape of the gesture: the
-// daemon's pan still has Ctrl down when the button comes up, and its drags travel. A
-// human clicking for a menu does neither.
-//
-// The case that matters most here is the last one. Over-suppressing would take away
-// the user's own right-click, which is a worse bug than the one being fixed.
-{
-  const CANVAS_POINT = { x: 900, y: 500 };
-
-  function gesture({ ctrl = false, drag = 0, button = true, afterMs = 0, downMs = 0 }) {
-    const clock = { t: 1000000 };
-    const listeners = {};
-    const layout = buildLayout([]);
-    const probe = loadProbe(layout, listeners, clock);
-
-    const fire = (type, ev) => (listeners[type] || []).forEach(fn => fn(ev));
-
-    if (button) {
-      fire("mousedown", { button: 2, clientX: CANVAS_POINT.x, clientY: CANVAS_POINT.y });
-      clock.t += downMs;
-      if (drag) {
-        fire("mousemove", {
-          clientX: CANVAS_POINT.x + drag, clientY: CANVAS_POINT.y,
-          screenX: CANVAS_POINT.x + drag, screenY: CANVAS_POINT.y + 70,
-        });
-      }
-      fire("mouseup", { button: 2 });
-    }
-    clock.t += afterMs;
-
-    return probe.suppressionReason({ ctrlKey: ctrl });
-  }
-
-  const SUPPRESSION_CASES = [
-    ["a pan: ctrl still down when the button came up",
-     { ctrl: true, drag: 40 }, true],
-
-    ["a pan whose drag was too short to look like one",
-     { ctrl: true, drag: 0 }, true],
-
-    ["a rotate: ctrl dropped, but the button travelled",
-     { ctrl: false, drag: 40 }, true],
-
-    ["a real right-click: no ctrl, no travel",
-     { ctrl: false, drag: 0 }, false],
-
-    ["a real right-click with a pixel of hand tremor",
-     { ctrl: false, drag: 2 }, false],
-
-    ["the keyboard menu key, with no button press at all",
-     { ctrl: false, drag: 0, button: false }, false],
-
-    ["a menu long after the button was last touched",
-     { ctrl: true, drag: 40, afterMs: 5000 }, false],
-  ];
-
-  for (const [name, opts, expected] of SUPPRESSION_CASES) {
-    checks++;
-    const reason = gesture(opts);
-    const got = reason !== null;
-    if (got !== expected) {
-      failures++;
-      console.log(`FAIL  ${name}`);
-      console.log(`        expected ${expected ? "suppressed" : "left alone"}, `
-                  + `got ${got ? `suppressed (${reason})` : "left alone"}`);
-    } else {
-      console.log(`PASS  ${expected ? "suppressed" : "left alone"}: ${name}`);
-    }
   }
 }
 
