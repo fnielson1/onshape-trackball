@@ -237,8 +237,7 @@ Each entry carries a `why`, and the four causes need different fixes:
 | --- | --- | --- |
 | on an overlay **INSIDE** the region we reported safe | The probe missed something. `target` names the element it missed | Raise `DISCOVERY_COLS`/`DISCOVERY_ROWS` in `content.js` — the overlay was smaller than the sample spacing |
 | on an overlay **outside** the region | The cursor got somewhere it should not have been: a recentre that did not keep up with a fast flick, or a press that landed before one | Raise `RECENTER_MARGIN`, or lower `RECENTER_CHECK_INTERVAL` |
-| on the canvas after **only N px** of drag | Chrome's own menu is already covered — rotate's release tags itself with Ctrl, checked before this. This `why` is about *Onshape's own* canvas menu instead: it opens straight out of Onshape's mouseup handling, ignores Ctrl, and just wants real on-screen distance, which `ROTATE_SCALE` usually shrinks | Raise `min_drag_px` in the config file (default `10`) |
-| on the canvas after **N px** of drag | A real drag, so this is Onshape's own canvas menu opening normally — not a stray press | Nothing here; it is Onshape's behaviour |
+| **on the canvas** | Chrome's own menu is already covered — rotate's release tags itself with Ctrl, checked before this. This `why` is about *Onshape's own* canvas menu instead: it opens straight out of Onshape's mouseup handling, ignores Ctrl, and just wants real on-screen distance | Nothing here; it is Onshape's behaviour |
 | **not during a pan** | Not this mouse at all — the other mouse, or a real right-click | Nothing |
 
 `menu_shown` separates the menu you actually saw from one that was suppressed or that

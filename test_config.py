@@ -123,22 +123,6 @@ check("below the floor is clamped up",
 check("above the ceiling is clamped down",
       ns["resolve_rotate_scale"](with_config("rotate_scale = 50\n")), 5.0)
 
-# --- minimum drag before a release is nudged -------------------------------------
-check("min drag defaults to 10px (Onshape's own click-vs-drag check still needs real distance)",
-      ns["resolve_min_drag_px"](with_config(None)), 10)
-
-check("a custom value is honoured",
-      ns["resolve_min_drag_px"](with_config("min_drag_px = 4\n")), 4)
-
-check("zero disables the nudge's shortfall entirely",
-      ns["resolve_min_drag_px"](with_config("min_drag_px = 0\n")), 0)
-
-check("a junk value falls back",
-      ns["resolve_min_drag_px"](with_config("min_drag_px = far\n")), 10)
-
-check("an oversized value is clamped",
-      ns["resolve_min_drag_px"](with_config("min_drag_px = 9000\n")), 200)
-
 # --- which gesture the right button performs -------------------------------------
 check("defaults to true: hold the button to pan",
       ns["resolve_pan_button"](with_config(None)), True)

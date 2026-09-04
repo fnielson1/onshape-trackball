@@ -218,40 +218,6 @@ PAN_DEADZONE = 10
 # install and a daemon started with no config file at all should agree.
 PAN_YIELD_DEADZONE = 20
 
-# A press and release with nothing in between is a click, and Chrome opens a context
-# menu on one. That part is now covered for free: _release_right_button tags rotate's
-# release with Ctrl, which extension/content.js checks first and unconditionally,
-# ahead of distance — no motion needed.
-#
-# What still needs real, on-screen distance is Onshape itself. Confirmed by tracing a
-# live repro: Onshape opens its own canvas menu straight out of its own mouseup
-# handling — no `contextmenu` event involved, Ctrl included or not — purely on how the
-# cursor moved between press and release. A gesture that survived the dead zone can
-# still land here, because ROTATE_SCALE halves (by default) whatever distance reaches
-# the screen, deliberately, to keep rotation from feeling hypersensitive.
-#
-# The exact threshold could not be pinned precisely — driving Onshape's canvas
-# directly to bracket it hit a real confound: every accepted "drag" also rotates the
-# camera, and after enough trials the cursor drifts off the part onto empty
-# background, where the click/drag boundary behaves differently, so later readings in
-# the same session cannot be trusted against earlier ones. What held up: real hardware
-# never failed above 6.7px in the daemon's own release logs, and a real right-click
-# with only 3.0px of travel did open Onshape's menu. This sits with margin above that
-# window. Every pixel here is still a pixel Onshape rotates by, so it is not free,
-# just far cheaper than the fix that came before it.
-#
-# Overridden by min_drag_px in the config file; this is the fallback.
-MIN_DRAG_PX = 8
-
-# The nudge above is split across this many samples rather than written as one lump
-# sum, NUDGE_STEP_INTERVAL apart, so it looks like the tail of a real stroke rather
-# than a teleport — real hardware never reports a lump sum for real motion, a rolling
-# trackball sends dozens of small samples for any genuine movement. Live testing could
-# not fully separate this from the camera-drift confound above, so treat it as a
-# reasonable-and-harmless precaution rather than a proven necessity.
-NUDGE_STEPS = 3
-NUDGE_STEP_INTERVAL = 0.008
-
 # How often the cached window rect is re-read, to survive a move or resize that
 # happens without any focus change.
 GEOMETRY_REFRESH = 2.0
@@ -351,8 +317,6 @@ class Translator:
         self._edge_travel = 0.0     # distance sent since the last edge check
         self.recenters = 0
         self.yields = 0
-        self._last_press_pos = None
-        self._last_press_time = 0.0
         self._travel_x = 0.0
         self._travel_y = 0.0
         self._rotate_remainder_x = 0.0
@@ -360,7 +324,6 @@ class Translator:
         self._other_travel_x = 0.0
         self._other_travel_y = 0.0
         self._other_travel_at = 0.0
-        self.drag_nudges = 0
         self._yield_until = 0.0
         self.presses_recentred = 0
         self.left_taps = 0
@@ -392,13 +355,9 @@ class Translator:
         return centre
 
     def _press_pan(self):
-        now = time.monotonic()
         position = POINTER.position() if POINTER.ok else None
-        position = self._ensure_inside_window(position)
-
+        self._ensure_inside_window(position)
         self._emit_pan_down()
-        self._last_press_pos = position
-        self._last_press_time = now
 
     def _within_deadzone(self):
         return (self._travel_x * self._travel_x + self._travel_y * self._travel_y
@@ -520,71 +479,6 @@ class Translator:
             self._ui.syn()
             self._right_emitted = True
 
-    def _nudge_for_drag(self):
-        """Guarantee a little displacement before releasing a button.
-
-        A press and release with nothing between them is a click, and Ctrl +
-        right-click opens Chrome's context menu mid-pan. Moving first makes every
-        gesture read as a drag instead. The move does pan or rotate the model too,
-        which is why only the shortfall is added — not a flat MIN_DRAG_PX on top of
-        whatever real motion already happened. A stroke sitting a couple of pixels
-        under the line does not deserve the full nudge; that would read as a stray
-        jump right when a small, deliberate rotate is trying to land on an angle.
-
-        Returns (measured_px, nudged) for the release record: how far the cursor had
-        actually travelled since the press, and whether we had to make up the
-        difference. A context menu arriving just after a release with a small
-        measured_px is the signature of a drag that the page read as a click.
-        """
-        position = POINTER.position() if POINTER.ok else None
-
-        measured = None
-        nudge_px = MIN_DRAG_PX
-        dx = 0.0
-        if position is not None and self._last_press_pos is not None:
-            dx = position[0] - self._last_press_pos[0]
-            dy = position[1] - self._last_press_pos[1]
-            measured = (dx * dx + dy * dy) ** 0.5
-            if measured >= MIN_DRAG_PX:
-                return measured, False      # already dragged far enough
-            # +1 rather than the bare shortfall: the nudge only moves along X while
-            # `measured` is the true diagonal, so a stroke that was mostly vertical
-            # needs a little more than the arithmetic difference to actually clear
-            # the line once combined with whatever X displacement already existed.
-            nudge_px = int(MIN_DRAG_PX - measured) + 1
-
-        # Continue in whichever direction the stroke was already heading, so the
-        # nudge reads as a bit more of the same rotate rather than a flick the other
-        # way — a rotate to the left must not get finished off with a nudge to the
-        # right. Only when the existing motion was ambiguous (essentially no X
-        # component) does this default to the right, for the edge check below to
-        # override if needed.
-        direction = -1 if dx < 0 else 1
-
-        geometry = GATE.view_rect()
-        if position is not None and geometry is not None:
-            win_x, _, win_w, _ = geometry
-            if direction > 0 and position[0] + nudge_px > win_x + win_w - 8:
-                direction = -1
-            elif direction < 0 and position[0] - nudge_px < win_x + 8:
-                direction = 1
-
-        # Split rather than written as one lump sum, so it looks like the tail of a
-        # real stroke rather than a teleport — see NUDGE_STEPS.
-        steps = min(NUDGE_STEPS, max(1, nudge_px))
-        base = nudge_px // steps
-        remainder = nudge_px - base * steps
-        for i in range(steps):
-            step_px = base + (1 if i < remainder else 0)
-            if step_px == 0:
-                continue
-            self._ui.write(ecodes.EV_REL, ecodes.REL_X, direction * step_px)
-            self._ui.syn()
-            if i < steps - 1:
-                time.sleep(NUDGE_STEP_INTERVAL)
-        self.drag_nudges += 1
-        return measured, True
-
     def _release_right_button(self):
         """Every right-button release goes through here, so none of them can ever
         land as a bare click.
@@ -594,24 +488,13 @@ class Translator:
         anything it infers from distance: `event.ctrlKey` is the *first* thing
         suppressionReason() looks at. Rotate never holds Ctrl during the drag — that
         is what makes it rotate rather than pan — so its release had nothing to give
-        the page the same certainty, and fell back to the nudge below as the only
-        signal available. That fallback works, but every pixel it adds is a pixel
-        Onshape rotates by, which reads as a stray flick right when a small,
-        deliberate rotate is trying to land on an angle.
+        the page the same certainty.
 
         So rotate's release borrows pan's own trick instead: Ctrl goes down just for
         the instant the button lifts, then comes back up. No motion is sent while it
         is up, so this changes nothing about the drag Onshape already saw — only
         what the release itself looks like to the page, which is now indistinguishable
         from pan's — for the browser's own menu.
-
-        Onshape's own canvas menu is a separate problem this cannot touch: it opens
-        straight out of Onshape's own mouseup handling, no `contextmenu` event
-        involved, and does not care about Ctrl either way — only how far the cursor
-        actually moved on screen between press and release, which ROTATE_SCALE has
-        usually shrunk well below what a real hand movement would suggest. The nudge
-        below is what still has to cover that: real, if modest, on-screen distance,
-        because that is the only thing Onshape's own check reads.
 
         The syn is essential, not tidiness: the modifier lives on a second device
         with its own stream, and an unflushed button release would arrive *after*
@@ -626,16 +509,12 @@ class Translator:
             self._ctrl(1)
             time.sleep(MODIFIER_SETTLE)
 
-        measured, nudged = self._nudge_for_drag()
-
         # Kept so a context-menu report arriving from the page can be lined up against
         # the release that most likely caused it. This is the daemon's half of that
         # story; the page supplies what the menu actually opened on.
         position = POINTER.position() if POINTER.ok else None
         self.last_release = {
             "at": time.monotonic(),
-            "moved_px": None if measured is None else round(measured, 1),
-            "nudged": nudged,
             "at_pos": position,
             "in_view_rect": _inside(GATE.view_rect(), position),
         }
@@ -725,8 +604,6 @@ class Translator:
             self._ctrl(1)
             time.sleep(MODIFIER_SETTLE)
         self._repress_right_button()
-        self._last_press_pos = POINTER.position() if POINTER.ok else None
-        self._last_press_time = time.monotonic()
         self._reset_deadzone()      # a resumed stroke earns its own dead zone too
 
     # --- public ------------------------------------------------------------------
@@ -871,8 +748,6 @@ class Translator:
             # untouched — _press_pan would re-decide it from PAN_REQUIRES_RIGHT_BUTTON,
             # which is only correct for the free gesture — so only the button itself
             # needs to come back.
-            self._last_press_pos = (centre_x, centre_y)
-            self._last_press_time = time.monotonic()
             self._repress_right_button()
         self._ui.syn()
         self.recenters += 1
@@ -998,7 +873,6 @@ class Translator:
                 "presses_recentred": self.presses_recentred,
                 "left_taps": self.left_taps,
                 "ctrl_held": self._ctrl_down,
-                "drag_nudges": self.drag_nudges,
             }
 
 
@@ -1108,9 +982,9 @@ class Gate:
           overlay, outside our region -> the cursor got somewhere it should not have:
                                          a recentre that did not keep up, or a press
                                          that landed before one
-          canvas, short release       -> our own drag read as a click, so Onshape (or
-                                         Chrome) offered a menu on the canvas itself;
-                                         look at moved_px against MIN_DRAG_PX
+          on the canvas               -> the region was right and the cursor was
+                                         where we meant it to be; Onshape's own
+                                         canvas menu, not a bug here
           not while panning           -> not ours at all; the other mouse, or a real
                                          right-click
         """
@@ -1131,18 +1005,8 @@ class Gate:
                 why = "not during a pan (other mouse, or a real right-click)"
             elif on_canvas:
                 # On the canvas the region was right and the cursor was where we meant
-                # it to be, so the cause is the gesture itself — but only if the drag
-                # really was too short. A menu after a healthy drag is Onshape's own
-                # canvas menu, which is a different thing entirely and not a bug here.
-                moved = release and release.get("moved_px")
-                if moved is None:
-                    why = "on the canvas, with no release measurement to compare"
-                elif moved < MIN_DRAG_PX:
-                    why = (f"on the canvas after only {moved}px of drag "
-                           f"(MIN_DRAG_PX={MIN_DRAG_PX}) — the page read it as a click")
-                else:
-                    why = (f"on the canvas after {moved}px of drag — a real drag, so "
-                           f"this is Onshape's own canvas menu, not a stray press")
+                # it to be, so this is Onshape's own canvas menu, not a bug here.
+                why = "on the canvas — Onshape's own canvas menu"
             elif in_region is True:
                 why = "on an overlay INSIDE the region we reported safe — probe missed it"
             elif in_region is False:
@@ -1222,7 +1086,6 @@ class Gate:
         state["pan_yield_deadzone_px"] = PAN_YIELD_DEADZONE
         state["pan_requires_right_button"] = PAN_REQUIRES_RIGHT_BUTTON
         state["rotate_scale"] = ROTATE_SCALE
-        state["min_drag_px"] = MIN_DRAG_PX
         state["left_click_key"] = LEFT_CLICK_KEY
         state["device_attached"] = translator is not None
         if translator is not None:
@@ -1479,23 +1342,6 @@ def resolve_deadzone(config):
     return clamped
 
 
-def resolve_min_drag_px(config):
-    """A bad value is a typo in a hand-edited file, so warn and fall back rather than
-    refusing to start."""
-    raw = config.get("min_drag_px")
-    if raw is None:
-        return MIN_DRAG_PX
-    try:
-        value = int(float(raw))
-    except ValueError:
-        log(f"min_drag_px: '{raw}' is not a number; using {MIN_DRAG_PX}")
-        return MIN_DRAG_PX
-    clamped = max(0, min(200, value))
-    if clamped != value:
-        log(f"min_drag_px: {value} is outside 0-200; using {clamped}")
-    return clamped
-
-
 def resolve_yield_deadzone(config):
     raw = config.get("pan_yield_deadzone_px")
     if raw is None:
@@ -1567,7 +1413,7 @@ def resolve_pan_idle(config):
 def main():
     global DEVICE_PATH, PAN_IDLE_RELEASE, RECENTER, RECENTER_MARGIN, PAN_YIELD
     global PAN_DEADZONE, PAN_YIELD_DEADZONE, PAN_REQUIRES_RIGHT_BUTTON
-    global LEFT_CLICK_KEY, LEFT_CLICK_CODE, ROTATE_SCALE, MIN_DRAG_PX
+    global LEFT_CLICK_KEY, LEFT_CLICK_CODE, ROTATE_SCALE
     _open_log()
     config = read_config()
     DEVICE_PATH = resolve_device(config)
@@ -1579,7 +1425,6 @@ def main():
     PAN_REQUIRES_RIGHT_BUTTON = resolve_pan_button(config)
     LEFT_CLICK_KEY, LEFT_CLICK_CODE = resolve_left_click(config)
     ROTATE_SCALE = resolve_rotate_scale(config)
-    MIN_DRAG_PX = resolve_min_drag_px(config)
 
     # Must happen before any window rect is read: on Windows an un-declared process
     # gets virtualised coordinates from GetWindowRect while the cursor answers in
@@ -1601,7 +1446,7 @@ def main():
         f"({pan_trigger}, dead zone {PAN_DEADZONE}px, "
         f"yield dead zone {PAN_YIELD_DEADZONE}px, "
         f"idle release {PAN_IDLE_RELEASE * 1000:.0f}ms, "
-        f"rotate scale {ROTATE_SCALE:g}, min drag {MIN_DRAG_PX}px, "
+        f"rotate scale {ROTATE_SCALE:g}, "
         f"{recentring}, backend {backend.name})")
 
     while True:

@@ -482,111 +482,6 @@ if not clean:
     print(f"      ctrl_held={tr._ctrl_down}, right_emitted={tr._right_emitted}, log={log}")
 results.append(clean)
 
-# --- every release must be a drag, never a bare click ---------------------------
-# Ctrl + right-click with no movement opens Chrome's context menu mid-pan. The nudge
-# below is now a fallback (the Ctrl tag in _release_right_button is what actually
-# covers this day to day — see the ctrl_right cases above), but it still needs to
-# work correctly for whoever ends up relying on it, so these exercise it directly
-# with a nonzero min_drag_px; the production default is 0, which turns it off.
-saved_min_drag = ns['MIN_DRAG_PX']
-ns['MIN_DRAG_PX'] = 12
-
-# Press then release with the pointer never moving: a nudge must be emitted first.
-# With zero real motion, the shortfall is the whole MIN_DRAG_PX, plus the +1 margin
-# _nudge_for_drag always adds for the X-only-vs-diagonal mismatch. Split across
-# NUDGE_STEPS separate REL/SYN pairs rather than one lump write — a single jump reads
-# as a click to Onshape's own orbit control regardless of size, confirmed by driving
-# its canvas directly, where real hardware never sends a lump sum for real motion.
-tr, log = ctrl_setup()
-tr._press_pan()
-log.clear()
-tr._release_right_button()
-rel_events = [x for x in log if x[0] == 'REL']
-nudged = (len(rel_events) == ns['NUDGE_STEPS']
-          and all(x[1] == 'X' for x in rel_events)
-          and sum(x[2] for x in rel_events) == ns['MIN_DRAG_PX'] + 1
-          and log[-2] == ('KEY','RIGHT',0)
-          and log.index(rel_events[-1]) < log.index(('KEY','RIGHT',0))
-          and tr.drag_nudges == 1)
-print(f"{'PASS' if nudged else 'FAIL'}  a motionless release is nudged into a drag first")
-if not nudged:
-    print(f"      log={log}, nudges={tr.drag_nudges}")
-results.append(nudged)
-
-# A stroke that was almost far enough only needs a small top-up, not the flat
-# MIN_DRAG_PX on top — a big unconditional add-on is exactly the kind of stray jump
-# that ruins a small, deliberate rotate landing on an angle.
-tr, log = ctrl_setup()
-tr._press_pan()
-ns['POINTER']._pos = (CENTRE[0] + ns['MIN_DRAG_PX'] - 2, CENTRE[1])   # 2px short
-log.clear()
-tr._release_right_button()
-rel_events = [x for x in log if x[0] == 'REL']
-topped_up = (rel_events and sum(x[2] for x in rel_events) == 3   # shortfall 2px + the 1px margin
-             and tr.drag_nudges == 1)
-print(f"{'PASS' if topped_up else 'FAIL'}  a near-miss release only tops up the shortfall")
-if not topped_up:
-    print(f"      log={log}, nudges={tr.drag_nudges}")
-results.append(topped_up)
-
-# The nudge must continue in the direction the drag was already heading, not always
-# to the right — a rotate to the left must not get finished off with a nudge to the
-# right, which reads as a stray flick the other way rather than more of the same
-# rotate.
-tr, log = ctrl_setup()
-tr._press_pan()
-ns['POINTER']._pos = (CENTRE[0] - (ns['MIN_DRAG_PX'] - 2), CENTRE[1])   # moved left, 2px short
-log.clear()
-tr._release_right_button()
-rel_events = [x for x in log if x[0] == 'REL']
-follows_direction = (rel_events and all(x[2] < 0 for x in rel_events)
-                      and sum(x[2] for x in rel_events) == -3
-                      and tr.drag_nudges == 1)
-print(f"{'PASS' if follows_direction else 'FAIL'}  the nudge continues in the drag's own direction")
-if not follows_direction:
-    print(f"      log={log}, nudges={tr.drag_nudges}")
-results.append(follows_direction)
-
-# Already dragged far enough: no extra nudge, so no stray pan.
-tr, log = ctrl_setup()
-tr._press_pan()
-ns['POINTER']._pos = (CENTRE[0] + 200, CENTRE[1])
-log.clear()
-tr._release_right_button()
-clean = (log == [('KEY','RIGHT',0), ('SYN',)] and tr.drag_nudges == 0)
-print(f"{'PASS' if clean else 'FAIL'}  a real drag is released without an extra nudge")
-if not clean:
-    print(f"      log={log}, nudges={tr.drag_nudges}")
-results.append(clean)
-
-# The nudge steers away from the window edge rather than off it.
-tr, log = ctrl_setup()
-tr._press_pan()
-ns['POINTER']._pos = (WINDOW[0] + WINDOW[2] - 2, CENTRE[1])
-tr._last_press_pos = ns['POINTER']._pos
-log.clear()
-tr._release_right_button()
-inward = any(x[0] == 'REL' and x[2] < 0 for x in log)
-print(f"{'PASS' if inward else 'FAIL'}  the nudge steers inward at the window edge")
-if not inward:
-    print(f"      log={log}")
-results.append(inward)
-
-# Ending a pan normally goes through the same path.
-tr, log = ctrl_setup()
-for e in motion(1):
-    tr.handle(e)
-log.clear()
-tr._end_pan(syn=True)
-ordered = [x for x in log if x[0] in ('REL','KEY')]
-via_nudge = (ordered and ordered[0][0] == 'REL'
-             and ('KEY','RIGHT',0) in ordered and ('KEY','CTRL',0) in ordered
-             and ordered.index(('KEY','RIGHT',0)) < ordered.index(('KEY','CTRL',0)))
-print(f"{'PASS' if via_nudge else 'FAIL'}  ending a pan nudges, releases right, then Ctrl")
-if not via_nudge:
-    print(f"      log={log}")
-results.append(via_nudge)
-
 # --- canvas rect ----------------------------------------------------------------
 # The cursor should be penned inside the 3D canvas, not merely inside the window:
 # Onshape's toolbars and feature tree are inside the window but outside the canvas,
@@ -647,30 +542,21 @@ def classify(panning, last_release, event):
     g.record_context_menu([event])
     return g._context_menus[-1]
 
-fresh = lambda moved: {"at": time.monotonic(), "moved_px": moved, "nudged": False,
-                       "at_pos": (900, 500), "in_view_rect": True}
+fresh = lambda: {"at": time.monotonic(), "at_pos": (900, 500), "in_view_rect": True}
 
 cases = [
     ("an overlay inside the region we called safe",
-     True, fresh(40.0),
+     True, fresh(),
      {"onCanvas": False, "inRegion": True, "target": "div.toolbar", "x": 900, "y": 500},
      "probe missed it"),
 
     ("an overlay outside the region",
-     True, fresh(40.0),
+     True, fresh(),
      {"onCanvas": False, "inRegion": False, "target": "div.tree", "x": 100, "y": 500},
      "should not have been there"),
 
-    ("the canvas itself, after too short a drag",
-     True, fresh(1.0),
-     {"onCanvas": True, "inRegion": True, "target": "canvas", "x": 900, "y": 500},
-     "read it as a click"),
-
-    # Same place, same gesture, but the drag was real — so this is Onshape offering its
-    # own canvas menu, which is not the bug being hunted. Reporting both the same way
-    # would send you looking for a fault that is not there.
-    ("the canvas after a healthy drag",
-     True, fresh(40.0),
+    ("the canvas itself",
+     True, fresh(),
      {"onCanvas": True, "inRegion": True, "target": "canvas", "x": 900, "y": 500},
      "Onshape's own canvas menu"),
 
@@ -691,10 +577,10 @@ for label, panning, release, event, expect in cases:
 # The native menu actually appearing is a different fact from the event firing: Onshape
 # suppresses the ones it handles itself, and only the unsuppressed ones are the browser
 # menu the user complains about.
-suppressed = classify(True, fresh(40.0),
+suppressed = classify(True, fresh(),
                       {"onCanvas": True, "inRegion": True, "target": "canvas",
                        "x": 900, "y": 500, "prevented": True})
-shown = classify(True, fresh(40.0),
+shown = classify(True, fresh(),
                  {"onCanvas": True, "inRegion": True, "target": "canvas",
                   "x": 900, "y": 500, "prevented": False})
 distinguishes = (suppressed["menu_shown"] is False
@@ -704,7 +590,7 @@ results.append(distinguishes)
 
 # Only the most recent reports are kept, or --status becomes a log file.
 g = ns['Gate']()
-g.translator = StubTranslator(True, fresh(40.0))
+g.translator = StubTranslator(True, fresh())
 g.record_context_menu([{"onCanvas": True, "inRegion": True, "target": f"c{i}",
                         "x": 1, "y": 1} for i in range(ns['CONTEXT_MENU_HISTORY'] + 15)])
 bounded = len(g._context_menus) == ns['CONTEXT_MENU_HISTORY']
@@ -715,7 +601,7 @@ results.append(bounded)
 
 # Junk off the network must not take the daemon down with it.
 g = ns['Gate']()
-g.translator = StubTranslator(True, fresh(40.0))
+g.translator = StubTranslator(True, fresh())
 try:
     g.record_context_menu(["nonsense", None, 42, {}])
     survived = True
@@ -724,8 +610,6 @@ except Exception as exc:
     print(f"      raised {exc!r}")
 print(f"{'PASS' if survived else 'FAIL'}  malformed context-menu reports are ignored, not fatal")
 results.append(survived)
-
-ns['MIN_DRAG_PX'] = saved_min_drag
 
 # The point of all this: a cursor comfortably inside the window but at the canvas
 # edge must still be recentred, into the canvas rather than the window.
