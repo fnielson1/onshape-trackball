@@ -94,6 +94,24 @@ const POINTER_CHECK_INTERVAL = 30;
 // Bounded, because it is keyed on live elements and this page runs for hours.
 const MAX_POINTER_HITS = 32;
 
+// A right-button stroke that ends with next to no net motion reads to Onshape as an
+// ordinary right-click, not a drag, and it opens its own canvas context menu in
+// response — see gcEndGesture and the contextmenu listener below. These bound how
+// closely a contextmenu event has to follow our own synthetic release, in both space
+// and time, to be confidently attributed to that release rather than to the other
+// mouse's genuine right-click landing on the canvas by coincidence.
+const MENU_SUPPRESS_WINDOW_MS = 250;
+const MENU_SUPPRESS_TOLERANCE_PX = 3;
+
+// A right-button release lands here or closer to its own press reads to Onshape as a
+// plain click rather than a drag, which is what actually opens its canvas menu — not
+// the tolerance above, which only covers the browser-level contextmenu event itself.
+// gcEndGesture nudges every such release out past this distance, so Onshape never
+// sees a release close enough to its press to read as a click at all, regardless of
+// how little the trackball itself moved — a quick tap, or the last fragment of a
+// drag right before pan_idle_release_ms cuts it off, both included.
+const FORCE_DRAG_MIN_PX = 6;
+
 let offset = null;
 let pointerHits = new Set();
 // The last region we reported, in viewport coordinates. The daemon gets it in
@@ -109,14 +127,22 @@ let lastPointerCheck = 0;
 let rightDownAt = null;
 let rightDragMax = 0;
 
+// Where and when gcEndGesture last dispatched a synthetic right-button mouseup — see
+// MENU_SUPPRESS_WINDOW_MS above and the contextmenu listener below, which use this to
+// tell Onshape's own canvas menu reacting to *that* release apart from a genuine
+// right-click by the other mouse.
+let lastSyntheticRelease = null;
+
 // isTrusted excludes this extension's own synthetic dispatch (see the gesture
 // synthesis section near the end of this file) from all three listeners below. This
 // used to matter for suppression too — Chrome could raise its own context menu from
 // the gated mouse's real, OS-injected Ctrl+right-drag, and untangling "our gesture"
-// from "a genuine right-click" needed exactly this kind of tracking. Nothing here is
-// OS-level input any more, on either mouse, so that whole mechanism (and the
-// suppression it drove) is gone — see README's "Stopping them" section for why. What
-// is left is diagnostic only.
+// from "a genuine right-click" needed exactly this kind of tracking. That mechanism is
+// gone — see README's "Stopping them" section for why — but suppression itself is
+// back below, keyed on lastSyntheticRelease instead: Chrome's own menu is still
+// unreachable from synthetic input, but Onshape's own in-page canvas menu isn't, and
+// reacts to our own dispatch as if it were a real click. What's left of this
+// isTrusted-based tracking is diagnostic only.
 
 addEventListener("mousedown", event => {
   if (!event.isTrusted || event.button !== 2) return;
@@ -184,12 +210,32 @@ function describe(element) {
 addEventListener("contextmenu", event => {
   const canvas = biggestCanvas();
   const region = lastSafeViewport;
+  const onCanvas = Boolean(canvas && event.target === canvas);
+
+  // Attribute this menu to our own gesture only if it lines up, tightly, with the
+  // release gcEndGesture just fired — not on gcActive/panning state alone, which
+  // stays true across the whole gate session and would just as happily match the
+  // other mouse's real right-click on the canvas. See MENU_SUPPRESS_WINDOW_MS.
+  const ours = onCanvas && lastSyntheticRelease
+    && Date.now() - lastSyntheticRelease.at <= MENU_SUPPRESS_WINDOW_MS
+    && Math.abs(event.clientX - lastSyntheticRelease.x) <= MENU_SUPPRESS_TOLERANCE_PX
+    && Math.abs(event.clientY - lastSyntheticRelease.y) <= MENU_SUPPRESS_TOLERANCE_PX;
+
+  if (ours) {
+    // preventDefault stops it if Onshape's own handler is gated on this event the
+    // normal way; the Escape tap is the fallback for if it isn't — Onshape dispatched
+    // this event itself off our synthetic mouseup, so its menu may already be
+    // committed to opening regardless of what happens to the event object. Escape is
+    // a near-universal "close this overlay" convention, including in Onshape's own UI.
+    event.preventDefault();
+    gcTapKey("esc");
+  }
 
   const info = {
     at: Date.now(),
     x: Math.round(event.clientX),
     y: Math.round(event.clientY),
-    onCanvas: Boolean(canvas && event.target === canvas),
+    onCanvas,
     target: describe(event.target),
     dragPx: Math.round(rightDragMax),
     ctrl: Boolean(event.ctrlKey),
@@ -414,8 +460,12 @@ function probe() {
     // contextmenu reporting; 7 started suppressing them; 8 dropped that suppression
     // again — nothing here is OS-level input any more, on either mouse, so there was
     // nothing left for it to protect against, and it risked eating the other mouse's
-    // genuine right-clicks instead. See README's "Stopping them" section.
-    v: 8,
+    // genuine right-clicks instead (see README's "Stopping them" section); 9
+    // reintroduced it narrowly, keyed on lastSyntheticRelease rather than on
+    // ctrlKey/dragPx, so it can no longer match anything but our own release; 10
+    // added FORCE_DRAG_MIN_PX, which stops Onshape's canvas menu from being
+    // triggered at all rather than reacting after the fact.
+    v: 10,
     canvases: document.querySelectorAll("canvas").length,
     offset: Boolean(offset),
     usable: usable ? [Math.round(usable.width), Math.round(usable.height)] : null,
@@ -509,6 +559,9 @@ let gcGesture = null;        // "pan" | "rotate" | null: the currently open drag
 // so unlike a real cursor there is no edge to run out of. Only the on-page *icon* is
 // clamped, below, for cosmetic reasons.
 let gcVirtual = null;
+// Where gcBeginGesture opened the current stroke, so gcEndGesture can tell how far
+// it travelled — see FORCE_DRAG_MIN_PX.
+let gcPressPos = null;
 let gcGatedIcon = null;
 let gcOtherIcon = null;
 let gcCursorNoneStyle = null;
@@ -612,6 +665,7 @@ function gcBeginGesture(gesture) {
   if (!canvas) return;
   if (!gcVirtual) gcVirtual = gcSeedPosition();
   gcGesture = gesture;
+  gcPressPos = { x: gcVirtual.x, y: gcVirtual.y };
   gcFireMouse(canvas, "mousedown", gcVirtual.x, gcVirtual.y, gesture === "pan");
 }
 
@@ -631,9 +685,33 @@ function gcEndGesture() {
   if (!gcGesture) return;
   const canvas = biggestCanvas();
   if (canvas && gcVirtual) {
-    gcFireMouse(canvas, "mouseup", gcVirtual.x, gcVirtual.y, gcGesture === "pan");
+    let releaseX = gcVirtual.x, releaseY = gcVirtual.y;
+
+    // See FORCE_DRAG_MIN_PX. gcVirtual itself is left untouched — this only shifts
+    // where the release lands, not where the next gesture picks up from, so a run of
+    // near-still taps cannot walk the real position anywhere over time.
+    if (gcPressPos) {
+      const dx = releaseX - gcPressPos.x;
+      const dy = releaseY - gcPressPos.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < FORCE_DRAG_MIN_PX) {
+        // Nothing to preserve the direction of when there was no motion at all —
+        // any fixed direction works equally well there.
+        const angle = dist > 0 ? Math.atan2(dy, dx) : 0;
+        releaseX = gcPressPos.x + Math.cos(angle) * FORCE_DRAG_MIN_PX;
+        releaseY = gcPressPos.y + Math.sin(angle) * FORCE_DRAG_MIN_PX;
+        // An actual intervening mousemove, not just a teleported mouseup — Onshape's
+        // own drag tracking, like ours, may care whether motion was reported at all,
+        // not only where the release ended up.
+        gcFireMouse(canvas, "mousemove", releaseX, releaseY, gcGesture === "pan");
+      }
+    }
+
+    gcFireMouse(canvas, "mouseup", releaseX, releaseY, gcGesture === "pan");
+    lastSyntheticRelease = { x: releaseX, y: releaseY, at: Date.now() };
   }
   gcGesture = null;
+  gcPressPos = null;
 }
 
 // button indices follow the DOM's own MouseEvent.button convention: 0 left, 1

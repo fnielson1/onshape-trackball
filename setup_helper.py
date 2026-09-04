@@ -55,7 +55,7 @@ def _gate_namespace():
 CONFIG_KEYS = ("device", "left_click_key", "pan_requires_right_button",
                "pan_deadzone_px", "pan_idle_release_ms", "rotate_scale")
 
-DEFAULT_PAN_IDLE_MS = 150
+DEFAULT_PAN_IDLE_MS = 5
 DEFAULT_DEADZONE_PX = 10
 DEFAULT_ROTATE_SCALE = 0.5
 
@@ -131,7 +131,7 @@ def _block(key, device=""):
             "#   lower   strokes end sooner; brief pauses split one pan into several\n"
             "#   higher  the button stays held longer after you stop moving\n"
             "#\n"
-            "# Accepted range is 20-2000; anything outside is clamped.\n"
+            "# Accepted range is 5-2000; anything outside is clamped.\n"
             f"pan_idle_release_ms = {DEFAULT_PAN_IDLE_MS}\n")
 
     if key == "pan_deadzone_px":

@@ -129,13 +129,13 @@ LEFT_CLICK_CODE = LEFT_CLICK_CODES[LEFT_CLICK_KEY]
 # A pan stroke ends after this long without motion, so the synthetic button is never
 # left down. Panning then feels like trackpad strokes: push, pause, push again.
 # Overridden by pan_idle_release_ms in the config file; this is the fallback.
-DEFAULT_PAN_IDLE_RELEASE_MS = 150
+DEFAULT_PAN_IDLE_RELEASE_MS = 5
 PAN_IDLE_RELEASE = DEFAULT_PAN_IDLE_RELEASE_MS / 1000.0
 
 # Outside this range the feature stops behaving like a pan stroke at all: too low
 # and a stroke ends between mouse reports, too high and the button hangs around
 # long after you stop.
-PAN_IDLE_MIN_MS = 20
+PAN_IDLE_MIN_MS = 5
 PAN_IDLE_MAX_MS = 2000
 
 # How often the idle check runs, so a release lands within PAN_TICK of the deadline.
@@ -956,11 +956,11 @@ class Gate:
                 "on_canvas": on_canvas,
                 "at_point": [event.get("x"), event.get("y")],
                 "in_reported_region": in_region,
-                # Whether a menu actually reached the user, vs. something on the page
-                # — most likely Onshape's own canvas menu — calling preventDefault.
-                # Nothing here suppresses anything any more: neither mouse ever
-                # produces OS-level input, so there is nothing left to protect
-                # Chrome's own menu from. See extension/content.js's history.
+                # Whether a menu actually reached the user. False now covers two
+                # cases: something on the page calling preventDefault on its own, and
+                # content.js's own targeted suppression (see MENU_SUPPRESS_WINDOW_MS
+                # and lastSyntheticRelease there) recognising this as our own
+                # gesture's release and preventDefault-ing plus Escape-tapping it.
                 "menu_shown": not event.get("prevented", False),
                 "drag_px": event.get("dragPx"),
                 "ctrl_held": event.get("ctrl"),

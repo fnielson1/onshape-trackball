@@ -268,35 +268,60 @@ Each entry carries a `why`:
 | --- | --- |
 | on an overlay **INSIDE** the region we reported safe | The probe missed something — `target` names the element it missed. Raise `DISCOVERY_COLS`/`DISCOVERY_ROWS` in `content.js`; the overlay was smaller than the sample spacing |
 | on an overlay **outside** the region | The *other* mouse's own real right-click landed on an overlay — expected, not a bug: only the reported region is ever verified safe |
-| **on the canvas** | Most likely Onshape's own canvas menu, reacting to our synthetic dispatch — it opens straight out of Onshape's own mouseup handling and is not suppressed by anything here |
+| **on the canvas** | Most likely Onshape's own canvas menu, reacting to our synthetic dispatch — it opens straight out of Onshape's own mouseup handling. `content.js` now suppresses this one (see below) |
 | **not during a pan** | Not this mouse at all — the other mouse's real right-click, or Menu-key/Shift+F10 |
 
-`menu_shown` says whether a menu actually reached the user, vs. something on the
-page (most likely Onshape's own canvas menu) calling `preventDefault`, and
-`in_reported_region` plus `at_point` say exactly where it landed relative to the
-region the daemon had been given.
+`menu_shown` says whether a menu actually reached the user — either because
+something on the page called `preventDefault` on its own, or because `content.js`
+recognised it as its own and suppressed it — and `in_reported_region` plus
+`at_point` say exactly where it landed relative to the region the daemon had been
+given.
 
 ### Stopping them
 
-Nothing does, deliberately, and that is new: an earlier version of this project
-suppressed `contextmenu` outright, keyed on the shape of the gesture (`ctrlKey`
-still set, or the button dragged past a few pixels) to tell the gated mouse's own
-pan/rotate apart from a genuine right-click — because the gated mouse's gestures
-used to be injected as *real*, OS-trusted input, indistinguishable from hardware,
-and Chrome would raise its own menu for them the same as it would for a real
-right-drag.
-
-That is no longer true of anything here. Every translated action goes out as an
-**untrusted** synthetic DOM event — confirmed live, Chrome never raises its own
-context menu in response to one, even for a drag well under the size that would
-trigger it from real hardware. The gated mouse cannot produce a real Chrome context
-menu any more, on purpose or by accident, so there is nothing left for suppression
-to protect against — and keeping the old heuristic around would only risk
+Chrome's own, OS-drawn context menu: nothing does, and nothing needs to. An earlier
+version of this project injected the gated mouse's gestures as *real*, OS-trusted
+input, indistinguishable from hardware, so Chrome would raise its own menu for a
+right-tap the same as it would for real hardware, and suppression was keyed on the
+shape of the gesture (`ctrlKey` still set, or the button dragged past a few pixels)
+to tell that apart from a genuine right-click. Every translated action now goes out
+as an **untrusted** synthetic DOM event instead — confirmed live, Chrome never
+raises its own context menu in response to one, even for a drag well under the size
+that would trigger it from real hardware. The gated mouse cannot produce a real
+Chrome context menu any more, on purpose or by accident, so there is nothing left
+for that old heuristic to protect against — and keeping it around would only risk
 swallowing the *other* mouse's own genuine right-clicks, which is a worse bug than
 the one it used to fix. `content.js`'s `mousedown`/`mouseup`/`mousemove` tracking
-now explicitly excludes this extension's own synthetic dispatch via
-`event.isTrusted`, so what little of the old tracking remains (`dragPx`, `ctrl` in
-the table above) describes only the other mouse's real activity.
+still explicitly excludes this extension's own synthetic dispatch via
+`event.isTrusted`, so what's left of that old tracking (`dragPx`, `ctrl` in the
+table above) describes only the other mouse's real activity.
+
+Onshape's own, in-page canvas menu is a different animal: it isn't Chrome UI, and
+it opens because Onshape's own mouseup handling treats a right-button press and
+release with next to no motion between them as a plain right-click — which is
+exactly what a pan or rotate stroke looks like when it ends before the cursor has
+moved, including the last fragment of an otherwise ordinary drag right before
+`pan_idle_release_ms` cuts it off.
+
+`content.js` now stops this at the source rather than reacting to it:
+`gcEndGesture` compares the release position against where `gcBeginGesture` opened
+the stroke (`gcPressPos`), and if the two are closer than `FORCE_DRAG_MIN_PX`, fires
+one extra synthetic `mousemove` to push the release out past that distance before
+releasing — so Onshape sees a real drag on every stroke, never a click, regardless
+of how little the trackball itself moved. `gcVirtual` itself is left untouched by
+this, so it cannot drift over a run of near-still taps; only where that one release
+lands is nudged. Because it changes what Onshape sees rather than intercepting
+Onshape's *reaction* to what it saw, this doesn't depend on guessing right about
+Onshape's own menu-rendering internals the way suppression does.
+
+The `contextmenu` listener still carries a suppression fallback from before this,
+kept as defense in depth rather than removed: `gcEndGesture` also records the
+position and time of its own synthetic release (`lastSyntheticRelease`), and the
+listener calls `preventDefault` plus taps Escape when a menu event lands on the
+canvas within `MENU_SUPPRESS_TOLERANCE_PX` and `MENU_SUPPRESS_WINDOW_MS` of that
+release — tight enough that the other mouse's own right-click on the canvas would
+have to land on almost the same pixel in the same quarter-second to be mistaken for
+ours.
 
 You cannot click *into* Onshape with the gated mouse — it is inert until Onshape is
 already frontmost, so focus the window with your other mouse first.

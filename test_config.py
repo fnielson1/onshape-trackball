@@ -29,19 +29,19 @@ sys.argv = ["gate.py"]  # no command-line device override
 
 # --- pan_idle_release_ms ------------------------------------------------------
 check("missing file falls back to the default",
-      ns["resolve_pan_idle"](with_config(None)), 0.15)
+      ns["resolve_pan_idle"](with_config(None)), 0.005)
 
 check("missing key falls back to the default",
-      ns["resolve_pan_idle"](with_config("device = /dev/x\n")), 0.15)
+      ns["resolve_pan_idle"](with_config("device = /dev/x\n")), 0.005)
 
 check("a plain value is honoured",
       ns["resolve_pan_idle"](with_config("pan_idle_release_ms = 250\n")), 0.25)
 
 check("junk falls back to the default",
-      ns["resolve_pan_idle"](with_config("pan_idle_release_ms = banana\n")), 0.15)
+      ns["resolve_pan_idle"](with_config("pan_idle_release_ms = banana\n")), 0.005)
 
 check("below the floor is clamped up",
-      ns["resolve_pan_idle"](with_config("pan_idle_release_ms = 5\n")), 0.02)
+      ns["resolve_pan_idle"](with_config("pan_idle_release_ms = 1\n")), 0.005)
 
 check("above the ceiling is clamped down",
       ns["resolve_pan_idle"](with_config("pan_idle_release_ms = 9999\n")), 2.0)
