@@ -157,7 +157,14 @@ function ensureChannel() {
   };
   ws.onclose = () => {
     channelConnecting = false;
-    if (channelSocket === ws) channelSocket = null;
+    if (channelSocket !== ws) return;   // already superseded by a newer connection
+    channelSocket = null;
+    // The daemon dying (killed, crashed, service restarting) is exactly as
+    // urgent as it explicitly saying "gate closed": content.js has no other way
+    // to find out the channel is gone, and without this it would keep believing
+    // the gate is open — real cursor still hidden, an in-progress gesture never
+    // getting the synthetic mouseup that ends it on Onshape's own side.
+    relayToOnshapeTabs({ type: "gate", open: false });
   };
   ws.onerror = () => {
     // onclose always follows an error on a WebSocket; nothing extra to do here.
